@@ -1,0 +1,47 @@
+# Hangouts
+
+An AI-powered social planning app built with React, Firebase, and the Gemini API. Originally generated in Google Gemini Canvas, then refactored to run as a standard Vite + React project.
+
+## Features
+- Sign in with Google, Apple, or anonymously
+- Profile with photo, preferences, family, and availability calendar
+- Groups with real-time chat
+- AI-generated event suggestions (Gemini + Google Search grounding)
+- Calendar sync (analyze your Google Calendar to auto-fill availability)
+- One-click "Save to Google Calendar" or `.ics` download
+
+## Stack
+- Vite + React 18
+- Firebase (Auth, Firestore, Storage)
+- Tailwind CSS (via CDN — swap to a build step for production)
+- Gemini API (`gemini-2.5-flash` with Google Search grounding)
+
+## Local setup
+1. Install Node 18+ if you don't have it.
+2. Clone the repo, then `npm install`.
+3. Copy `.env.example` to `.env.local` and fill in the values (see below).
+4. `npm run dev` — opens at http://localhost:5173.
+
+### Getting Firebase config
+1. Go to [console.firebase.google.com](https://console.firebase.google.com) → create a project.
+2. Add a web app (the `</>` icon). Register it and copy the `firebaseConfig` values into `.env.local`.
+3. Enable **Authentication** → Sign-in method → enable Google, Apple, and Anonymous.
+4. Enable **Firestore Database** → Create database → start in production mode.
+5. Enable **Storage** → Get started.
+6. Apply the security rules from `firestore.rules` and `storage.rules` (paste them into the Rules tab of each).
+
+### Getting a Gemini API key
+1. Go to [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey).
+2. Create an API key. Paste it into `VITE_GEMINI_API_KEY` in `.env.local`.
+
+> **Security note:** the Gemini key is bundled into the client at build time, so anyone using your site can read it. For a colleague demo this is fine; for production, restrict the key by HTTP referrer in Google Cloud Console, or proxy through a backend.
+
+## Deploying
+The repo is set up for **Vercel** (zero-config). Push to GitHub, import the repo at [vercel.com/new](https://vercel.com/new), and add the env vars from `.env.example` in the project settings. Vercel auto-builds on every push.
+
+You'll also need to add your Vercel URL (e.g. `your-app.vercel.app`) to the Firebase Auth "Authorized domains" list under **Authentication → Settings**.
+
+## Notes / known issues
+- Gemini's `tools: [{ google_search: {} }]` combined with `responseSchema` may behave inconsistently — if "Find Real Events" returns empty, that's the likely cause.
+- The `.tsx` extension on the original Canvas output was misleading — there were no TypeScript types. This refactor uses `.jsx`.
+- Apple sign-in requires Apple Developer setup in the Firebase console — the button is wired up but won't work until you complete that flow.

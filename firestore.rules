@@ -1,0 +1,25 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // A user can read/write their own profile and feed
+    match /artifacts/{appId}/users/{userId}/{document=**} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // Group docs: any signed-in user can read; only members can write
+    match /artifacts/{appId}/public/data/groups/{groupId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null;
+      allow update, delete: if request.auth != null
+        && request.auth.uid in resource.data.members;
+
+      // Messages inside a group: only members can read/write
+      match /messages/{messageId} {
+        allow read, write: if request.auth != null
+          && request.auth.uid in get(/databases/$(database)/documents/artifacts/$(appId)/public/data/groups/$(groupId)).data.members;
+      }
+    }
+  }
+}
