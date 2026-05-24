@@ -68,6 +68,22 @@ service cloud.firestore {
         allow read, write: if request.auth != null
           && request.auth.uid in get(/databases/$(database)/documents/artifacts/$(appId)/public/data/groups/$(groupId)).data.members;
       }
+
+      // Proposals inside a group: any member can read & create & RSVP.
+      // Only the proposer or group admin can delete.
+      match /proposals/{proposalId} {
+        allow read: if request.auth != null
+          && request.auth.uid in get(/databases/$(database)/documents/artifacts/$(appId)/public/data/groups/$(groupId)).data.members;
+        allow create: if request.auth != null
+          && request.auth.uid in get(/databases/$(database)/documents/artifacts/$(appId)/public/data/groups/$(groupId)).data.members
+          && request.resource.data.proposerId == request.auth.uid;
+        allow update: if request.auth != null
+          && request.auth.uid in get(/databases/$(database)/documents/artifacts/$(appId)/public/data/groups/$(groupId)).data.members;
+        allow delete: if request.auth != null && (
+          resource.data.proposerId == request.auth.uid
+          || get(/databases/$(database)/documents/artifacts/$(appId)/public/data/groups/$(groupId)).data.adminId == request.auth.uid
+        );
+      }
     }
   }
 }

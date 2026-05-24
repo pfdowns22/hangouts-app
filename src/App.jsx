@@ -1136,6 +1136,7 @@ const GroupDetailView = ({ group, onBack }) => {
   const { userId, showGlobalMessage, getUserNameById } = useContext(AppContext);
   const [members, setMembers] = useState([]);
   const [showInvite, setShowInvite] = useState(false);
+  const [groupTab, setGroupTab] = useState('proposals');
 
   useEffect(() => {
     Promise.all(group.members.map((id) => getUserNameById(id))).then(setMembers);
@@ -1175,7 +1176,29 @@ const GroupDetailView = ({ group, onBack }) => {
       {showInvite && <InviteModal group={group} onClose={() => setShowInvite(false)} />}
       <div className="flex-1 overflow-hidden flex flex-col md:flex-row gap-4">
         <div className="flex-1 flex flex-col min-h-0 bg-white rounded-2xl border shadow-sm overflow-hidden">
-          <ChatRoom groupId={group.id} />
+          <div className="flex border-b border-gray-100 px-2">
+            <button
+              onClick={() => setGroupTab('proposals')}
+              className={`px-4 py-3 text-sm font-semibold transition border-b-2 ${
+                groupTab === 'proposals' ? 'border-indigo-600 text-indigo-600' : 'border-transparent text-gray-500 hover:text-gray-800'
+              }`}
+            >
+              Proposed Events
+            </button>
+            <button
+              onClick={() => setGroupTab('chat')}
+              className={`px-4 py-3 text-sm font-semibold transition border-b-2 ${
+                groupTab === 'chat' ? 'border-indigo-600 text-indigo-600' : 'border-transparent text-gray-500 hover:text-gray-800'
+              }`}
+            >
+              Chat
+            </button>
+          </div>
+          {groupTab === 'proposals' ? (
+            <GroupProposals groupId={group.id} />
+          ) : (
+            <ChatRoom groupId={group.id} />
+          )}
         </div>
         <div className="w-full md:w-64 space-y-4 overflow-y-auto">
           <div className="bg-gray-50 p-4 rounded-xl">
@@ -1189,6 +1212,138 @@ const GroupDetailView = ({ group, onBack }) => {
               ))}
             </div>
           </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const GroupProposals = ({ groupId }) => {
+  const [proposals, setProposals] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const q = query(
+      collection(db, `artifacts/${appId}/public/data/groups/${groupId}/proposals`),
+      orderBy('createdAt', 'desc'),
+      limit(50)
+    );
+    return onSnapshot(q, (snap) => {
+      setProposals(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+      setLoading(false);
+    });
+  }, [groupId]);
+
+  if (loading) {
+    return (
+      <div className="flex-1 flex justify-center items-center bg-slate-50">
+        <div className="w-8 h-8 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
+
+  if (proposals.length === 0) {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center text-center p-8 bg-slate-50">
+        <SparklesIcon className="w-12 h-12 text-gray-300 mb-3" />
+        <h3 className="text-lg font-bold text-gray-600">No proposals yet</h3>
+        <p className="text-sm text-gray-500 max-w-sm mt-2">
+          Head to the <span className="font-semibold">Suggestions</span> tab, pick this group, then "Propose" any event you find.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex-1 overflow-y-auto p-4 space-y-3 bg-slate-50">
+      {proposals.map((p) => <ProposalCard key={p.id} proposal={p} groupId={groupId} />)}
+    </div>
+  );
+};
+
+const ProposalCard = ({ proposal, groupId }) => {
+  const { userId, showGlobalMessage } = useContext(AppContext);
+  const [updating, setUpdating] = useState(false);
+  const rsvps = proposal.rsvps || {};
+  const myRsvp = rsvps[userId];
+  const yes = Object.values(rsvps).filter((v) => v === 'yes');
+  const no = Object.values(rsvps).filter((v) => v === 'no');
+  const imageSrc = useEventImage(proposal);
+
+  const setRsvp = async (value) => {
+    setUpdating(true);
+    try {
+      await updateDoc(
+        doc(db, `artifacts/${appId}/public/data/groups/${groupId}/proposals`, proposal.id),
+        { [`rsvps.${userId}`]: value }
+      );
+    } catch (e) {
+      console.error(e);
+      showGlobalMessage('Could not save your RSVP.', 'error');
+    } finally {
+      setUpdating(false);
+    }
+  };
+
+  return (
+    <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+      <div className="w-full h-32 bg-gray-100">
+        {imageSrc ? (
+          <img src={imageSrc} alt={proposal.title} className="w-full h-full object-cover" />
+        ) : (
+          <div className="w-full h-full animate-pulse bg-gradient-to-br from-indigo-100 to-purple-100" />
+        )}
+      </div>
+      <div className="p-4">
+        <p className="text-xs font-bold text-amber-600 uppercase tracking-wide">Proposed by {proposal.proposerName || 'a member'}</p>
+        <h3 className="font-bold text-gray-900 text-lg mt-1">{proposal.title}</h3>
+        {proposal.description && (
+          <p className="text-gray-600 text-sm mt-1 leading-relaxed line-clamp-3">{proposal.description}</p>
+        )}
+        <div className="flex flex-wrap gap-3 mt-2 text-xs text-gray-500 font-medium">
+          {proposal.date && (
+            <span className="flex items-center gap-1">
+              <CalendarIcon className="w-3 h-3" /> {new Date(proposal.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}
+            </span>
+          )}
+          {proposal.location && (
+            <span className="flex items-center gap-1">
+              <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-3 h-3" /> {proposal.location}
+            </span>
+          )}
+        </div>
+
+        <div className="mt-4 flex flex-col gap-2">
+          <div className="flex gap-2">
+            <button
+              onClick={() => setRsvp('yes')}
+              disabled={updating}
+              className={`flex-1 py-2 rounded-lg text-sm font-bold transition disabled:opacity-50 ${
+                myRsvp === 'yes' ? 'bg-emerald-500 text-white shadow' : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
+              }`}
+            >
+              {myRsvp === 'yes' ? '✓ Going' : 'Accept'} ({yes.length})
+            </button>
+            <button
+              onClick={() => setRsvp('no')}
+              disabled={updating}
+              className={`flex-1 py-2 rounded-lg text-sm font-bold transition disabled:opacity-50 ${
+                myRsvp === 'no' ? 'bg-red-400 text-white shadow' : 'bg-red-50 text-red-600 hover:bg-red-100'
+              }`}
+            >
+              {myRsvp === 'no' ? '✗ Declined' : 'Decline'} ({no.length})
+            </button>
+          </div>
+          {proposal.url && (
+            <a
+              href={proposal.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-center text-xs font-bold text-blue-600 bg-blue-50 hover:bg-blue-100 py-2 rounded-lg transition"
+            >
+              More Info / Tickets
+            </a>
+          )}
         </div>
       </div>
     </div>
@@ -1397,18 +1552,39 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
   const handleProposeSuggestion = async (suggestion) => {
     try {
       const group = groups.find((g) => g.id === selectedId);
-      const proposalData = { ...suggestion, proposerId: userId, proposerName: userProfile.name, groupId: group.id, groupName: group.name };
+      const proposalData = {
+        ...suggestion,
+        proposerId: userId,
+        proposerName: userProfile.name,
+        groupId: group.id,
+        groupName: group.name,
+        // Proposer is implicitly attending — they suggested it.
+        rsvps: { [userId]: 'yes' },
+        createdAt: serverTimestamp(),
+      };
+
+      // Canonical proposal lives in the group's subcollection so everyone
+      // sees the same record and can RSVP against it.
+      const proposalRef = await addDoc(
+        collection(db, `artifacts/${appId}/public/data/groups/${group.id}/proposals`),
+        proposalData
+      );
+
+      // Also drop a lightweight ping into each *other* member's feed so the
+      // top-level listener fires a toast notification + bumps the badge.
       const batch = writeBatch(db);
       group.members.forEach((memberId) => {
+        if (memberId === userId) return;
         batch.set(doc(collection(db, `artifacts/${appId}/users/${memberId}/feed`)), {
           type: 'groupProposal',
-          data: proposalData,
+          data: { ...suggestion, proposerName: userProfile.name, groupId: group.id, groupName: group.name, proposalId: proposalRef.id },
           timestamp: serverTimestamp(),
         });
       });
       await batch.commit();
       showGlobalMessage(`Proposed to ${group.name}!`, 'success');
     } catch (error) {
+      console.error(error);
       showGlobalMessage('Failed to propose suggestion.', 'error');
     }
   };
