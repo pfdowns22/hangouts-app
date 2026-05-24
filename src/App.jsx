@@ -32,11 +32,18 @@ import { auth, db, storage, appId, geminiApiKey } from './firebase.js';
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiApiKey}`;
 
-// Deterministic placeholder image when Gemini doesn't return an imageUrl
-// (it returns null surprisingly often) or the URL it returned is broken.
-// Picsum.photos seeded by title gives the same image for the same event.
-const fallbackImage = (title) =>
-  `https://picsum.photos/seed/${encodeURIComponent(title || 'event')}/800/400`;
+// Image fallback chain when Gemini's imageUrl is null or 404s.
+// 1. pollinations.ai generates a topical AI image from keywords (free, no key)
+//    — for "Liberty WNBA game" this returns a basketball-arena scene, not a random jeep.
+// 2. placehold.co text card as final fallback if pollinations is down.
+const topicalImage = (keywords) => {
+  const q = (keywords || 'social event').slice(0, 100);
+  return `https://image.pollinations.ai/prompt/${encodeURIComponent(q)}?width=800&height=400&nologo=true`;
+};
+const textPlaceholder = (title) => {
+  const t = (title || 'Event').slice(0, 50);
+  return `https://placehold.co/800x400/6366f1/ffffff/png?text=${encodeURIComponent(t)}`;
+};
 
 // Gemini doesn't allow `tools: [{google_search:{}}]` together with
 // `responseSchema: application/json`. For grounded calls we parse JSON
@@ -724,7 +731,9 @@ const MyFeedSection = () => {
 
   useEffect(() => {
     if (!userId) return;
-    const q = query(collection(db, `artifacts/${appId}/users/${userId}/feed`), orderBy('timestamp', 'desc'), limit(50));
+    // ASC ordering so new items from infinite-scroll appear at the bottom
+    // of the rendered list (where the user is looking), not at the top.
+    const q = query(collection(db, `artifacts/${appId}/users/${userId}/feed`), orderBy('timestamp', 'asc'), limit(200));
     return onSnapshot(q, (snapshot) => setFeedItems(snapshot.docs.map((d) => ({ id: d.id, ...d.data() }))));
   }, [userId]);
 
@@ -738,12 +747,14 @@ const MyFeedSection = () => {
         if (entries[0].isIntersecting && !generatingRef.current) {
           generatingRef.current = true;
           generatePersonalSuggestions(false).finally(() => {
-            // small cooldown so a single scroll-to-bottom doesn't spam requests
-            setTimeout(() => { generatingRef.current = false; }, 3000);
+            // brief cooldown so a single scroll-to-bottom doesn't spam requests
+            setTimeout(() => { generatingRef.current = false; }, 800);
           });
         }
       },
-      { rootMargin: '200px' }
+      // Trigger well before the sentinel hits the viewport so the fetch
+      // starts while the user is still scrolling through existing cards.
+      { rootMargin: '1200px' }
     );
     observer.observe(sentinelRef.current);
     return () => observer.disconnect();
@@ -789,7 +800,8 @@ IMPORTANT:
 - Ensure event dates are strictly today or in the future.
 - For each event, include the OFFICIAL event/venue URL (no aggregator links if avoidable).
 - For imageUrl, find a real public image URL (jpg/png/webp) from the event's official website, venue site, or a major publication — verify the URL is reachable. If you can't find one, set imageUrl to null.
-Return ONLY a JSON array (no prose, no markdown fences) of objects with these keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl.`;
+- For imageKeywords, provide 3-6 specific visual words that describe what an image of this event would look like (e.g. "WNBA basketball game arena" or "outdoor jazz concert park summer"). NOT the event name — actual visual scene keywords. This is used to generate a topical fallback image.
+Return ONLY a JSON array (no prose, no markdown fences) of objects with these keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords.`;
 
       const response = await fetch(GEMINI_URL, {
         method: 'POST',
@@ -907,12 +919,19 @@ const FeedCard = ({ item, onDelete }) => {
 
       <div className="w-full h-48 mb-4 rounded-xl overflow-hidden bg-gray-100 -mt-2">
         <img
-          src={data.imageUrl || fallbackImage(data.title)}
+          src={data.imageUrl || topicalImage(data.imageKeywords || data.title)}
           alt={data.title}
           className="w-full h-full object-cover"
           onError={(e) => {
-            const fb = fallbackImage(data.title);
-            if (e.target.src !== fb) e.target.src = fb;
+            // Three-stage fallback: Gemini URL -> pollinations topical -> text card
+            const stage = e.target.dataset.fallbackStage || '0';
+            if (stage === '0') {
+              e.target.dataset.fallbackStage = '1';
+              e.target.src = topicalImage(data.imageKeywords || data.title);
+            } else if (stage === '1') {
+              e.target.dataset.fallbackStage = '2';
+              e.target.src = textPlaceholder(data.title);
+            }
           }}
         />
       </div>
@@ -1179,7 +1198,8 @@ IMPORTANT:
 - Do not hallucinate events. Use real web results only.
 - Include the OFFICIAL event/venue URL.
 - For imageUrl, find a real public image URL from the event's website, venue site, or a major publication. If you can't find one, set imageUrl to null.
-Return ONLY a JSON array (no prose, no markdown fences) of objects with these keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl.`;
+- For imageKeywords, provide 3-6 specific visual words that describe what an image of this event would look like (e.g. "WNBA basketball game arena" or "outdoor jazz concert park summer"). NOT the event name — actual visual scene keywords. This is used to generate a topical fallback image.
+Return ONLY a JSON array (no prose, no markdown fences) of objects with these keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords.`;
 
       const res = await fetch(GEMINI_URL, {
         method: 'POST',
@@ -1244,12 +1264,18 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with these ke
           <div key={i} className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 flex flex-col hover:-translate-y-1 transition duration-300">
             <div className="w-full h-32 mb-4 rounded-xl overflow-hidden bg-gray-100 -mt-2">
               <img
-                src={idea.imageUrl || fallbackImage(idea.title)}
+                src={idea.imageUrl || topicalImage(idea.imageKeywords || idea.title)}
                 alt={idea.title}
                 className="w-full h-full object-cover"
                 onError={(e) => {
-                  const fb = fallbackImage(idea.title);
-                  if (e.target.src !== fb) e.target.src = fb;
+                  const stage = e.target.dataset.fallbackStage || '0';
+                  if (stage === '0') {
+                    e.target.dataset.fallbackStage = '1';
+                    e.target.src = topicalImage(idea.imageKeywords || idea.title);
+                  } else if (stage === '1') {
+                    e.target.dataset.fallbackStage = '2';
+                    e.target.src = textPlaceholder(idea.title);
+                  }
                 }}
               />
             </div>
