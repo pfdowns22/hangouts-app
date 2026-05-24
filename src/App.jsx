@@ -1051,24 +1051,25 @@ const FeedCard = ({ item, onDelete }) => {
         </div>
       </div>
 
-      <div className="mt-5 flex gap-2 border-t border-gray-100 pt-4 flex-wrap">
+      <div className="mt-5 flex gap-3 border-t border-gray-100 pt-4 items-stretch">
         {data.url && (
-          <a href={data.url} target="_blank" rel="noopener noreferrer" className="flex-1 min-w-[100px] text-center text-sm font-bold text-blue-600 bg-blue-50 hover:bg-blue-100 py-2.5 rounded-lg transition flex items-center justify-center gap-1">
+          <a href={data.url} target="_blank" rel="noopener noreferrer" className="flex-1 text-center text-sm font-bold text-blue-600 bg-blue-50 hover:bg-blue-100 py-2.5 rounded-lg transition flex items-center justify-center gap-1">
             <Icon path="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" className="w-4 h-4" /> More Info
           </a>
         )}
+        <button onClick={handleCalendarClick} className="flex-1 text-sm font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 py-2.5 rounded-lg transition flex items-center justify-center gap-1">
+          <PlusIcon className="w-4 h-4" /> {googleAccessToken ? 'Save to Calendar' : 'Download .ics'}
+        </button>
         {isEvent && hasGroups && (
           <button
             onClick={() => setShowSend(true)}
-            className="flex-1 min-w-[100px] text-sm font-bold text-amber-700 bg-amber-50 hover:bg-amber-100 py-2.5 rounded-lg transition flex items-center justify-center gap-1"
+            className="w-11 flex items-center justify-center text-amber-600 bg-amber-50 hover:bg-amber-100 rounded-lg transition"
             title="Send to a group"
+            aria-label="Send to a group"
           >
-            <SendIcon className="w-4 h-4" /> Send to Group
+            <SendIcon className="w-5 h-5" />
           </button>
         )}
-        <button onClick={handleCalendarClick} className="flex-1 min-w-[100px] text-sm font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 py-2.5 rounded-lg transition flex items-center justify-center gap-1">
-          <PlusIcon className="w-4 h-4" /> {googleAccessToken ? 'Save to Calendar' : 'Download .ics'}
-        </button>
       </div>
       {showSend && <SendToGroupModal event={data} onClose={() => setShowSend(false)} />}
     </div>
@@ -2114,16 +2115,25 @@ const SendToGroupModal = ({ event, onClose }) => {
   const send = async (group) => {
     setSendingTo(group.id);
     try {
-      const proposalData = {
-        title: event.title,
+      // Sanitize every field — Firestore rejects writes that contain
+      // `undefined`, and Gemini's event payloads often leave imageUrl /
+      // imageKeywords / url unset. Falling back to safe defaults keeps
+      // the batch.commit() from blowing up.
+      const safe = {
+        title: event.title || '',
         description: event.description || '',
         location: event.location || '',
         date: event.date || '',
         url: event.url || '',
         imageUrl: event.imageUrl || null,
         imageKeywords: event.imageKeywords || '',
+      };
+      const proposerName = userProfile?.name || 'User';
+
+      const proposalData = {
+        ...safe,
         proposerId: userId,
-        proposerName: userProfile.name,
+        proposerName,
         groupId: group.id,
         groupName: group.name,
         rsvps: { [userId]: 'yes' },
@@ -2133,6 +2143,7 @@ const SendToGroupModal = ({ event, onClose }) => {
         collection(db, `artifacts/${appId}/public/data/groups/${group.id}/proposals`),
         proposalData
       );
+
       // Ping other members' feeds (for toast + badge)
       const batch = writeBatch(db);
       (group.members || []).forEach((memberId) => {
@@ -2140,14 +2151,8 @@ const SendToGroupModal = ({ event, onClose }) => {
         batch.set(doc(collection(db, `artifacts/${appId}/users/${memberId}/feed`)), {
           type: 'groupProposal',
           data: {
-            title: event.title,
-            description: event.description,
-            location: event.location,
-            date: event.date,
-            url: event.url,
-            imageUrl: event.imageUrl,
-            imageKeywords: event.imageKeywords,
-            proposerName: userProfile.name,
+            ...safe,
+            proposerName,
             groupId: group.id,
             groupName: group.name,
             proposalId: proposalRef.id,
@@ -2156,10 +2161,10 @@ const SendToGroupModal = ({ event, onClose }) => {
         });
       });
       await batch.commit();
-      showGlobalMessage(`Sent "${event.title}" to ${group.name}!`);
+      showGlobalMessage(`Sent "${safe.title}" to ${group.name}!`);
       onClose();
     } catch (e) {
-      console.error(e);
+      console.error('Send-to-group failed:', e);
       showGlobalMessage('Could not send to that group.', 'error');
     } finally {
       setSendingTo(null);
