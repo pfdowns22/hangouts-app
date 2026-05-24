@@ -54,29 +54,32 @@ const textPlaceholder = (title) => {
 // don't burn the free-tier 50/hr quota on repeat renders of the same event.
 const unsplashCache = new Map();
 
-// React hook: returns the best image URL for an event, async-resolves Unsplash
-// queries when a key is configured. Falls back to pollinations otherwise.
+// React hook: returns the best image URL for an event.
+// When VITE_UNSPLASH_KEY is configured, Unsplash is *always* the primary
+// source — Gemini's claimed imageUrls are notoriously unreliable (often
+// pointing at images that 404 or aren't really images at all). We only
+// fall back to Gemini's URL or pollinations if Unsplash has no results.
 const useEventImage = (data) => {
+  // Optimistic starting state: when no Unsplash key, fall back immediately
+  // to pollinations so users see *something* before any async work.
   const [src, setSrc] = useState(
-    data?.imageUrl || (UNSPLASH_KEY ? null : pollinationsImage(data?.imageKeywords || data?.title))
+    UNSPLASH_KEY ? null : (data?.imageUrl || pollinationsImage(data?.imageKeywords || data?.title))
   );
 
   useEffect(() => {
-    if (data?.imageUrl) {
-      setSrc(data.imageUrl);
-      return;
-    }
     const query = (data?.imageKeywords || data?.title || 'event').slice(0, 80);
 
+    // No Unsplash key: defer to Gemini's URL (if any) or pollinations.
     if (!UNSPLASH_KEY) {
-      setSrc(pollinationsImage(query));
+      setSrc(data?.imageUrl || pollinationsImage(query));
       return;
     }
+
+    // With Unsplash configured, always try Unsplash first.
     if (unsplashCache.has(query)) {
       setSrc(unsplashCache.get(query));
       return;
     }
-    // Async Unsplash search — falls back to pollinations on any error.
     let cancelled = false;
     fetch(`https://api.unsplash.com/search/photos?query=${encodeURIComponent(query)}&per_page=1&orientation=landscape&client_id=${UNSPLASH_KEY}`)
       .then((r) => r.json())
@@ -87,11 +90,12 @@ const useEventImage = (data) => {
           unsplashCache.set(query, url);
           setSrc(url);
         } else {
-          setSrc(pollinationsImage(query));
+          // Unsplash returned no results — try Gemini's URL, then pollinations.
+          setSrc(data?.imageUrl || pollinationsImage(query));
         }
       })
       .catch(() => {
-        if (!cancelled) setSrc(pollinationsImage(query));
+        if (!cancelled) setSrc(data?.imageUrl || pollinationsImage(query));
       });
     return () => { cancelled = true; };
   }, [data?.imageUrl, data?.title, data?.imageKeywords]);
@@ -1403,13 +1407,11 @@ const AuthScreen = () => {
     }
   };
 
-  const handleAppleSignIn = async () => {
-    try {
-      await signInWithPopup(auth, new OAuthProvider('apple.com'));
-    } catch (error) {
-      console.error('Apple sign-in failed:', error);
-    }
-  };
+  // Apple sign-in is disabled until we complete Apple Developer setup
+  // (Services ID, signing key, domain verification). The button remains
+  // visible but disabled so the UI shows the future option without
+  // surprising users with an error when they click.
+  const handleAppleSignIn = () => {};
 
   const handleAnonSignIn = async () => {
     try {
@@ -1431,8 +1433,14 @@ const AuthScreen = () => {
           <button onClick={handleGoogleSignIn} className="w-full py-3 px-4 bg-white border border-gray-200 rounded-xl hover:bg-gray-50 font-bold text-gray-700 flex items-center justify-center gap-3 transition">
             <GoogleIcon /> Continue with Google
           </button>
-          <button onClick={handleAppleSignIn} className="w-full py-3 px-4 bg-black text-white rounded-xl hover:bg-gray-900 font-bold flex items-center justify-center gap-3 transition">
+          <button
+            onClick={handleAppleSignIn}
+            disabled
+            title="Apple sign-in coming soon"
+            className="w-full py-3 px-4 bg-gray-100 text-gray-400 rounded-xl font-bold flex items-center justify-center gap-3 cursor-not-allowed border border-gray-200"
+          >
             <AppleIcon /> Continue with Apple
+            <span className="text-xs font-medium ml-1 px-2 py-0.5 bg-gray-200 text-gray-500 rounded-full">Soon</span>
           </button>
           <button onClick={handleAnonSignIn} className="text-sm text-gray-400 hover:text-indigo-600 font-medium mt-4">
             Skip for now (Anonymous)
@@ -1545,6 +1553,88 @@ const FeedbackModal = ({ onClose }) => {
   );
 };
 
+// --- Password Gate ---
+// A simple shared-passcode wall that fronts the entire app. Useful for
+// friends-and-family demos that shouldn't be world-accessible.
+// VITE_PASSCODE_HASH should be the lowercase hex SHA-256 of the chosen
+// passcode. If the env var is not set, the gate is bypassed (handy for
+// local dev). Once unlocked, the result is cached in localStorage so
+// returning users skip the prompt.
+const PASSCODE_HASH = import.meta.env.VITE_PASSCODE_HASH || '';
+const UNLOCK_KEY = 'hangouts_unlocked_v1';
+
+const sha256Hex = async (text) => {
+  const bytes = new TextEncoder().encode(text);
+  const hash = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+};
+
+const PasscodeGate = ({ children }) => {
+  // No hash configured -> bypass entirely (treat as dev/preview env).
+  const [unlocked, setUnlocked] = useState(
+    !PASSCODE_HASH || (typeof window !== 'undefined' && window.localStorage.getItem(UNLOCK_KEY) === 'true')
+  );
+  const [input, setInput] = useState('');
+  const [checking, setChecking] = useState(false);
+  const [error, setError] = useState('');
+
+  if (unlocked) return children;
+
+  const tryUnlock = async (e) => {
+    e.preventDefault();
+    if (!input.trim()) return;
+    setChecking(true);
+    setError('');
+    try {
+      const entered = await sha256Hex(input.trim());
+      if (entered === PASSCODE_HASH.toLowerCase()) {
+        window.localStorage.setItem(UNLOCK_KEY, 'true');
+        setUnlocked(true);
+      } else {
+        setError('Incorrect passcode.');
+        setInput('');
+      }
+    } catch {
+      setError('Could not verify passcode.');
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-500 via-purple-500 to-pink-500 p-4">
+      <div className="bg-white/95 backdrop-blur-xl p-8 rounded-3xl shadow-2xl w-full max-w-md text-center">
+        <div className="w-20 h-20 bg-indigo-100 rounded-full flex items-center justify-center mx-auto mb-6 text-indigo-600">
+          <Icon path="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" className="w-10 h-10" />
+        </div>
+        <h1 className="text-3xl font-black text-gray-900 mb-2">Hangouts</h1>
+        <p className="text-gray-500 mb-6">Private preview. Enter the passcode to continue.</p>
+        <form onSubmit={tryUnlock} className="space-y-3">
+          <input
+            autoFocus
+            type="password"
+            value={input}
+            onChange={(e) => { setInput(e.target.value); setError(''); }}
+            placeholder="Passcode"
+            className="w-full p-3 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:bg-white text-center transition"
+          />
+          {error && <p className="text-sm text-red-500 font-medium">{error}</p>}
+          <button
+            type="submit"
+            disabled={!input.trim() || checking}
+            className="w-full py-3 px-4 bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 font-bold transition disabled:opacity-50"
+          >
+            {checking ? 'Checking…' : 'Unlock'}
+          </button>
+        </form>
+        <p className="text-xs text-gray-400 mt-6">Don't have the passcode? Ask Paul.</p>
+      </div>
+    </div>
+  );
+};
+
 // --- Main App ---
 export default function App() {
   const [userId, setUserId] = useState(null);
@@ -1605,23 +1695,24 @@ export default function App() {
     );
 
   return (
-    <AppContext.Provider
-      value={{
-        userId,
-        userProfile,
-        setUserProfile,
-        showGlobalMessage,
-        setShowProfileModal,
-        setShowSettingsModal,
-        setShowAboutModal,
-        getUserNameById,
-        googleAccessToken,
-        setGoogleAccessToken,
-      }}
-    >
-      {!userId ? (
-        <AuthScreen />
-      ) : (
+    <PasscodeGate>
+      <AppContext.Provider
+        value={{
+          userId,
+          userProfile,
+          setUserProfile,
+          showGlobalMessage,
+          setShowProfileModal,
+          setShowSettingsModal,
+          setShowAboutModal,
+          getUserNameById,
+          googleAccessToken,
+          setGoogleAccessToken,
+        }}
+      >
+        {!userId ? (
+          <AuthScreen />
+        ) : (
         <div className="min-h-screen bg-[#F3F4F6] text-gray-900 font-sans p-4 md:p-8">
           <Header />
           {msg && (
@@ -1635,7 +1726,8 @@ export default function App() {
           {showAboutModal && <AboutModal onClose={() => setShowAboutModal(false)} />}
           <FeedbackButton />
         </div>
-      )}
-    </AppContext.Provider>
+        )}
+      </AppContext.Provider>
+    </PasscodeGate>
   );
 }
