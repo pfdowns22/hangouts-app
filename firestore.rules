@@ -3,8 +3,32 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // A user can read/write their own profile and feed
-    match /artifacts/{appId}/users/{userId}/{document=**} {
+    // Profile: any authenticated user can READ another user's profile so
+    // group-suggestion logic can aggregate preferences and availability.
+    // Only the owner can write their own profile.
+    match /artifacts/{appId}/users/{userId}/profiles/{profileDoc} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // Feed: a user can fully manage their own feed. Group members can
+    // additionally CREATE proposal/suggestion items in each other's feeds
+    // (must include groupId proving they're in the same group).
+    match /artifacts/{appId}/users/{userId}/feed/{feedDoc} {
+      allow read, update, delete: if request.auth != null && request.auth.uid == userId;
+      allow create: if request.auth != null && (
+        request.auth.uid == userId
+        ||
+        (
+          request.resource.data.type in ['groupProposal', 'groupSuggestion']
+          && request.resource.data.data.groupId is string
+          && request.auth.uid in get(/databases/$(database)/documents/artifacts/$(appId)/public/data/groups/$(request.resource.data.data.groupId)).data.members
+        )
+      );
+    }
+
+    // Fallback for any other per-user docs (kept private)
+    match /artifacts/{appId}/users/{userId}/{coll}/{doc=**} {
       allow read, write: if request.auth != null && request.auth.uid == userId;
     }
 

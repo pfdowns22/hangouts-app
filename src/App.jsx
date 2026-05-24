@@ -1244,6 +1244,7 @@ const SuggestionSection = () => {
   const [selectedId, setSelectedId] = useState('');
   const [generating, setGenerating] = useState(false);
   const [ideas, setIdeas] = useState([]);
+  const [memberSummary, setMemberSummary] = useState(null);
 
   const groupIdsKey = userProfile?.groupIds?.join(',') || '';
 
@@ -1256,6 +1257,42 @@ const SuggestionSection = () => {
     return onSnapshot(q, (snap) => setGroups(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
   }, [groupIdsKey]);
 
+  // When the user picks a group, pre-load a small summary of members so they
+  // can see what data will be mined before clicking "Find Real Events".
+  useEffect(() => {
+    if (!selectedId) {
+      setMemberSummary(null);
+      return;
+    }
+    const group = groups.find((g) => g.id === selectedId);
+    if (!group?.members) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const profiles = await Promise.all(
+          group.members.map(async (uid) => {
+            try {
+              const snap = await getDoc(doc(db, `artifacts/${appId}/users/${uid}/profiles`, 'myProfile'));
+              return snap.exists() ? { uid, ...snap.data() } : { uid, name: 'User' };
+            } catch {
+              return { uid, name: 'User' };
+            }
+          })
+        );
+        if (cancelled) return;
+        setMemberSummary({
+          count: profiles.length,
+          names: profiles.map((p) => p.name?.split(' ')[0] || 'User'),
+          hasAvailability: profiles.some((p) => p.freeSlots?.length),
+          prefs: [...new Set(profiles.flatMap((p) => p.preferences || []))].slice(0, 12),
+        });
+      } catch (e) {
+        if (!cancelled) setMemberSummary(null);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [selectedId, groups]);
+
   const generate = async () => {
     if (!geminiApiKey) {
       showGlobalMessage('Gemini API key missing. Set VITE_GEMINI_API_KEY in your environment.', 'error');
@@ -1264,20 +1301,65 @@ const SuggestionSection = () => {
     setGenerating(true);
     try {
       const group = groups.find((g) => g.id === selectedId);
-      const loc = userProfile?.address || 'New York';
-      const todsPrefs = userProfile?.timeOfDayPrefs?.length ? userProfile.timeOfDayPrefs.join(', ') : 'any time';
-      const dowPrefs = userProfile?.dayOfWeekPrefs?.length ? userProfile.dayOfWeekPrefs.join(', ') : 'any day';
+
+      // Fetch every member's profile to aggregate the group's collective
+      // interests, availability, and constraints. Suggester's profile acts
+      // as the location anchor since we don't yet have a group-level locale.
+      const memberProfiles = await Promise.all(
+        group.members.map(async (uid) => {
+          try {
+            const snap = await getDoc(doc(db, `artifacts/${appId}/users/${uid}/profiles`, 'myProfile'));
+            return snap.exists() ? { uid, ...snap.data() } : { uid };
+          } catch {
+            return { uid };
+          }
+        })
+      );
+
+      // Aggregate
+      const allPrefs = [...new Set(memberProfiles.flatMap((p) => p.preferences || []))];
+      const allTimeOfDay = [...new Set(memberProfiles.flatMap((p) => p.timeOfDayPrefs || []))];
+      const allDayOfWeek = [...new Set(memberProfiles.flatMap((p) => p.dayOfWeekPrefs || []))];
+      const allKids = memberProfiles.flatMap((p) => p.kids || []);
+      const loc = userProfile?.address || memberProfiles.find((p) => p.address)?.address || 'New York';
+
+      // Each member's free time blocks, capped to the next 14 entries each
+      // so we don't blow the prompt budget on very busy users.
+      const availability = memberProfiles
+        .filter((p) => p.freeSlots?.length)
+        .map((p) => ({
+          name: p.name?.split(' ')[0] || 'Member',
+          slots: p.freeSlots.slice(0, 14),
+        }));
+
       const today = new Date().toDateString();
 
-      const prompt = `Today is ${today}. Search the web for 6 ACTUAL, REAL-WORLD events, pop-ups, festivals, or verifiable activities for a group named "${group.name}" CLOSE TO ${loc} (within ~15 miles / 25 km — prefer the user's own neighborhood, NOT generic city-wide listings).
-Preferred times of day: ${todsPrefs}. Preferred days of week: ${dowPrefs}.
+      const prompt = `Today is ${today}. You're recommending events for a group of ${memberProfiles.length} friends called "${group.name}" who want to hang out together.
+
+GROUP CONTEXT:
+- Combined interests across all members: ${allPrefs.length ? allPrefs.join(', ') : 'general fun'}
+- Preferred times of day (union across members): ${allTimeOfDay.length ? allTimeOfDay.join(', ') : 'any time'}
+- Preferred days of week (union across members): ${allDayOfWeek.length ? allDayOfWeek.join(', ') : 'any day'}
+- Family situation: ${allKids.length ? `Group includes children ages ${allKids.map((k) => k.age).join(', ')} — prefer family-friendly options.` : 'No children — adult-friendly options are fine.'}
+- Anchor location: ${loc} (events must be within ~15 miles / 25 km of here)
+
+MEMBER AVAILABILITY (free time blocks, next 30 days):
+${
+  availability.length
+    ? availability.map((m) => `- ${m.name}: ${m.slots.map((s) => `${s.date} ${s.start}-${s.end}`).join('; ')}`).join('\n')
+    : '(No members have synced calendars yet — pick popular times: Friday/Saturday evenings and weekend afternoons.)'
+}
+
+YOUR TASK:
+Search the web for 6 ACTUAL, REAL-WORLD events happening near ${loc} in the next 30 days. PRIORITIZE events whose date/time overlaps with the most members' free blocks above. If no member availability is provided, prioritize Friday/Saturday evenings and weekend afternoons.
+
 IMPORTANT:
-- All dates must be today or in the future.
-- Do not hallucinate events. Use real web results only.
+- Do NOT make up events. Only suggest real events you can verify via web search.
+- Ensure event dates are strictly today or in the future.
 - Include the OFFICIAL event/venue URL.
-- For imageUrl, find a real public image URL from the event's website, venue site, or a major publication. If you can't find one, set imageUrl to null.
-- For imageKeywords, provide 3-6 specific visual words that describe what an image of this event would look like (e.g. "WNBA basketball game arena" or "outdoor jazz concert park summer"). NOT the event name — actual visual scene keywords. This is used to generate a topical fallback image.
-Return ONLY a JSON array (no prose, no markdown fences) of objects with these keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords.`;
+- For imageUrl, find a real public image URL from the event's website, venue, or a major publication. If you can't find one, set imageUrl to null.
+- For imageKeywords, provide 3-6 specific visual scene words (e.g. "WNBA basketball arena game"). Not the event name.
+Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords.`;
 
       const res = await fetch(GEMINI_URL, {
         method: 'POST',
@@ -1293,6 +1375,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with these ke
       if (!parsed) throw new Error('Could not parse ideas from AI response');
       setIdeas(parsed);
     } catch (e) {
+      console.error(e);
       showGlobalMessage('Could not fetch real events. Try again.', 'error');
     } finally {
       setGenerating(false);
@@ -1320,7 +1403,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with these ke
 
   return (
     <div>
-      <div className="flex flex-col md:flex-row gap-4 mb-8 bg-indigo-50 p-6 rounded-2xl items-end">
+      <div className="flex flex-col md:flex-row gap-4 mb-4 bg-indigo-50 p-6 rounded-2xl items-end">
         <div className="flex-1 w-full">
           <label className="block text-sm font-bold text-indigo-900 mb-2">Select a Group</label>
           <select value={selectedId} onChange={(e) => setSelectedId(e.target.value)} className="w-full p-3 rounded-xl border-indigo-200 focus:ring-indigo-500 bg-white">
@@ -1337,6 +1420,26 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with these ke
           {generating ? 'Searching web...' : 'Find Real Events'}
         </button>
       </div>
+
+      {memberSummary && (
+        <div className="mb-8 bg-white border border-indigo-100 rounded-2xl p-4 text-sm text-gray-700">
+          <p className="font-semibold text-gray-800 mb-1 flex items-center gap-2">
+            <UsersIcon className="w-4 h-4 text-indigo-500" />
+            Finding events for {memberSummary.count} member{memberSummary.count === 1 ? '' : 's'}: {memberSummary.names.join(', ')}
+          </p>
+          {memberSummary.prefs.length > 0 ? (
+            <p className="text-xs text-gray-500 mt-1">
+              <span className="font-medium">Combined interests:</span> {memberSummary.prefs.join(', ')}
+            </p>
+          ) : (
+            <p className="text-xs text-gray-400 mt-1 italic">No interests captured yet — ideas will be more relevant once members fill in their profiles.</p>
+          )}
+          <p className="text-xs text-gray-500 mt-0.5">
+            <span className="font-medium">Calendar mining:</span>{' '}
+            {memberSummary.hasAvailability ? 'At least one member has synced free time — we\'ll prefer slots that overlap.' : 'No members have synced calendars yet.'}
+          </p>
+        </div>
+      )}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
         {ideas.map((idea, i) => (
           <SuggestionCard key={i} idea={idea} onPropose={handleProposeSuggestion} googleAccessToken={googleAccessToken} showGlobalMessage={showGlobalMessage} />
