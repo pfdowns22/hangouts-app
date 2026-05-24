@@ -32,6 +32,12 @@ import { auth, db, storage, appId, geminiApiKey } from './firebase.js';
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiApiKey}`;
 
+// Deterministic placeholder image when Gemini doesn't return an imageUrl
+// (it returns null surprisingly often) or the URL it returned is broken.
+// Picsum.photos seeded by title gives the same image for the same event.
+const fallbackImage = (title) =>
+  `https://picsum.photos/seed/${encodeURIComponent(title || 'event')}/800/400`;
+
 // Gemini doesn't allow `tools: [{google_search:{}}]` together with
 // `responseSchema: application/json`. For grounded calls we parse JSON
 // out of the model's text output instead of relying on schema enforcement.
@@ -349,6 +355,9 @@ const ProfileSection = ({ onClose }) => {
   const [preferences, setPreferences] = useState(userProfile?.preferences || []);
   const [currentPreference, setCurrentPreference] = useState('');
   const [availableDates, setAvailableDates] = useState(userProfile?.availability || []);
+  const [timeOfDayPrefs, setTimeOfDayPrefs] = useState(userProfile?.timeOfDayPrefs || []);
+  const [dayOfWeekPrefs, setDayOfWeekPrefs] = useState(userProfile?.dayOfWeekPrefs || []);
+  const [freeSlots, setFreeSlots] = useState(userProfile?.freeSlots || []);
   const [isSaving, setIsSaving] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [analyzingCalendar, setAnalyzingCalendar] = useState(false);
@@ -375,8 +384,18 @@ const ProfileSection = ({ onClose }) => {
   const handleSaveProfile = async () => {
     setIsSaving(true);
     try {
-      await updateDoc(doc(db, `artifacts/${appId}/users/${userId}/profiles`, 'myProfile'), { name, address, kids, preferences, availability: availableDates });
-      setUserProfile((prev) => ({ ...prev, name, address, kids, preferences, availability: availableDates }));
+      const update = {
+        name,
+        address,
+        kids,
+        preferences,
+        availability: availableDates,
+        timeOfDayPrefs,
+        dayOfWeekPrefs,
+        freeSlots,
+      };
+      await updateDoc(doc(db, `artifacts/${appId}/users/${userId}/profiles`, 'myProfile'), update);
+      setUserProfile((prev) => ({ ...prev, ...update }));
       showGlobalMessage('Profile saved successfully!');
       onClose();
     } catch (e) {
@@ -385,6 +404,9 @@ const ProfileSection = ({ onClose }) => {
       setIsSaving(false);
     }
   };
+
+  const togglePref = (list, setter, value) =>
+    setter(list.includes(value) ? list.filter((x) => x !== value) : [...list, value]);
 
   const analyzeCalendarWithGemini = async () => {
     if (!googleAccessToken) {
@@ -410,7 +432,16 @@ const ProfileSection = ({ onClose }) => {
         ? calendarData.items.map((e) => ({ start: e.start.dateTime || e.start.date, end: e.end.dateTime || e.end.date, summary: e.summary }))
         : [];
 
-      const prompt = `Here is a list of my calendar events for the next 30 days: ${JSON.stringify(events)}.\nAnalyze my schedule and identify dates (YYYY-MM-DD) where I am "Available" for social hangouts.\nReturn strictly a JSON array of string dates.`;
+      const prompt = `Here is a list of my calendar events for the next 30 days: ${JSON.stringify(events)}.
+Analyze my schedule and identify SPECIFIC FREE TIME BLOCKS where I could realistically attend a 1-3 hour social hangout.
+Rules:
+- Assume my "social hours" are roughly 9:00 to 22:00 local time (not overnight).
+- A free block must be at least 90 minutes long with no conflicting events.
+- Prefer evenings (after 17:00) and weekend afternoons; only suggest weekday daytime blocks if I have a clearly open calendar.
+- Skip any block that ends less than 30 minutes before the next event (need transit/buffer time).
+- Cap at the 25 best blocks.
+Return strictly a JSON array (no prose, no markdown fences) of objects with shape:
+{ "date": "YYYY-MM-DD", "start": "HH:MM", "end": "HH:MM", "label": "short human label like 'Tue evening' or 'Sat afternoon'" }`;
 
       const geminiRes = await fetch(GEMINI_URL, {
         method: 'POST',
@@ -419,15 +450,30 @@ const ProfileSection = ({ onClose }) => {
           contents: [{ role: 'user', parts: [{ text: prompt }] }],
           generationConfig: {
             responseMimeType: 'application/json',
-            responseSchema: { type: 'ARRAY', items: { type: 'STRING' } },
+            responseSchema: {
+              type: 'ARRAY',
+              items: {
+                type: 'OBJECT',
+                properties: {
+                  date: { type: 'STRING' },
+                  start: { type: 'STRING' },
+                  end: { type: 'STRING' },
+                  label: { type: 'STRING' },
+                },
+                required: ['date', 'start', 'end'],
+              },
+            },
           },
         }),
       });
       const data = await geminiRes.json();
       if (!data.candidates) throw new Error('AI generated empty response.');
-      const available = JSON.parse(data.candidates[0].content.parts[0].text);
-      setAvailableDates((prev) => [...new Set([...prev, ...available])].sort());
-      showGlobalMessage(`Synced! Found ${available.length} available dates.`);
+      const slots = JSON.parse(data.candidates[0].content.parts[0].text);
+      setFreeSlots(slots);
+      // Keep the day-level checked state in sync so the calendar reflects which days have any availability
+      const days = [...new Set(slots.map((s) => s.date))].sort();
+      setAvailableDates((prev) => [...new Set([...prev, ...days])].sort());
+      showGlobalMessage(`Synced! Found ${slots.length} free time blocks across ${days.length} days.`);
     } catch (error) {
       console.error(error);
       showGlobalMessage('Could not sync calendar.', 'error');
@@ -536,9 +582,53 @@ const ProfileSection = ({ onClose }) => {
         </div>
       </div>
 
+      <div className="space-y-3">
+        <h3 className="font-bold text-gray-800">When are you usually free?</h3>
+        <div>
+          <label className="block text-xs font-semibold uppercase text-gray-500 mb-2">Times of day</label>
+          <div className="flex flex-wrap gap-2">
+            {['Mornings', 'Afternoons', 'Evenings'].map((slot) => {
+              const active = timeOfDayPrefs.includes(slot);
+              return (
+                <button
+                  key={slot}
+                  type="button"
+                  onClick={() => togglePref(timeOfDayPrefs, setTimeOfDayPrefs, slot)}
+                  className={`px-3 py-1.5 rounded-full text-sm font-medium border transition ${
+                    active ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-700 border-gray-200 hover:border-indigo-300'
+                  }`}
+                >
+                  {slot}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+        <div>
+          <label className="block text-xs font-semibold uppercase text-gray-500 mb-2">Days of week</label>
+          <div className="flex flex-wrap gap-2">
+            {['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map((day) => {
+              const active = dayOfWeekPrefs.includes(day);
+              return (
+                <button
+                  key={day}
+                  type="button"
+                  onClick={() => togglePref(dayOfWeekPrefs, setDayOfWeekPrefs, day)}
+                  className={`px-3 py-1.5 rounded-full text-sm font-medium border transition ${
+                    active ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-700 border-gray-200 hover:border-indigo-300'
+                  }`}
+                >
+                  {day}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
       <div>
         <div className="flex justify-between items-center mb-3">
-          <h3 className="font-bold text-gray-800">Availability</h3>
+          <h3 className="font-bold text-gray-800">Availability Calendar</h3>
           <button onClick={analyzeCalendarWithGemini} disabled={analyzingCalendar} className="text-xs bg-indigo-50 text-indigo-700 px-3 py-1.5 rounded-lg font-bold flex items-center gap-1 hover:bg-indigo-100 transition disabled:opacity-50">
             {analyzingCalendar ? (
               <div className="w-3 h-3 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />
@@ -549,6 +639,19 @@ const ProfileSection = ({ onClose }) => {
           </button>
         </div>
         <CalendarPicker selectedDates={availableDates} onDateToggle={handleDateToggle} />
+        {freeSlots.length > 0 && (
+          <div className="mt-4 bg-indigo-50 border border-indigo-100 rounded-xl p-4">
+            <h4 className="text-sm font-bold text-indigo-900 mb-2">Free time blocks ({freeSlots.length})</h4>
+            <div className="max-h-48 overflow-y-auto space-y-1 text-sm text-indigo-800">
+              {freeSlots.map((s, i) => (
+                <div key={i} className="flex justify-between gap-2 py-1 border-b border-indigo-100 last:border-0">
+                  <span className="font-medium">{s.label || s.date}</span>
+                  <span className="font-mono text-xs">{s.date} · {s.start}–{s.end}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
       <div className="flex justify-end pt-4 border-t">
         <button onClick={handleSaveProfile} disabled={isSaving} className="bg-indigo-600 text-white font-bold py-3 px-8 rounded-xl hover:bg-indigo-700 transition shadow-lg shadow-indigo-200">
@@ -616,12 +719,36 @@ const MyFeedSection = () => {
   const { userId, userProfile, showGlobalMessage } = useContext(AppContext);
   const [feedItems, setFeedItems] = useState([]);
   const [isGenerating, setIsGenerating] = useState(false);
+  const sentinelRef = useRef(null);
+  const generatingRef = useRef(false);
 
   useEffect(() => {
     if (!userId) return;
     const q = query(collection(db, `artifacts/${appId}/users/${userId}/feed`), orderBy('timestamp', 'desc'), limit(50));
     return onSnapshot(q, (snapshot) => setFeedItems(snapshot.docs.map((d) => ({ id: d.id, ...d.data() }))));
   }, [userId]);
+
+  // Infinite scroll: when sentinel becomes visible and we already have content,
+  // auto-fetch another batch of upcoming events. Guarded by generatingRef so we
+  // never fire concurrent fetches.
+  useEffect(() => {
+    if (!sentinelRef.current || feedItems.length === 0) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting && !generatingRef.current) {
+          generatingRef.current = true;
+          generatePersonalSuggestions(false).finally(() => {
+            // small cooldown so a single scroll-to-bottom doesn't spam requests
+            setTimeout(() => { generatingRef.current = false; }, 3000);
+          });
+        }
+      },
+      { rootMargin: '200px' }
+    );
+    observer.observe(sentinelRef.current);
+    return () => observer.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [feedItems.length, userProfile]);
 
   const deleteFeedItem = async (itemId) => {
     try {
@@ -643,13 +770,26 @@ const MyFeedSection = () => {
       const loc = userProfile?.address || 'New York, NY';
       const prefs = userProfile?.preferences?.join(', ') || 'general fun';
       const kidsText = userProfile?.kids?.length ? `Kids ages: ${userProfile.kids.map((k) => k.age).join(',')}` : 'No kids';
+      const todsPrefs = userProfile?.timeOfDayPrefs?.length ? userProfile.timeOfDayPrefs.join(', ') : 'any time';
+      const dowPrefs = userProfile?.dayOfWeekPrefs?.length ? userProfile.dayOfWeekPrefs.join(', ') : 'any day';
       const today = new Date().toDateString();
 
       const timeframePrompt = forToday
         ? `events happening strictly TODAY, ${today}, or tonight.`
         : `upcoming events happening within the next 30 days.`;
 
-      const prompt = `Today is ${today}. Find 5 ACTUAL, REAL-WORLD events, pop-ups, festivals, or highly-rated specific venue activities in or near ${loc} ${timeframePrompt}\nTailor to these constraints: ${kidsText}, Preferences: ${prefs}.\nIMPORTANT: Do not make up events. Only suggest real events you found. Ensure dates are strictly in the future or today. Include a real URL for the event and a relevant high-quality image URL.\nReturn ONLY a JSON array (no prose, no markdown fences) of objects with these keys: title (string), description (string), location (string), date (string in "YYYY-MM-DD HH:MM" format), url (string), imageUrl (string).`;
+      const prompt = `Today is ${today}. Find 5 ACTUAL, REAL-WORLD events, pop-ups, festivals, or highly-rated specific venue activities CLOSE TO ${loc} (within ~15 miles / 25 km — prefer the user's own neighborhood and surrounding area, NOT generic city-wide listings) ${timeframePrompt}
+Constraints:
+- Family situation: ${kidsText}
+- Interests/preferences: ${prefs}
+- Preferred times of day: ${todsPrefs}
+- Preferred days of week: ${dowPrefs}
+IMPORTANT:
+- Do NOT make up events. Only suggest real events you can verify via web search.
+- Ensure event dates are strictly today or in the future.
+- For each event, include the OFFICIAL event/venue URL (no aggregator links if avoidable).
+- For imageUrl, find a real public image URL (jpg/png/webp) from the event's official website, venue site, or a major publication — verify the URL is reachable. If you can't find one, set imageUrl to null.
+Return ONLY a JSON array (no prose, no markdown fences) of objects with these keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl.`;
 
       const response = await fetch(GEMINI_URL, {
         method: 'POST',
@@ -709,6 +849,16 @@ const MyFeedSection = () => {
           {feedItems.map((item) => (
             <FeedCard key={item.id} item={item} onDelete={() => deleteFeedItem(item.id)} />
           ))}
+          {/* Infinite scroll sentinel: when visible, fetch more upcoming events */}
+          <div ref={sentinelRef} className="h-12 flex items-center justify-center text-sm text-gray-400">
+            {isGenerating === 'upcoming' ? (
+              <span className="flex items-center gap-2">
+                <SearchIcon className="w-4 h-4 animate-spin" /> Finding more events…
+              </span>
+            ) : (
+              'Scroll for more'
+            )}
+          </div>
         </div>
       )}
     </div>
@@ -755,11 +905,17 @@ const FeedCard = ({ item, onDelete }) => {
         <TrashIcon className="w-5 h-5" />
       </button>
 
-      {data.imageUrl && (
-        <div className="w-full h-48 mb-4 rounded-xl overflow-hidden bg-gray-100 -mt-2">
-          <img src={data.imageUrl} alt={data.title} className="w-full h-full object-cover" onError={(e) => (e.target.style.display = 'none')} />
-        </div>
-      )}
+      <div className="w-full h-48 mb-4 rounded-xl overflow-hidden bg-gray-100 -mt-2">
+        <img
+          src={data.imageUrl || fallbackImage(data.title)}
+          alt={data.title}
+          className="w-full h-full object-cover"
+          onError={(e) => {
+            const fb = fallbackImage(data.title);
+            if (e.target.src !== fb) e.target.src = fb;
+          }}
+        />
+      </div>
 
       <div className="flex justify-between items-start pr-8">
         <div className="w-full">
@@ -1012,9 +1168,18 @@ const SuggestionSection = () => {
     try {
       const group = groups.find((g) => g.id === selectedId);
       const loc = userProfile?.address || 'New York';
+      const todsPrefs = userProfile?.timeOfDayPrefs?.length ? userProfile.timeOfDayPrefs.join(', ') : 'any time';
+      const dowPrefs = userProfile?.dayOfWeekPrefs?.length ? userProfile.dayOfWeekPrefs.join(', ') : 'any day';
       const today = new Date().toDateString();
 
-      const prompt = `Today is ${today}. Search the web for 6 ACTUAL, REAL-WORLD events, pop-ups, festivals, or verifiable activities for a group named "${group.name}".\nLocation: ${loc}.\nIMPORTANT: All dates must be in the future relative to today. Do not hallucinate events. Include a real URL and a relevant image URL for each event.\nReturn ONLY a JSON array (no prose, no markdown fences) of objects with these keys: title (string), description (string), location (string), date (string in "YYYY-MM-DD HH:MM" format), url (string), imageUrl (string).`;
+      const prompt = `Today is ${today}. Search the web for 6 ACTUAL, REAL-WORLD events, pop-ups, festivals, or verifiable activities for a group named "${group.name}" CLOSE TO ${loc} (within ~15 miles / 25 km — prefer the user's own neighborhood, NOT generic city-wide listings).
+Preferred times of day: ${todsPrefs}. Preferred days of week: ${dowPrefs}.
+IMPORTANT:
+- All dates must be today or in the future.
+- Do not hallucinate events. Use real web results only.
+- Include the OFFICIAL event/venue URL.
+- For imageUrl, find a real public image URL from the event's website, venue site, or a major publication. If you can't find one, set imageUrl to null.
+Return ONLY a JSON array (no prose, no markdown fences) of objects with these keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl.`;
 
       const res = await fetch(GEMINI_URL, {
         method: 'POST',
@@ -1077,11 +1242,17 @@ const SuggestionSection = () => {
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
         {ideas.map((idea, i) => (
           <div key={i} className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 flex flex-col hover:-translate-y-1 transition duration-300">
-            {idea.imageUrl && (
-              <div className="w-full h-32 mb-4 rounded-xl overflow-hidden bg-gray-100 -mt-2">
-                <img src={idea.imageUrl} alt={idea.title} className="w-full h-full object-cover" onError={(e) => (e.target.style.display = 'none')} />
-              </div>
-            )}
+            <div className="w-full h-32 mb-4 rounded-xl overflow-hidden bg-gray-100 -mt-2">
+              <img
+                src={idea.imageUrl || fallbackImage(idea.title)}
+                alt={idea.title}
+                className="w-full h-full object-cover"
+                onError={(e) => {
+                  const fb = fallbackImage(idea.title);
+                  if (e.target.src !== fb) e.target.src = fb;
+                }}
+              />
+            </div>
             <h3 className="font-bold text-lg text-gray-800 mb-2">{idea.title}</h3>
             <p className="text-gray-600 text-sm mb-4 flex-1">{idea.description}</p>
             <div className="text-xs text-gray-500 mb-4 space-y-1">
