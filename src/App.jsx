@@ -32,6 +32,25 @@ import { auth, db, storage, appId, geminiApiKey } from './firebase.js';
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiApiKey}`;
 
+// Gemini doesn't allow `tools: [{google_search:{}}]` together with
+// `responseSchema: application/json`. For grounded calls we parse JSON
+// out of the model's text output instead of relying on schema enforcement.
+const extractJsonArray = (text) => {
+  if (!text) return null;
+  // Try fenced code block first
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const candidate = fenced ? fenced[1] : text;
+  // Find first '[' and last ']' to isolate the array
+  const start = candidate.indexOf('[');
+  const end = candidate.lastIndexOf(']');
+  if (start === -1 || end === -1 || end <= start) return null;
+  try {
+    return JSON.parse(candidate.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+};
+
 // --- Context ---
 const AppContext = createContext(null);
 
@@ -630,7 +649,7 @@ const MyFeedSection = () => {
         ? `events happening strictly TODAY, ${today}, or tonight.`
         : `upcoming events happening within the next 30 days.`;
 
-      const prompt = `Today is ${today}. Find 5 ACTUAL, REAL-WORLD events, pop-ups, festivals, or highly-rated specific venue activities in or near ${loc} ${timeframePrompt}\nTailor to these constraints: ${kidsText}, Preferences: ${prefs}.\nIMPORTANT: Do not make up events. Only suggest real events you found. Ensure dates are strictly in the future or today. Include a real URL for the event and a relevant high-quality image URL.\nFormat output strictly as a JSON array of objects.`;
+      const prompt = `Today is ${today}. Find 5 ACTUAL, REAL-WORLD events, pop-ups, festivals, or highly-rated specific venue activities in or near ${loc} ${timeframePrompt}\nTailor to these constraints: ${kidsText}, Preferences: ${prefs}.\nIMPORTANT: Do not make up events. Only suggest real events you found. Ensure dates are strictly in the future or today. Include a real URL for the event and a relevant high-quality image URL.\nReturn ONLY a JSON array (no prose, no markdown fences) of objects with these keys: title (string), description (string), location (string), date (string in "YYYY-MM-DD HH:MM" format), url (string), imageUrl (string).`;
 
       const response = await fetch(GEMINI_URL, {
         method: 'POST',
@@ -638,31 +657,14 @@ const MyFeedSection = () => {
         body: JSON.stringify({
           contents: [{ role: 'user', parts: [{ text: prompt }] }],
           tools: [{ google_search: {} }],
-          generationConfig: {
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: 'ARRAY',
-              items: {
-                type: 'OBJECT',
-                properties: {
-                  title: { type: 'STRING' },
-                  description: { type: 'STRING' },
-                  location: { type: 'STRING' },
-                  date: { type: 'STRING', description: 'Format: YYYY-MM-DD HH:MM' },
-                  url: { type: 'STRING', description: 'Valid URL to the event/venue website' },
-                  imageUrl: { type: 'STRING', description: 'Valid URL to an image representing the event' },
-                },
-                required: ['title', 'description', 'location', 'date'],
-              },
-            },
-          },
         }),
       });
 
       if (!response.ok) throw new Error('API call failed');
       const data = await response.json();
       if (!data.candidates) throw new Error('AI returned empty response');
-      const suggestions = JSON.parse(data.candidates[0].content.parts[0].text);
+      const suggestions = extractJsonArray(data.candidates[0].content.parts[0].text);
+      if (!suggestions) throw new Error('Could not parse suggestions from AI response');
       const batch = writeBatch(db);
       suggestions.forEach((s) =>
         batch.set(doc(collection(db, `artifacts/${appId}/users/${userId}/feed`)), {
@@ -1012,7 +1014,7 @@ const SuggestionSection = () => {
       const loc = userProfile?.address || 'New York';
       const today = new Date().toDateString();
 
-      const prompt = `Today is ${today}. Search the web for 6 ACTUAL, REAL-WORLD events, pop-ups, festivals, or verifiable activities for a group named "${group.name}".\nLocation: ${loc}.\nIMPORTANT: All dates must be in the future relative to today. Do not hallucinate events. Include a real URL and a relevant image URL for each event.\nFormat output strictly as a JSON array of objects.`;
+      const prompt = `Today is ${today}. Search the web for 6 ACTUAL, REAL-WORLD events, pop-ups, festivals, or verifiable activities for a group named "${group.name}".\nLocation: ${loc}.\nIMPORTANT: All dates must be in the future relative to today. Do not hallucinate events. Include a real URL and a relevant image URL for each event.\nReturn ONLY a JSON array (no prose, no markdown fences) of objects with these keys: title (string), description (string), location (string), date (string in "YYYY-MM-DD HH:MM" format), url (string), imageUrl (string).`;
 
       const res = await fetch(GEMINI_URL, {
         method: 'POST',
@@ -1020,29 +1022,13 @@ const SuggestionSection = () => {
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
           tools: [{ google_search: {} }],
-          generationConfig: {
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: 'ARRAY',
-              items: {
-                type: 'OBJECT',
-                properties: {
-                  title: { type: 'STRING' },
-                  description: { type: 'STRING' },
-                  location: { type: 'STRING' },
-                  date: { type: 'STRING', description: 'Format: YYYY-MM-DD HH:MM' },
-                  url: { type: 'STRING', description: 'Valid URL to the event/venue website' },
-                  imageUrl: { type: 'STRING', description: 'Valid URL to an image representing the event' },
-                },
-                required: ['title', 'description', 'location', 'date'],
-              },
-            },
-          },
         }),
       });
       const data = await res.json();
       if (!data.candidates) throw new Error('AI returned empty response');
-      setIdeas(JSON.parse(data.candidates[0].content.parts[0].text));
+      const parsed = extractJsonArray(data.candidates[0].content.parts[0].text);
+      if (!parsed) throw new Error('Could not parse ideas from AI response');
+      setIdeas(parsed);
     } catch (e) {
       showGlobalMessage('Could not fetch real events. Try again.', 'error');
     } finally {
