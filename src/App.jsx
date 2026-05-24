@@ -369,13 +369,30 @@ const AboutModal = ({ onClose }) => (
       <p className="text-lg text-gray-800 font-medium">Simplify your social life.</p>
       <p>Hangouts uses advanced AI with live Search Grounding to find the perfect real activity for any group, taking into account everyone's schedule, location, and preferences.</p>
       <div className="bg-indigo-50 p-4 rounded-xl border border-indigo-100">
-        <h4 className="font-bold text-indigo-900 mb-2">New in 3.0</h4>
+        <h4 className="font-bold text-indigo-900 mb-2">What's in here</h4>
         <ul className="list-disc list-inside space-y-1 text-sm">
-          <li>Live Google Search Grounded Event Discovery</li>
-          <li>Event Thumbnails &amp; "More Info" Booking links</li>
-          <li>Direct Google Calendar Sync Integration</li>
-          <li>"Ideas for Today" quick generation</li>
+          <li>Live Google Search grounded event discovery</li>
+          <li>Real Unsplash images for every event</li>
+          <li>Group invites via shareable link or email</li>
+          <li>Group proposals with Accept / Decline RSVPs</li>
+          <li>Calendar mining — Gemini turns your Google Calendar into free-time blocks</li>
+          <li>Infinite scroll on your feed</li>
         </ul>
+      </div>
+      <div className="bg-amber-50 p-4 rounded-xl border border-amber-100">
+        <h4 className="font-bold text-amber-900 mb-2">Using iPhone / iCloud Calendar?</h4>
+        <p className="text-sm mb-2">Hangouts reads from Google Calendar, but you can sync your iCloud calendar into Google in two minutes:</p>
+        <ol className="list-decimal list-inside space-y-1 text-sm">
+          <li>On your iPhone: <em>Settings → Calendar → Accounts → Add Account → Google</em>. Sign in.</li>
+          <li>Make sure "Calendars" is toggled on for that Google account.</li>
+          <li>Open the Calendar app, hit "Calendars" at the bottom, and check every Google calendar you want Hangouts to see.</li>
+          <li>(Optional) From iCloud.com → Calendar → click the radio-tower icon next to a calendar → Public Calendar → copy the link → in Google Calendar (web) → Other calendars → From URL.</li>
+        </ol>
+        <p className="text-xs text-gray-500 mt-2">After syncing, hit "Analyze with Gemini" in your profile to mine the combined view.</p>
+      </div>
+      <div className="bg-rose-50 p-4 rounded-xl border border-rose-100 text-sm">
+        <h4 className="font-bold text-rose-900 mb-1">Private preview</h4>
+        <p>This is a friends-and-family build. Please don't share the passcode or the URL outside the group.</p>
       </div>
     </div>
   </Modal>
@@ -1989,6 +2006,73 @@ const JoinGroupModal = ({ groupId, onClose }) => {
   );
 };
 
+// --- Name Setting (for anonymous + new users) ---
+// Anonymous Firebase Auth users come in with no displayName, so their
+// profile defaults to "User". When that's the case (or the name is
+// missing/blank), prompt the user to pick a display name so group
+// members can tell them apart.
+const NameSettingModal = ({ onClose }) => {
+  const { userId, userProfile, setUserProfile, showGlobalMessage } = useContext(AppContext);
+  const [name, setName] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  const save = async () => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setSaving(true);
+    try {
+      await updateDoc(doc(db, `artifacts/${appId}/users/${userId}/profiles`, 'myProfile'), { name: trimmed });
+      setUserProfile((p) => ({ ...(p || {}), name: trimmed }));
+      showGlobalMessage(`Welcome, ${trimmed}!`);
+      onClose();
+    } catch (e) {
+      console.error(e);
+      showGlobalMessage('Could not save your name.', 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    // No outer onClose handler — user must enter a name (or skip explicitly).
+    <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex justify-center items-center p-4">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md flex flex-col">
+        <header className="p-5 border-b border-gray-100">
+          <h2 className="text-xl font-bold text-gray-800">What should we call you?</h2>
+        </header>
+        <div className="p-6 space-y-4">
+          <p className="text-sm text-gray-500">
+            Your group members will see this name when you chat or propose events. You can change it later in your profile.
+          </p>
+          <input
+            autoFocus
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && save()}
+            placeholder="Your first name"
+            className="w-full p-3 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:bg-white transition"
+          />
+          <div className="flex gap-2">
+            <button
+              onClick={onClose}
+              className="flex-1 py-3 rounded-xl font-medium text-gray-500 hover:bg-gray-100 transition"
+            >
+              Skip
+            </button>
+            <button
+              onClick={save}
+              disabled={!name.trim() || saving}
+              className="flex-1 bg-indigo-600 text-white py-3 rounded-xl font-bold disabled:opacity-50 hover:bg-indigo-700 transition"
+            >
+              {saving ? 'Saving…' : 'Continue'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // --- Send-to-Group ---
 // Lets the user propose an event from their personal feed to any group
 // they're a member of. Mirrors the SuggestionSection propose flow:
@@ -2319,7 +2403,16 @@ export default function App() {
   const [showAboutModal, setShowAboutModal] = useState(false);
   const [pendingJoinGroupId, setPendingJoinGroupId] = useState(null);
   const [unreadFeedCount, setUnreadFeedCount] = useState(0);
+  const [nameSkipped, setNameSkipped] = useState(false);
   const seenFeedIdsRef = useRef(null); // null until first snapshot lands
+
+  // Once we have a userId + a loaded profile, decide whether the name
+  // prompt should appear (anonymous user, or somehow no name set).
+  const needsName =
+    !!userId &&
+    !!userProfile &&
+    !nameSkipped &&
+    (!userProfile.name || userProfile.name === 'User' || userProfile.name.trim() === '');
 
   const showGlobalMessage = useCallback((text, type = 'success') => {
     setMsg({ text, type });
@@ -2465,6 +2558,7 @@ export default function App() {
           {pendingJoinGroupId && (
             <JoinGroupModal groupId={pendingJoinGroupId} onClose={() => setPendingJoinGroupId(null)} />
           )}
+          {needsName && <NameSettingModal onClose={() => setNameSkipped(true)} />}
           <FeedbackButton />
         </div>
         )}
