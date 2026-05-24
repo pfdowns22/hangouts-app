@@ -17,12 +17,27 @@ service cloud.firestore {
         && request.resource.data.userId == request.auth.uid;
     }
 
-    // Group docs: any signed-in user can read; only members can write
+    // Group docs: any signed-in user can read.
+    // Existing members can update any field.
+    // Non-members can ONLY add themselves to members[] (used by the invite-link join flow).
     match /artifacts/{appId}/public/data/groups/{groupId} {
       allow read: if request.auth != null;
       allow create: if request.auth != null;
-      allow update, delete: if request.auth != null
+      allow delete: if request.auth != null
         && request.auth.uid in resource.data.members;
+      allow update: if request.auth != null && (
+        // Existing member — full update permission
+        request.auth.uid in resource.data.members
+        ||
+        // Non-member joining via invite: only modifies members[], and only
+        // by appending their own uid (no removals, no other field changes).
+        (
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['members'])
+          && request.resource.data.members.hasAll(resource.data.members)
+          && request.resource.data.members.hasAll([request.auth.uid])
+          && !(request.auth.uid in resource.data.members)
+        )
+      );
 
       // Messages inside a group: only members can read/write
       match /messages/{messageId} {

@@ -163,6 +163,9 @@ const LeaveIcon = () => <Icon path="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3
 const SyncIcon = ({ className = 'w-6 h-6' }) => <Icon path="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" className={className} />;
 const SearchIcon = ({ className = 'w-6 h-6' }) => <Icon path="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" className={className} />;
 const ChatIcon = ({ className = 'w-6 h-6' }) => <Icon path="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" className={className} />;
+const CopyIcon = ({ className = 'w-6 h-6' }) => <Icon path="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" className={className} />;
+const MailIcon = ({ className = 'w-6 h-6' }) => <Icon path="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" className={className} />;
+const InviteIcon = ({ className = 'w-6 h-6' }) => <Icon path="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z" className={className} />;
 
 // --- Calendar Utilities ---
 const generateICSFile = (suggestion) => {
@@ -1119,6 +1122,7 @@ const CreateGroupModal = ({ onClose }) => {
 const GroupDetailView = ({ group, onBack }) => {
   const { userId, showGlobalMessage, getUserNameById } = useContext(AppContext);
   const [members, setMembers] = useState([]);
+  const [showInvite, setShowInvite] = useState(false);
 
   useEffect(() => {
     Promise.all(group.members.map((id) => getUserNameById(id))).then(setMembers);
@@ -1142,10 +1146,20 @@ const GroupDetailView = ({ group, onBack }) => {
           <Icon path="M15 19l-7-7 7-7" /> Back
         </button>
         <h2 className="text-xl font-bold">{group.name}</h2>
-        <button onClick={handleLeave} className="text-red-400 hover:text-red-600 p-2 rounded-full hover:bg-red-50">
-          <LeaveIcon />
-        </button>
+        <div className="flex items-center gap-1">
+          <button
+            onClick={() => setShowInvite(true)}
+            className="text-indigo-500 hover:text-indigo-700 p-2 rounded-full hover:bg-indigo-50 flex items-center gap-1"
+            title="Invite people"
+          >
+            <InviteIcon className="w-5 h-5" />
+          </button>
+          <button onClick={handleLeave} className="text-red-400 hover:text-red-600 p-2 rounded-full hover:bg-red-50" title="Leave group">
+            <LeaveIcon />
+          </button>
+        </div>
       </div>
+      {showInvite && <InviteModal group={group} onClose={() => setShowInvite(false)} />}
       <div className="flex-1 overflow-hidden flex flex-col md:flex-row gap-4">
         <div className="flex-1 flex flex-col min-h-0 bg-white rounded-2xl border shadow-sm overflow-hidden">
           <ChatRoom groupId={group.id} />
@@ -1451,6 +1465,225 @@ const AuthScreen = () => {
   );
 };
 
+// --- Group Invites ---
+const buildInviteUrl = (groupId) => {
+  if (typeof window === 'undefined') return '';
+  return `${window.location.origin}/?join=${encodeURIComponent(groupId)}`;
+};
+
+const InviteModal = ({ group, onClose }) => {
+  const { showGlobalMessage } = useContext(AppContext);
+  const inviteUrl = buildInviteUrl(group.id);
+  const [emails, setEmails] = useState('');
+  const [sending, setSending] = useState(false);
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(inviteUrl);
+      showGlobalMessage('Link copied to clipboard!');
+    } catch {
+      showGlobalMessage('Copy failed — select the link and copy manually.', 'error');
+    }
+  };
+
+  const share = async () => {
+    if (!navigator.share) return copy();
+    try {
+      await navigator.share({
+        title: `Join "${group.name}" on Hangouts`,
+        text: `Join "${group.name}" on Hangouts — passcode is hangouts2026`,
+        url: inviteUrl,
+      });
+    } catch {
+      // user cancelled — no-op
+    }
+  };
+
+  const sendEmails = async () => {
+    const list = emails
+      .split(/[,\s\n]+/)
+      .map((s) => s.trim())
+      .filter((s) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(s));
+    if (list.length === 0) {
+      showGlobalMessage('No valid email addresses to send.', 'error');
+      return;
+    }
+    if (!FEEDBACK_KEY) {
+      showGlobalMessage('Email sending not configured (missing VITE_FEEDBACK_KEY).', 'error');
+      return;
+    }
+    setSending(true);
+    let ok = 0;
+    for (const addr of list) {
+      try {
+        await fetch('https://api.web3forms.com/submit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          body: JSON.stringify({
+            access_key: FEEDBACK_KEY,
+            subject: `You're invited to join "${group.name}" on Hangouts`,
+            from_name: 'Hangouts',
+            email: addr,
+            message: `You've been invited to join the group "${group.name}" on Hangouts.\n\nClick to join: ${inviteUrl}\n\nFirst time? You'll be asked for a passcode — it's: hangouts2026`,
+          }),
+        });
+        ok += 1;
+      } catch (e) {
+        console.warn('Invite email failed for', addr, e);
+      }
+    }
+    setSending(false);
+    setEmails('');
+    showGlobalMessage(`Sent ${ok} of ${list.length} invites.`, ok === list.length ? 'success' : 'error');
+  };
+
+  return (
+    <Modal onClose={onClose} title={`Invite to "${group.name}"`}>
+      <div className="space-y-6">
+        <div>
+          <label className="block text-xs font-semibold uppercase text-gray-500 mb-2">Shareable link</label>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              readOnly
+              value={inviteUrl}
+              onFocus={(e) => e.target.select()}
+              className="flex-1 p-3 bg-gray-50 border border-gray-200 rounded-xl text-sm font-mono"
+            />
+            <button
+              onClick={copy}
+              className="px-4 py-3 bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 font-medium text-sm flex items-center gap-2 transition"
+            >
+              <CopyIcon className="w-4 h-4" /> Copy
+            </button>
+          </div>
+          {typeof navigator !== 'undefined' && navigator.share && (
+            <button
+              onClick={share}
+              className="mt-3 w-full bg-gray-100 hover:bg-gray-200 text-gray-700 py-2.5 rounded-xl font-medium text-sm flex items-center justify-center gap-2 transition"
+            >
+              <ShareIcon className="w-4 h-4" /> Share via…
+            </button>
+          )}
+          <p className="text-xs text-gray-400 mt-2">Anyone with this link who can get past the passcode can join.</p>
+        </div>
+
+        <div>
+          <label className="block text-xs font-semibold uppercase text-gray-500 mb-2 flex items-center gap-2">
+            <MailIcon className="w-4 h-4" /> Or email it directly
+          </label>
+          <textarea
+            value={emails}
+            onChange={(e) => setEmails(e.target.value)}
+            placeholder="alice@example.com, bob@example.com"
+            className="w-full p-3 bg-gray-50 border border-gray-200 rounded-xl text-sm min-h-20 focus:ring-2 focus:ring-indigo-500"
+          />
+          <button
+            onClick={sendEmails}
+            disabled={sending || !emails.trim()}
+            className="mt-3 w-full bg-indigo-600 text-white py-2.5 rounded-xl font-bold disabled:opacity-50 hover:bg-indigo-700 transition"
+          >
+            {sending ? 'Sending…' : 'Send invites'}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+};
+
+const JoinGroupModal = ({ groupId, onClose }) => {
+  const { userId, userProfile, setUserProfile, showGlobalMessage } = useContext(AppContext);
+  const [group, setGroup] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [joining, setJoining] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const snap = await getDoc(doc(db, `artifacts/${appId}/public/data/groups`, groupId));
+        if (cancelled) return;
+        if (!snap.exists()) {
+          showGlobalMessage("That group doesn't exist.", 'error');
+          onClose();
+          return;
+        }
+        setGroup({ id: snap.id, ...snap.data() });
+      } catch (e) {
+        showGlobalMessage('Could not load group.', 'error');
+        onClose();
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [groupId]);
+
+  const join = async () => {
+    setJoining(true);
+    try {
+      await updateDoc(doc(db, `artifacts/${appId}/public/data/groups`, groupId), { members: arrayUnion(userId) });
+      await updateDoc(doc(db, `artifacts/${appId}/users/${userId}/profiles`, 'myProfile'), { groupIds: arrayUnion(groupId) });
+      // Log it in the user's feed so they see it next time they open the app
+      await addDoc(collection(db, `artifacts/${appId}/users/${userId}/feed`), {
+        type: 'groupJoin',
+        data: { groupName: group.name, groupId },
+        timestamp: serverTimestamp(),
+      });
+      setUserProfile((prev) => ({ ...prev, groupIds: [...(prev?.groupIds || []), groupId] }));
+      showGlobalMessage(`Joined "${group.name}"!`);
+      onClose();
+    } catch (e) {
+      console.error(e);
+      showGlobalMessage('Could not join group. The invite may be invalid.', 'error');
+    } finally {
+      setJoining(false);
+    }
+  };
+
+  const alreadyMember = group?.members?.includes(userId);
+
+  return (
+    <Modal onClose={onClose} title="Group invitation">
+      {loading ? (
+        <div className="flex justify-center py-10">
+          <div className="w-8 h-8 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />
+        </div>
+      ) : !group ? null : (
+        <div className="space-y-5">
+          <div className="bg-indigo-50 border border-indigo-100 rounded-xl p-5 text-center">
+            <UsersIcon className="w-10 h-10 mx-auto text-indigo-500 mb-2" />
+            <h3 className="text-xl font-bold text-gray-900">{group.name}</h3>
+            <p className="text-sm text-gray-500 mt-1">{group.members?.length || 0} member{group.members?.length === 1 ? '' : 's'}</p>
+          </div>
+          {alreadyMember ? (
+            <>
+              <p className="text-sm text-gray-600 text-center">You're already a member of this group.</p>
+              <button onClick={onClose} className="w-full bg-gray-100 hover:bg-gray-200 text-gray-700 py-3 rounded-xl font-bold transition">
+                Close
+              </button>
+            </>
+          ) : (
+            <>
+              <p className="text-sm text-gray-600 text-center">
+                You've been invited to join <strong>{group.name}</strong> on Hangouts.
+              </p>
+              <div className="flex gap-3">
+                <button onClick={onClose} className="flex-1 bg-gray-100 hover:bg-gray-200 text-gray-700 py-3 rounded-xl font-bold transition">
+                  Not now
+                </button>
+                <button onClick={join} disabled={joining} className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white py-3 rounded-xl font-bold disabled:opacity-50 transition">
+                  {joining ? 'Joining…' : 'Join group'}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </Modal>
+  );
+};
+
 // --- Feedback Widget ---
 // Floating "Feedback" button in the bottom-right. Submitted feedback is
 // stored in Firestore (artifacts/{appId}/public/data/feedback) and, when
@@ -1645,6 +1878,23 @@ export default function App() {
   const [showProfileModal, setShowProfileModal] = useState(false);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [showAboutModal, setShowAboutModal] = useState(false);
+  const [pendingJoinGroupId, setPendingJoinGroupId] = useState(null);
+
+  // Parse `?join={groupId}` once on first load. Stash the group id; we'll
+  // surface the join modal as soon as the user is signed in.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    const join = params.get('join');
+    if (join) {
+      setPendingJoinGroupId(join);
+      // Clear the query param so a future refresh doesn't loop the prompt.
+      params.delete('join');
+      const query = params.toString();
+      const newUrl = window.location.pathname + (query ? `?${query}` : '') + window.location.hash;
+      window.history.replaceState({}, '', newUrl);
+    }
+  }, []);
 
   const showGlobalMessage = useCallback((text, type = 'success') => {
     setMsg({ text, type });
@@ -1724,6 +1974,9 @@ export default function App() {
           {showProfileModal && <ProfileModal onClose={() => setShowProfileModal(false)} />}
           {showSettingsModal && <SettingsModal onClose={() => setShowSettingsModal(false)} />}
           {showAboutModal && <AboutModal onClose={() => setShowAboutModal(false)} />}
+          {pendingJoinGroupId && (
+            <JoinGroupModal groupId={pendingJoinGroupId} onClose={() => setPendingJoinGroupId(null)} />
+          )}
           <FeedbackButton />
         </div>
         )}
