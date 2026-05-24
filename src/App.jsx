@@ -33,16 +33,70 @@ const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiApiKey}`;
 
 // Image fallback chain when Gemini's imageUrl is null or 404s.
-// 1. pollinations.ai generates a topical AI image from keywords (free, no key)
-//    — for "Liberty WNBA game" this returns a basketball-arena scene, not a random jeep.
-// 2. placehold.co text card as final fallback if pollinations is down.
-const topicalImage = (keywords) => {
+// Priority order:
+// 1. Unsplash API (real photos, fast CDN) — used if VITE_UNSPLASH_KEY is set
+// 2. pollinations.ai turbo (AI-generated, no key) — slower but works without setup
+// 3. placehold.co text card — final fallback, always loads
+const UNSPLASH_KEY = import.meta.env.VITE_UNSPLASH_KEY || '';
+
+const pollinationsImage = (keywords) => {
   const q = (keywords || 'social event').slice(0, 100);
-  return `https://image.pollinations.ai/prompt/${encodeURIComponent(q)}?width=800&height=400&nologo=true`;
+  // model=turbo is ~3x faster than flux; smaller dims generate quicker too.
+  return `https://image.pollinations.ai/prompt/${encodeURIComponent(q)}?width=600&height=300&nologo=true&model=turbo`;
 };
+
 const textPlaceholder = (title) => {
   const t = (title || 'Event').slice(0, 50);
   return `https://placehold.co/800x400/6366f1/ffffff/png?text=${encodeURIComponent(t)}`;
+};
+
+// Cache Unsplash search results per-query within the page session so we
+// don't burn the free-tier 50/hr quota on repeat renders of the same event.
+const unsplashCache = new Map();
+
+// React hook: returns the best image URL for an event, async-resolves Unsplash
+// queries when a key is configured. Falls back to pollinations otherwise.
+const useEventImage = (data) => {
+  const [src, setSrc] = useState(
+    data?.imageUrl || (UNSPLASH_KEY ? null : pollinationsImage(data?.imageKeywords || data?.title))
+  );
+
+  useEffect(() => {
+    if (data?.imageUrl) {
+      setSrc(data.imageUrl);
+      return;
+    }
+    const query = (data?.imageKeywords || data?.title || 'event').slice(0, 80);
+
+    if (!UNSPLASH_KEY) {
+      setSrc(pollinationsImage(query));
+      return;
+    }
+    if (unsplashCache.has(query)) {
+      setSrc(unsplashCache.get(query));
+      return;
+    }
+    // Async Unsplash search — falls back to pollinations on any error.
+    let cancelled = false;
+    fetch(`https://api.unsplash.com/search/photos?query=${encodeURIComponent(query)}&per_page=1&orientation=landscape&client_id=${UNSPLASH_KEY}`)
+      .then((r) => r.json())
+      .then((j) => {
+        if (cancelled) return;
+        const url = j?.results?.[0]?.urls?.regular;
+        if (url) {
+          unsplashCache.set(query, url);
+          setSrc(url);
+        } else {
+          setSrc(pollinationsImage(query));
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setSrc(pollinationsImage(query));
+      });
+    return () => { cancelled = true; };
+  }, [data?.imageUrl, data?.title, data?.imageKeywords]);
+
+  return src;
 };
 
 // Gemini doesn't allow `tools: [{google_search:{}}]` together with
@@ -104,6 +158,7 @@ const CameraIcon = ({ className = 'w-6 h-6' }) => <Icon path="M3 9a2 2 0 012-2h.
 const LeaveIcon = () => <Icon path="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />;
 const SyncIcon = ({ className = 'w-6 h-6' }) => <Icon path="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" className={className} />;
 const SearchIcon = ({ className = 'w-6 h-6' }) => <Icon path="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" className={className} />;
+const ChatIcon = ({ className = 'w-6 h-6' }) => <Icon path="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" className={className} />;
 
 // --- Calendar Utilities ---
 const generateICSFile = (suggestion) => {
@@ -882,6 +937,7 @@ const FeedCard = ({ item, onDelete }) => {
   const { data, type } = item;
   const isInvite = type === 'groupProposal';
   const bgColor = isInvite ? 'bg-amber-50 border-amber-100' : 'bg-white border-gray-100';
+  const imageSrc = useEventImage(data);
 
   if (type === 'groupJoin')
     return (
@@ -918,22 +974,25 @@ const FeedCard = ({ item, onDelete }) => {
       </button>
 
       <div className="w-full h-48 mb-4 rounded-xl overflow-hidden bg-gray-100 -mt-2">
-        <img
-          src={data.imageUrl || topicalImage(data.imageKeywords || data.title)}
-          alt={data.title}
-          className="w-full h-full object-cover"
-          onError={(e) => {
-            // Three-stage fallback: Gemini URL -> pollinations topical -> text card
-            const stage = e.target.dataset.fallbackStage || '0';
-            if (stage === '0') {
-              e.target.dataset.fallbackStage = '1';
-              e.target.src = topicalImage(data.imageKeywords || data.title);
-            } else if (stage === '1') {
-              e.target.dataset.fallbackStage = '2';
-              e.target.src = textPlaceholder(data.title);
-            }
-          }}
-        />
+        {imageSrc ? (
+          <img
+            src={imageSrc}
+            alt={data.title}
+            className="w-full h-full object-cover"
+            onError={(e) => {
+              const stage = e.target.dataset.fallbackStage || '0';
+              if (stage === '0') {
+                e.target.dataset.fallbackStage = '1';
+                e.target.src = pollinationsImage(data.imageKeywords || data.title);
+              } else if (stage === '1') {
+                e.target.dataset.fallbackStage = '2';
+                e.target.src = textPlaceholder(data.title);
+              }
+            }}
+          />
+        ) : (
+          <div className="w-full h-full animate-pulse bg-gradient-to-br from-indigo-100 to-purple-100" />
+        )}
       </div>
 
       <div className="flex justify-between items-start pr-8">
@@ -1261,57 +1320,68 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with these ke
       </div>
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
         {ideas.map((idea, i) => (
-          <div key={i} className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 flex flex-col hover:-translate-y-1 transition duration-300">
-            <div className="w-full h-32 mb-4 rounded-xl overflow-hidden bg-gray-100 -mt-2">
-              <img
-                src={idea.imageUrl || topicalImage(idea.imageKeywords || idea.title)}
-                alt={idea.title}
-                className="w-full h-full object-cover"
-                onError={(e) => {
-                  const stage = e.target.dataset.fallbackStage || '0';
-                  if (stage === '0') {
-                    e.target.dataset.fallbackStage = '1';
-                    e.target.src = topicalImage(idea.imageKeywords || idea.title);
-                  } else if (stage === '1') {
-                    e.target.dataset.fallbackStage = '2';
-                    e.target.src = textPlaceholder(idea.title);
-                  }
-                }}
-              />
-            </div>
-            <h3 className="font-bold text-lg text-gray-800 mb-2">{idea.title}</h3>
-            <p className="text-gray-600 text-sm mb-4 flex-1">{idea.description}</p>
-            <div className="text-xs text-gray-500 mb-4 space-y-1">
-              <p className="flex items-center gap-1">
-                <CalendarIcon className="w-3 h-3" /> {new Date(idea.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}
-              </p>
-              <p className="flex items-center gap-1">
-                <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-3 h-3" /> {idea.location}
-              </p>
-            </div>
-            <div className="flex flex-col gap-2 border-t pt-4 mt-auto">
-              {idea.url && (
-                <a href={idea.url} target="_blank" rel="noopener noreferrer" className="flex items-center justify-center bg-blue-50 text-blue-600 text-sm font-bold p-2.5 rounded-lg hover:bg-blue-100 transition" title="More Info">
-                  <Icon path="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" className="w-4 h-4 mr-1" /> Info / Tickets
-                </a>
-              )}
-              <div className="flex gap-2">
-                <button onClick={() => handleProposeSuggestion(idea)} className="flex-1 bg-indigo-50 text-indigo-600 text-sm font-bold py-2.5 rounded-lg hover:bg-indigo-100 transition">
-                  Propose
-                </button>
-                <button
-                  onClick={async () => {
-                    if (googleAccessToken) await addToGoogleCalendar(idea, googleAccessToken, showGlobalMessage);
-                    else generateICSFile(idea);
-                  }}
-                  className="flex-1 bg-gray-50 text-gray-700 text-sm font-bold py-2.5 rounded-lg hover:bg-gray-100 transition"
-                >
-                  Calendar
-                </button>
-              </div>
-            </div>
-          </div>
+          <SuggestionCard key={i} idea={idea} onPropose={handleProposeSuggestion} googleAccessToken={googleAccessToken} showGlobalMessage={showGlobalMessage} />
         ))}
+      </div>
+    </div>
+  );
+};
+
+const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage }) => {
+  const imageSrc = useEventImage(idea);
+  return (
+    <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 flex flex-col hover:-translate-y-1 transition duration-300">
+      <div className="w-full h-32 mb-4 rounded-xl overflow-hidden bg-gray-100 -mt-2">
+        {imageSrc ? (
+          <img
+            src={imageSrc}
+            alt={idea.title}
+            className="w-full h-full object-cover"
+            onError={(e) => {
+              const stage = e.target.dataset.fallbackStage || '0';
+              if (stage === '0') {
+                e.target.dataset.fallbackStage = '1';
+                e.target.src = pollinationsImage(idea.imageKeywords || idea.title);
+              } else if (stage === '1') {
+                e.target.dataset.fallbackStage = '2';
+                e.target.src = textPlaceholder(idea.title);
+              }
+            }}
+          />
+        ) : (
+          <div className="w-full h-full animate-pulse bg-gradient-to-br from-indigo-100 to-purple-100" />
+        )}
+      </div>
+      <h3 className="font-bold text-lg text-gray-800 mb-2">{idea.title}</h3>
+      <p className="text-gray-600 text-sm mb-4 flex-1">{idea.description}</p>
+      <div className="text-xs text-gray-500 mb-4 space-y-1">
+        <p className="flex items-center gap-1">
+          <CalendarIcon className="w-3 h-3" /> {new Date(idea.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}
+        </p>
+        <p className="flex items-center gap-1">
+          <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-3 h-3" /> {idea.location}
+        </p>
+      </div>
+      <div className="flex flex-col gap-2 border-t pt-4 mt-auto">
+        {idea.url && (
+          <a href={idea.url} target="_blank" rel="noopener noreferrer" className="flex items-center justify-center bg-blue-50 text-blue-600 text-sm font-bold p-2.5 rounded-lg hover:bg-blue-100 transition" title="More Info">
+            <Icon path="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" className="w-4 h-4 mr-1" /> Info / Tickets
+          </a>
+        )}
+        <div className="flex gap-2">
+          <button onClick={() => onPropose(idea)} className="flex-1 bg-indigo-50 text-indigo-600 text-sm font-bold py-2.5 rounded-lg hover:bg-indigo-100 transition">
+            Propose
+          </button>
+          <button
+            onClick={async () => {
+              if (googleAccessToken) await addToGoogleCalendar(idea, googleAccessToken, showGlobalMessage);
+              else generateICSFile(idea);
+            }}
+            className="flex-1 bg-gray-50 text-gray-700 text-sm font-bold py-2.5 rounded-lg hover:bg-gray-100 transition"
+          >
+            Calendar
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -1370,6 +1440,108 @@ const AuthScreen = () => {
         </div>
       </div>
     </div>
+  );
+};
+
+// --- Feedback Widget ---
+// Floating "Feedback" button in the bottom-right. Submitted feedback is
+// stored in Firestore (artifacts/{appId}/public/data/feedback) and, when
+// VITE_FEEDBACK_KEY is configured, also emailed to the project owner via
+// Web3Forms.
+const FEEDBACK_KEY = import.meta.env.VITE_FEEDBACK_KEY || '';
+
+const FeedbackButton = () => {
+  const { userId } = useContext(AppContext);
+  const [open, setOpen] = useState(false);
+  if (!userId) return null;
+  return (
+    <>
+      <button
+        onClick={() => setOpen(true)}
+        className="fixed bottom-6 right-6 bg-indigo-600 text-white pl-4 pr-5 py-3 rounded-full shadow-2xl hover:bg-indigo-700 z-40 flex items-center gap-2 font-medium text-sm transition-transform hover:scale-105"
+        title="Send feedback"
+      >
+        <ChatIcon className="w-5 h-5" />
+        Feedback
+      </button>
+      {open && <FeedbackModal onClose={() => setOpen(false)} />}
+    </>
+  );
+};
+
+const FeedbackModal = ({ onClose }) => {
+  const { userId, userProfile, showGlobalMessage } = useContext(AppContext);
+  const [text, setText] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  const submit = async () => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    setSubmitting(true);
+    const payload = {
+      text: trimmed,
+      userId,
+      userName: userProfile?.name || 'Anonymous',
+      url: typeof window !== 'undefined' ? window.location.pathname : '',
+      userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
+      timestamp: serverTimestamp(),
+    };
+    try {
+      // 1) Persist to Firestore so the owner has a permanent record.
+      await addDoc(collection(db, `artifacts/${appId}/public/data/feedback`), payload);
+
+      // 2) Optionally email the owner via Web3Forms (no signup required to send,
+      //    just an access key from the owner's Web3Forms account).
+      if (FEEDBACK_KEY) {
+        try {
+          await fetch('https://api.web3forms.com/submit', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({
+              access_key: FEEDBACK_KEY,
+              subject: 'Hangouts feedback',
+              from_name: payload.userName,
+              message: `${trimmed}\n\n— from ${payload.userName} (uid: ${userId})\nURL: ${payload.url}\nUA: ${payload.userAgent}`,
+            }),
+          });
+        } catch (e) {
+          // Email failure is non-fatal — feedback is still saved to Firestore.
+          console.warn('Web3Forms email failed:', e);
+        }
+      }
+
+      showGlobalMessage('Thanks — feedback sent!');
+      onClose();
+    } catch (e) {
+      console.error(e);
+      showGlobalMessage('Could not send feedback. Please try again.', 'error');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Modal onClose={onClose} title="Share Feedback">
+      <div className="space-y-4">
+        <p className="text-sm text-gray-500">
+          Notice something broken, an idea for an improvement, or just want to say something nice? Drop it here — it goes straight to the maintainer.
+        </p>
+        <textarea
+          autoFocus
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder="What's working? What's broken? What's missing?"
+          className="w-full p-3 border border-gray-200 rounded-xl min-h-32 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition resize-y"
+        />
+        <button
+          onClick={submit}
+          disabled={!text.trim() || submitting}
+          className="w-full bg-indigo-600 text-white py-3 rounded-xl font-bold disabled:opacity-50 hover:bg-indigo-700 transition"
+        >
+          {submitting ? 'Sending…' : 'Send feedback'}
+        </button>
+      </div>
+    </Modal>
   );
 };
 
@@ -1461,6 +1633,7 @@ export default function App() {
           {showProfileModal && <ProfileModal onClose={() => setShowProfileModal(false)} />}
           {showSettingsModal && <SettingsModal onClose={() => setShowSettingsModal(false)} />}
           {showAboutModal && <AboutModal onClose={() => setShowAboutModal(false)} />}
+          <FeedbackButton />
         </div>
       )}
     </AppContext.Provider>

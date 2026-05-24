@@ -8,6 +8,15 @@ service cloud.firestore {
       allow read, write: if request.auth != null && request.auth.uid == userId;
     }
 
+    // Feedback: any signed-in user can submit; no client reads (owner views via Firebase Console)
+    match /artifacts/{appId}/public/data/feedback/{feedbackId} {
+      allow create: if request.auth != null
+        && request.resource.data.text is string
+        && request.resource.data.text.size() > 0
+        && request.resource.data.text.size() < 5000
+        && request.resource.data.userId == request.auth.uid;
+    }
+
     // Group docs: any signed-in user can read; only members can write
     match /artifacts/{appId}/public/data/groups/{groupId} {
       allow read: if request.auth != null;
