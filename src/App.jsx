@@ -309,24 +309,36 @@ const Header = () => (
   </header>
 );
 
-const TabButton = ({ label, tabName, activeTab, setActiveTab }) => (
+const TabButton = ({ label, tabName, activeTab, setActiveTab, badge }) => (
   <button
-    className={`px-6 py-2.5 rounded-xl text-sm font-semibold transition-all duration-200 whitespace-nowrap ${
+    className={`relative px-6 py-2.5 rounded-xl text-sm font-semibold transition-all duration-200 whitespace-nowrap ${
       activeTab === tabName ? 'bg-white text-indigo-600 shadow-sm transform scale-105' : 'text-gray-600 hover:bg-white/50'
     }`}
     onClick={() => setActiveTab(tabName)}
   >
     {label}
+    {badge > 0 && (
+      <span className="absolute -top-1 -right-1 min-w-5 h-5 px-1.5 bg-red-500 text-white text-xs font-bold rounded-full flex items-center justify-center shadow">
+        {badge > 9 ? '9+' : badge}
+      </span>
+    )}
   </button>
 );
 
 const MainContent = () => {
   const [activeTab, setActiveTab] = useState('myFeed');
+  const { unreadFeedCount, markFeedRead } = useContext(AppContext);
+
+  // When the user lands on (or returns to) the My Feed tab, clear the unread badge.
+  useEffect(() => {
+    if (activeTab === 'myFeed' && unreadFeedCount > 0) markFeedRead();
+  }, [activeTab, unreadFeedCount, markFeedRead]);
+
   return (
     <div className="max-w-6xl mx-auto">
       <nav className="mb-8 flex justify-center">
         <div className="bg-white/40 backdrop-blur-lg p-1.5 rounded-2xl shadow-sm inline-flex overflow-x-auto max-w-full">
-          <TabButton label="My Feed" tabName="myFeed" activeTab={activeTab} setActiveTab={setActiveTab} />
+          <TabButton label="My Feed" tabName="myFeed" activeTab={activeTab} setActiveTab={setActiveTab} badge={unreadFeedCount} />
           <TabButton label="My Groups" tabName="groups" activeTab={activeTab} setActiveTab={setActiveTab} />
           <TabButton label="Suggestions" tabName="suggestions" activeTab={activeTab} setActiveTab={setActiveTab} />
         </div>
@@ -1983,6 +1995,52 @@ export default function App() {
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [showAboutModal, setShowAboutModal] = useState(false);
   const [pendingJoinGroupId, setPendingJoinGroupId] = useState(null);
+  const [unreadFeedCount, setUnreadFeedCount] = useState(0);
+
+  // Subscribe to the current user's feed at the top level so we can show
+  // a toast when a new group proposal arrives even if the user is on a
+  // different tab. The MyFeed tab still has its own subscription for
+  // rendering; that's a small duplication but Firestore deduplicates the
+  // wire traffic.
+  const seenFeedIdsRef = useRef(null); // null until first snapshot lands
+  useEffect(() => {
+    if (!userId) {
+      seenFeedIdsRef.current = null;
+      setUnreadFeedCount(0);
+      return;
+    }
+    const q = query(
+      collection(db, `artifacts/${appId}/users/${userId}/feed`),
+      orderBy('timestamp', 'desc'),
+      limit(30)
+    );
+    return onSnapshot(q, (snap) => {
+      const currentIds = new Set();
+      const fresh = [];
+      snap.docs.forEach((d) => {
+        currentIds.add(d.id);
+        if (seenFeedIdsRef.current && !seenFeedIdsRef.current.has(d.id)) {
+          fresh.push({ id: d.id, ...d.data() });
+        }
+      });
+      // First snapshot just establishes the baseline — don't notify.
+      if (seenFeedIdsRef.current === null) {
+        seenFeedIdsRef.current = currentIds;
+        return;
+      }
+      seenFeedIdsRef.current = currentIds;
+      // Notify on incoming proposals/suggestions from other members.
+      fresh
+        .filter((i) => i.type === 'groupProposal' || i.type === 'groupSuggestion')
+        .forEach((i) => {
+          const who = i.data?.proposerName || 'Someone';
+          const title = i.data?.title || 'a new event';
+          const group = i.data?.groupName ? ` (${i.data.groupName})` : '';
+          showGlobalMessage(`${who} proposed: "${title}"${group}`);
+        });
+      if (fresh.length) setUnreadFeedCount((n) => n + fresh.length);
+    });
+  }, [userId, showGlobalMessage]);
 
   // Parse `?join={groupId}` once on first load. Stash the group id; we'll
   // surface the join modal as soon as the user is signed in.
@@ -2062,6 +2120,8 @@ export default function App() {
           getUserNameById,
           googleAccessToken,
           setGoogleAccessToken,
+          unreadFeedCount,
+          markFeedRead: () => setUnreadFeedCount(0),
         }}
       >
         {!userId ? (
