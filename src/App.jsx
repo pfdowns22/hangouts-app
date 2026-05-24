@@ -1996,13 +1996,31 @@ export default function App() {
   const [showAboutModal, setShowAboutModal] = useState(false);
   const [pendingJoinGroupId, setPendingJoinGroupId] = useState(null);
   const [unreadFeedCount, setUnreadFeedCount] = useState(0);
+  const seenFeedIdsRef = useRef(null); // null until first snapshot lands
+
+  const showGlobalMessage = useCallback((text, type = 'success') => {
+    setMsg({ text, type });
+    setTimeout(() => setMsg(null), 3000);
+  }, []);
+
+  const getUserNameById = useCallback(async (uid) => {
+    try {
+      const snap = await getDoc(doc(db, `artifacts/${appId}/users/${uid}/profiles`, 'myProfile'));
+      return snap.exists() ? snap.data().name : 'User';
+    } catch {
+      return 'User';
+    }
+  }, []);
 
   // Subscribe to the current user's feed at the top level so we can show
   // a toast when a new group proposal arrives even if the user is on a
   // different tab. The MyFeed tab still has its own subscription for
   // rendering; that's a small duplication but Firestore deduplicates the
   // wire traffic.
-  const seenFeedIdsRef = useRef(null); // null until first snapshot lands
+  // NOTE: This effect must be declared AFTER `showGlobalMessage` because
+  // it appears in the deps array — `const` symbols are in TDZ before
+  // their initializer, and an earlier version of this code blanked the
+  // whole app with a ReferenceError on first render.
   useEffect(() => {
     if (!userId) {
       seenFeedIdsRef.current = null;
@@ -2023,13 +2041,11 @@ export default function App() {
           fresh.push({ id: d.id, ...d.data() });
         }
       });
-      // First snapshot just establishes the baseline — don't notify.
       if (seenFeedIdsRef.current === null) {
         seenFeedIdsRef.current = currentIds;
         return;
       }
       seenFeedIdsRef.current = currentIds;
-      // Notify on incoming proposals/suggestions from other members.
       fresh
         .filter((i) => i.type === 'groupProposal' || i.type === 'groupSuggestion')
         .forEach((i) => {
@@ -2050,25 +2066,10 @@ export default function App() {
     const join = params.get('join');
     if (join) {
       setPendingJoinGroupId(join);
-      // Clear the query param so a future refresh doesn't loop the prompt.
       params.delete('join');
       const query = params.toString();
       const newUrl = window.location.pathname + (query ? `?${query}` : '') + window.location.hash;
       window.history.replaceState({}, '', newUrl);
-    }
-  }, []);
-
-  const showGlobalMessage = useCallback((text, type = 'success') => {
-    setMsg({ text, type });
-    setTimeout(() => setMsg(null), 3000);
-  }, []);
-
-  const getUserNameById = useCallback(async (uid) => {
-    try {
-      const snap = await getDoc(doc(db, `artifacts/${appId}/users/${uid}/profiles`, 'myProfile'));
-      return snap.exists() ? snap.data().name : 'User';
-    } catch {
-      return 'User';
     }
   }, []);
 
