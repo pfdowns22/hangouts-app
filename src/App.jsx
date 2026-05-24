@@ -953,11 +953,14 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with these ke
 };
 
 const FeedCard = ({ item, onDelete }) => {
-  const { googleAccessToken, showGlobalMessage } = useContext(AppContext);
+  const { googleAccessToken, showGlobalMessage, userProfile } = useContext(AppContext);
   const { data, type } = item;
   const isInvite = type === 'groupProposal';
   const bgColor = isInvite ? 'bg-amber-50 border-amber-100' : 'bg-white border-gray-100';
   const imageSrc = useEventImage(data);
+  const [showSend, setShowSend] = useState(false);
+  const isEvent = type === 'personalSuggestion' || type === 'groupProposal';
+  const hasGroups = (userProfile?.groupIds?.length || 0) > 0;
 
   if (type === 'groupJoin')
     return (
@@ -1031,16 +1034,26 @@ const FeedCard = ({ item, onDelete }) => {
         </div>
       </div>
 
-      <div className="mt-5 flex gap-3 border-t border-gray-100 pt-4">
+      <div className="mt-5 flex gap-2 border-t border-gray-100 pt-4 flex-wrap">
         {data.url && (
-          <a href={data.url} target="_blank" rel="noopener noreferrer" className="flex-1 text-center text-sm font-bold text-blue-600 bg-blue-50 hover:bg-blue-100 py-2.5 rounded-lg transition flex items-center justify-center gap-1">
+          <a href={data.url} target="_blank" rel="noopener noreferrer" className="flex-1 min-w-[100px] text-center text-sm font-bold text-blue-600 bg-blue-50 hover:bg-blue-100 py-2.5 rounded-lg transition flex items-center justify-center gap-1">
             <Icon path="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" className="w-4 h-4" /> More Info
           </a>
         )}
-        <button onClick={handleCalendarClick} className="flex-1 text-sm font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 py-2.5 rounded-lg transition flex items-center justify-center gap-1">
-          <PlusIcon className="w-4 h-4" /> {googleAccessToken ? 'Save to Google Calendar' : 'Download .ics'}
+        {isEvent && hasGroups && (
+          <button
+            onClick={() => setShowSend(true)}
+            className="flex-1 min-w-[100px] text-sm font-bold text-amber-700 bg-amber-50 hover:bg-amber-100 py-2.5 rounded-lg transition flex items-center justify-center gap-1"
+            title="Send to a group"
+          >
+            <SendIcon className="w-4 h-4" /> Send to Group
+          </button>
+        )}
+        <button onClick={handleCalendarClick} className="flex-1 min-w-[100px] text-sm font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 py-2.5 rounded-lg transition flex items-center justify-center gap-1">
+          <PlusIcon className="w-4 h-4" /> {googleAccessToken ? 'Save to Calendar' : 'Download .ics'}
         </button>
       </div>
+      {showSend && <SendToGroupModal event={data} onClose={() => setShowSend(false)} />}
     </div>
   );
 };
@@ -1972,6 +1985,140 @@ const JoinGroupModal = ({ groupId, onClose }) => {
           )}
         </div>
       )}
+    </Modal>
+  );
+};
+
+// --- Send-to-Group ---
+// Lets the user propose an event from their personal feed to any group
+// they're a member of. Mirrors the SuggestionSection propose flow:
+// canonical proposal lives in the group's /proposals subcollection;
+// lightweight pings go into other members' feeds for toast + badge.
+const SendToGroupModal = ({ event, onClose }) => {
+  const { userId, userProfile, showGlobalMessage } = useContext(AppContext);
+  const [groups, setGroups] = useState([]);
+  const [loadingGroups, setLoadingGroups] = useState(true);
+  const [sendingTo, setSendingTo] = useState(null);
+
+  const groupIdsKey = userProfile?.groupIds?.join(',') || '';
+
+  useEffect(() => {
+    if (!userProfile?.groupIds?.length) {
+      setGroups([]);
+      setLoadingGroups(false);
+      return;
+    }
+    let cancelled = false;
+    Promise.all(
+      userProfile.groupIds.map(async (gid) => {
+        try {
+          const snap = await getDoc(doc(db, `artifacts/${appId}/public/data/groups`, gid));
+          return snap.exists() ? { id: snap.id, ...snap.data() } : null;
+        } catch {
+          return null;
+        }
+      })
+    ).then((arr) => {
+      if (cancelled) return;
+      setGroups(arr.filter(Boolean));
+      setLoadingGroups(false);
+    });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groupIdsKey]);
+
+  const send = async (group) => {
+    setSendingTo(group.id);
+    try {
+      const proposalData = {
+        title: event.title,
+        description: event.description || '',
+        location: event.location || '',
+        date: event.date || '',
+        url: event.url || '',
+        imageUrl: event.imageUrl || null,
+        imageKeywords: event.imageKeywords || '',
+        proposerId: userId,
+        proposerName: userProfile.name,
+        groupId: group.id,
+        groupName: group.name,
+        rsvps: { [userId]: 'yes' },
+        createdAt: serverTimestamp(),
+      };
+      const proposalRef = await addDoc(
+        collection(db, `artifacts/${appId}/public/data/groups/${group.id}/proposals`),
+        proposalData
+      );
+      // Ping other members' feeds (for toast + badge)
+      const batch = writeBatch(db);
+      (group.members || []).forEach((memberId) => {
+        if (memberId === userId) return;
+        batch.set(doc(collection(db, `artifacts/${appId}/users/${memberId}/feed`)), {
+          type: 'groupProposal',
+          data: {
+            title: event.title,
+            description: event.description,
+            location: event.location,
+            date: event.date,
+            url: event.url,
+            imageUrl: event.imageUrl,
+            imageKeywords: event.imageKeywords,
+            proposerName: userProfile.name,
+            groupId: group.id,
+            groupName: group.name,
+            proposalId: proposalRef.id,
+          },
+          timestamp: serverTimestamp(),
+        });
+      });
+      await batch.commit();
+      showGlobalMessage(`Sent "${event.title}" to ${group.name}!`);
+      onClose();
+    } catch (e) {
+      console.error(e);
+      showGlobalMessage('Could not send to that group.', 'error');
+    } finally {
+      setSendingTo(null);
+    }
+  };
+
+  return (
+    <Modal onClose={onClose} title="Send to a group">
+      <div className="space-y-3">
+        <p className="text-sm text-gray-500">
+          Propose <span className="font-semibold text-gray-700">"{event.title}"</span> to one of your groups. Members will see it on the group's Proposed Events tab.
+        </p>
+        {loadingGroups ? (
+          <div className="flex justify-center py-8">
+            <div className="w-6 h-6 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />
+          </div>
+        ) : groups.length === 0 ? (
+          <div className="text-center py-8 text-gray-500 text-sm">
+            You're not in any groups yet. Create one from the "My Groups" tab first.
+          </div>
+        ) : (
+          <div className="space-y-2 max-h-80 overflow-y-auto">
+            {groups.map((g) => (
+              <button
+                key={g.id}
+                onClick={() => send(g)}
+                disabled={sendingTo !== null}
+                className="w-full text-left p-4 bg-gray-50 hover:bg-indigo-50 rounded-xl flex items-center justify-between transition disabled:opacity-50"
+              >
+                <div>
+                  <p className="font-bold text-gray-900">{g.name}</p>
+                  <p className="text-xs text-gray-500">{g.members?.length || 0} member{g.members?.length === 1 ? '' : 's'}</p>
+                </div>
+                {sendingTo === g.id ? (
+                  <div className="w-5 h-5 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />
+                ) : (
+                  <SendIcon className="w-5 h-5 text-indigo-500" />
+                )}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
     </Modal>
   );
 };
