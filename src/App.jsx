@@ -2084,6 +2084,7 @@ const SendToGroupModal = ({ event, onClose }) => {
   const [groups, setGroups] = useState([]);
   const [loadingGroups, setLoadingGroups] = useState(true);
   const [sendingTo, setSendingTo] = useState(null);
+  const [errorMsg, setErrorMsg] = useState('');
 
   const groupIdsKey = userProfile?.groupIds?.join(',') || '';
 
@@ -2114,6 +2115,7 @@ const SendToGroupModal = ({ event, onClose }) => {
 
   const send = async (group) => {
     setSendingTo(group.id);
+    setErrorMsg('');
     try {
       // Sanitize every field — Firestore rejects writes that contain
       // `undefined`, and Gemini's event payloads often leave imageUrl /
@@ -2165,6 +2167,8 @@ const SendToGroupModal = ({ event, onClose }) => {
       onClose();
     } catch (e) {
       console.error('Send-to-group failed:', e);
+      const detail = e?.code ? `${e.code}: ${e.message || ''}` : (e?.message || String(e));
+      setErrorMsg(`Could not send. ${detail}`);
       showGlobalMessage('Could not send to that group.', 'error');
     } finally {
       setSendingTo(null);
@@ -2187,6 +2191,11 @@ const SendToGroupModal = ({ event, onClose }) => {
           </div>
         ) : (
           <div className="space-y-2 max-h-80 overflow-y-auto">
+            {errorMsg && (
+              <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-700 break-words">
+                {errorMsg}
+              </div>
+            )}
             {groups.map((g) => (
               <button
                 key={g.id}
