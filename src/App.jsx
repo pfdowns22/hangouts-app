@@ -483,6 +483,7 @@ const ProfileSection = ({ onClose }) => {
   const [isSaving, setIsSaving] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [analyzingCalendar, setAnalyzingCalendar] = useState(false);
+  const [showSurvey, setShowSurvey] = useState(false);
 
   const handleImageUpload = async (e) => {
     const file = e.target.files[0];
@@ -698,9 +699,19 @@ Return strictly a JSON array (no prose, no markdown fences) of objects with shap
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
         <div>
-          <h3 className="font-bold text-gray-800 mb-3 flex items-center gap-2">
-            <HeartIcon className="w-5 h-5 text-pink-500" /> Preferences
-          </h3>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="font-bold text-gray-800 flex items-center gap-2">
+              <HeartIcon className="w-5 h-5 text-pink-500" /> Preferences
+            </h3>
+            <button
+              type="button"
+              onClick={() => setShowSurvey(true)}
+              className="text-xs bg-pink-50 text-pink-700 px-3 py-1.5 rounded-lg font-bold flex items-center gap-1 hover:bg-pink-100 transition"
+              title="Take a 1-minute AI-tailored interest survey"
+            >
+              <SparklesIcon className="w-4 h-4" /> Take Survey
+            </button>
+          </div>
           <div className="flex flex-wrap gap-2 mb-3">
             {preferences.map((pref) => (
               <span key={pref} className="flex items-center bg-indigo-50 text-indigo-700 px-3 py-1 rounded-full text-sm font-medium border border-indigo-100">
@@ -724,6 +735,12 @@ Return strictly a JSON array (no prose, no markdown fences) of objects with shap
               <PlusIcon />
             </button>
           </div>
+          {showSurvey && (
+            <SurveyModal
+              onClose={() => setShowSurvey(false)}
+              onPreferencesUpdate={(newPrefs) => setPreferences(newPrefs)}
+            />
+          )}
         </div>
         <div>
           <h3 className="font-bold text-gray-800 mb-3 flex items-center gap-2">
@@ -2164,6 +2181,222 @@ const JoinGroupModal = ({ groupId, onClose }) => {
           )}
         </div>
       )}
+    </Modal>
+  );
+};
+
+// --- Interest Survey (AI-tailored follow-ups) ---
+// Three broad starter questions, then Gemini generates 3 follow-ups
+// based on the user's answers. Selected options get unioned into the
+// user's profile.preferences so they flow into all the event prompts.
+const INITIAL_SURVEY_QUESTIONS = [
+  {
+    question: 'What kind of activities energize you?',
+    type: 'multi',
+    options: ['Outdoor', 'Indoor', 'Active', 'Chill', 'Social', 'Solo time', 'Spontaneous', 'Planned ahead'],
+  },
+  {
+    question: 'Pick your favorite categories',
+    type: 'multi',
+    options: ['Live Music', 'Sports', 'Food & Drink', 'Art / Museums', 'Theater / Comedy', 'Outdoor activities', 'Markets / Shopping', 'Festivals', 'Workshops / Classes'],
+  },
+  {
+    question: 'How adventurous are you about trying new things?',
+    type: 'single',
+    options: ['Try anything once', 'Mostly stick to familiar', 'A healthy mix'],
+  },
+];
+
+const SurveyModal = ({ onClose, onPreferencesUpdate }) => {
+  const { userId, userProfile, setUserProfile, showGlobalMessage } = useContext(AppContext);
+  const [stage, setStage] = useState(0);
+  const [answers, setAnswers] = useState({});
+  const [currentSelected, setCurrentSelected] = useState([]);
+  const [followUps, setFollowUps] = useState([]);
+  const [loadingFollowUps, setLoadingFollowUps] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  const allQuestions = [...INITIAL_SURVEY_QUESTIONS, ...followUps];
+  const currentQuestion = allQuestions[stage];
+  const isInitialDone = stage === INITIAL_SURVEY_QUESTIONS.length - 1;
+  const isFinalStage = stage === allQuestions.length - 1 && followUps.length > 0;
+
+  const handleToggleOption = (opt) => {
+    if (currentQuestion.type === 'single') {
+      setCurrentSelected([opt]);
+    } else {
+      setCurrentSelected((prev) => (prev.includes(opt) ? prev.filter((o) => o !== opt) : [...prev, opt]));
+    }
+  };
+
+  const generateFollowUps = async (answersSoFar) => {
+    if (!geminiApiKey) {
+      showGlobalMessage('Survey needs the Gemini API key.', 'error');
+      return null;
+    }
+    const summary = INITIAL_SURVEY_QUESTIONS
+      .map((q, i) => `Q: ${q.question}\nA: ${(answersSoFar[i] || []).join(', ') || '(no answer)'}`)
+      .join('\n\n');
+    const prompt = `A user is filling out an interest survey for a social events recommendation app. So far they've answered:
+
+${summary}
+
+Generate exactly 3 follow-up questions that drill into their stated interests. Each question must have 4-6 specific, concrete options the user could realistically pick from. Avoid duplicating what they already answered. Mix single-select and multi-select where it makes sense.
+
+Return ONLY a JSON array (no prose, no markdown) of objects with keys: question (string), type ("single" or "multi"), options (array of strings).`;
+
+    try {
+      const res = await fetch(GEMINI_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: 'ARRAY',
+              items: {
+                type: 'OBJECT',
+                properties: {
+                  question: { type: 'STRING' },
+                  type: { type: 'STRING' },
+                  options: { type: 'ARRAY', items: { type: 'STRING' } },
+                },
+                required: ['question', 'type', 'options'],
+              },
+            },
+          },
+        }),
+      });
+      const data = await res.json();
+      if (!data.candidates) throw new Error('AI returned empty response');
+      const generated = JSON.parse(data.candidates[0].content.parts[0].text);
+      return Array.isArray(generated) ? generated.slice(0, 3) : null;
+    } catch (e) {
+      console.error('Survey follow-up generation failed:', e);
+      return null;
+    }
+  };
+
+  const goNext = async () => {
+    const next = { ...answers, [stage]: currentSelected };
+    setAnswers(next);
+    setCurrentSelected([]);
+
+    // After the last initial question, generate Gemini follow-ups before advancing.
+    if (isInitialDone && followUps.length === 0) {
+      setLoadingFollowUps(true);
+      const generated = await generateFollowUps(next);
+      setLoadingFollowUps(false);
+      if (!generated || generated.length === 0) {
+        // Couldn't get follow-ups — save what we have and exit.
+        await save(next);
+        return;
+      }
+      setFollowUps(generated);
+    }
+    setStage((s) => s + 1);
+  };
+
+  const goBack = () => {
+    setStage((s) => Math.max(0, s - 1));
+    setCurrentSelected(answers[Math.max(0, stage - 1)] || []);
+  };
+
+  const save = async (finalAnswers) => {
+    setSaving(true);
+    try {
+      const allOptions = Object.values(finalAnswers).flat().filter(Boolean);
+      const newPrefs = [...new Set([...(userProfile?.preferences || []), ...allOptions])];
+      await updateDoc(doc(db, `artifacts/${appId}/users/${userId}/profiles`, 'myProfile'), { preferences: newPrefs });
+      setUserProfile((p) => ({ ...(p || {}), preferences: newPrefs }));
+      if (onPreferencesUpdate) onPreferencesUpdate(newPrefs);
+      showGlobalMessage(`Added ${allOptions.length} interests to your profile.`);
+      onClose();
+    } catch (e) {
+      console.error(e);
+      showGlobalMessage('Could not save survey results.', 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleFinish = async () => {
+    const finalAnswers = { ...answers, [stage]: currentSelected };
+    await save(finalAnswers);
+  };
+
+  // Render: loading screen for Gemini follow-up generation
+  if (loadingFollowUps) {
+    return (
+      <Modal onClose={onClose} title="Tailoring questions for you…">
+        <div className="flex flex-col items-center py-10 gap-3">
+          <div className="w-10 h-10 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />
+          <p className="text-sm text-gray-500">Asking Gemini for follow-up questions based on your answers…</p>
+        </div>
+      </Modal>
+    );
+  }
+
+  if (!currentQuestion) return null;
+
+  const total = allQuestions.length || INITIAL_SURVEY_QUESTIONS.length;
+
+  return (
+    <Modal onClose={onClose} title={`Interest survey · ${stage + 1} of ${total}`}>
+      <div className="space-y-5">
+        <div>
+          <h3 className="text-lg font-bold text-gray-900">{currentQuestion.question}</h3>
+          <p className="text-xs text-gray-500 mt-1">
+            {currentQuestion.type === 'multi' ? 'Pick as many as apply.' : 'Pick one.'}
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {currentQuestion.options.map((opt) => {
+            const on = currentSelected.includes(opt);
+            return (
+              <button
+                key={opt}
+                type="button"
+                onClick={() => handleToggleOption(opt)}
+                className={`px-3 py-2 rounded-full text-sm font-medium border transition ${
+                  on ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-700 border-gray-200 hover:border-indigo-300'
+                }`}
+              >
+                {opt}
+              </button>
+            );
+          })}
+        </div>
+        <div className="flex gap-2 pt-2">
+          {stage > 0 && (
+            <button
+              onClick={goBack}
+              disabled={saving}
+              className="flex-1 bg-gray-100 hover:bg-gray-200 text-gray-700 py-3 rounded-xl font-medium transition disabled:opacity-50"
+            >
+              Back
+            </button>
+          )}
+          {isFinalStage ? (
+            <button
+              onClick={handleFinish}
+              disabled={currentSelected.length === 0 || saving}
+              className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white py-3 rounded-xl font-bold disabled:opacity-50 transition"
+            >
+              {saving ? 'Saving…' : 'Finish'}
+            </button>
+          ) : (
+            <button
+              onClick={goNext}
+              disabled={currentSelected.length === 0}
+              className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white py-3 rounded-xl font-bold disabled:opacity-50 transition"
+            >
+              Next
+            </button>
+          )}
+        </div>
+      </div>
     </Modal>
   );
 };
