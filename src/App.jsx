@@ -22,6 +22,7 @@ import {
   deleteDoc,
   writeBatch,
   serverTimestamp,
+  Timestamp,
   orderBy,
   limit,
 } from 'firebase/firestore';
@@ -445,7 +446,7 @@ const SettingsSection = ({ onClose }) => {
 };
 
 const ProfileSection = ({ onClose }) => {
-  const { userId, userProfile, setUserProfile, showGlobalMessage, googleAccessToken } = useContext(AppContext);
+  const { userId, userProfile, setUserProfile, showGlobalMessage, googleAccessToken, triggerFeedRefresh } = useContext(AppContext);
   const [name, setName] = useState(userProfile?.name || '');
   const [address, setAddress] = useState(userProfile?.address || '');
   const [kids, setKids] = useState(userProfile?.kids || []);
@@ -581,6 +582,8 @@ const ProfileSection = ({ onClose }) => {
       await updateDoc(doc(db, `artifacts/${appId}/users/${userId}/profiles`, 'myProfile'), update);
       setUserProfile((prev) => ({ ...prev, ...update }));
       showGlobalMessage('Profile saved successfully!');
+      // Kick the feed to generate fresh ideas based on the new profile.
+      if (triggerFeedRefresh) triggerFeedRefresh();
       onClose();
     } catch (e) {
       showGlobalMessage('Error saving profile.', 'error');
@@ -1044,26 +1047,77 @@ const CalendarPicker = ({ selectedDates, onDateToggle }) => {
   );
 };
 
+const PATIENCE_MESSAGES = [
+  'Searching the web for events near you…',
+  'Checking which ones are still on…',
+  'Filtering by your interests and availability…',
+  'Looking for things you haven\'t seen yet…',
+  'Pulling images and final details…',
+  'Almost there — polishing the results…',
+];
+
+// Scope expansion as the user scrolls. Each "load more" jumps to the
+// next tier so we keep finding fresh content instead of repeating the
+// same local venues. Refresh resets the user to tier 0.
+const SCOPE_TIERS = [
+  { label: 'your immediate neighborhood (~3 miles)', radius: '3 miles' },
+  { label: 'adjacent neighborhoods (~10 miles)', radius: '10 miles' },
+  { label: 'your full city / borough (~25 miles)', radius: '25 miles' },
+  { label: 'the wider metro region (~60 miles)', radius: '60 miles' },
+];
+
+// A reference timestamp far in the past. Items written with timestamps
+// less than ~year 2010 will always sort below items written with
+// serverTimestamp() in desc order. We decrement from this base for each
+// infinite-scroll-triggered write so later scrolls appear below earlier
+// ones, all of them below any refreshed/proposed items.
+const SCROLL_TIMESTAMP_BASE = new Date('2005-01-01').getTime();
+
 const MyFeedSection = () => {
-  const { userId, userProfile, showGlobalMessage, setShowProfileModal } = useContext(AppContext);
+  const { userId, userProfile, showGlobalMessage, setShowProfileModal, feedRefreshTick } = useContext(AppContext);
   const [feedItems, setFeedItems] = useState([]);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [patienceIdx, setPatienceIdx] = useState(0);
   const sentinelRef = useRef(null);
   const generatingRef = useRef(false);
+  const scopeRef = useRef(0); // expanding scope tier; reset on refresh
+  const scrollCounterRef = useRef(0); // decrements scroll timestamps so later items sink lower
 
   // Onboarding banner appears for users who haven't set an address yet.
-  // Once they save their profile (which writes profileCompletedAt), the
-  // banner disappears.
   const needsOnboarding =
     !!userProfile && !userProfile.profileCompletedAt && (!userProfile.address || !userProfile.address.trim());
 
   useEffect(() => {
     if (!userId) return;
-    // ASC ordering so new items from infinite-scroll appear at the bottom
-    // of the rendered list (where the user is looking), not at the top.
-    const q = query(collection(db, `artifacts/${appId}/users/${userId}/feed`), orderBy('timestamp', 'asc'), limit(200));
+    // Desc ordering: newest at top. Infinite-scroll items are written
+    // with synthetic old timestamps (see SCROLL_TIMESTAMP_BASE) so they
+    // always sit below freshly-refreshed/proposed items.
+    const q = query(collection(db, `artifacts/${appId}/users/${userId}/feed`), orderBy('timestamp', 'desc'), limit(200));
     return onSnapshot(q, (snapshot) => setFeedItems(snapshot.docs.map((d) => ({ id: d.id, ...d.data() }))));
   }, [userId]);
+
+  // Cycle patience messages while a generation is in-flight so the user
+  // sees forward motion instead of a static spinner.
+  useEffect(() => {
+    if (!isGenerating) {
+      setPatienceIdx(0);
+      return;
+    }
+    const interval = setInterval(() => {
+      setPatienceIdx((i) => Math.min(i + 1, PATIENCE_MESSAGES.length - 1));
+    }, 3500);
+    return () => clearInterval(interval);
+  }, [isGenerating]);
+
+  // External refresh trigger — fired from ProfileSection on save (and
+  // any other entry point we add later). Resets scope and runs a fresh
+  // "Upcoming" generation.
+  useEffect(() => {
+    if (feedRefreshTick === 0 || !userId || !userProfile) return;
+    scopeRef.current = 0;
+    generatePersonalSuggestions(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [feedRefreshTick]);
 
   // Infinite scroll: when sentinel becomes visible and we already have content,
   // auto-fetch another batch of upcoming events. Guarded by generatingRef so we
@@ -1074,7 +1128,7 @@ const MyFeedSection = () => {
       (entries) => {
         if (entries[0].isIntersecting && !generatingRef.current) {
           generatingRef.current = true;
-          generatePersonalSuggestions(false).finally(() => {
+          generatePersonalSuggestions(false, { fromScroll: true }).finally(() => {
             // brief cooldown so a single scroll-to-bottom doesn't spam requests
             setTimeout(() => { generatingRef.current = false; }, 800);
           });
@@ -1099,26 +1153,34 @@ const MyFeedSection = () => {
     }
   };
 
-  const generatePersonalSuggestions = async (forToday = false) => {
+  const generatePersonalSuggestions = async (forToday = false, opts = {}) => {
+    const { fromScroll = false } = opts;
     if (!geminiApiKey) {
       showGlobalMessage('Gemini API key missing. Set VITE_GEMINI_API_KEY in your environment.', 'error');
       return;
     }
+    // Refresh (button or context tick) resets scope to immediate area.
+    // Scroll-triggered generation expands to the next scope tier so we
+    // surface fresh content instead of repeating local venues.
+    if (!fromScroll) scopeRef.current = 0;
+    else scopeRef.current = Math.min(scopeRef.current + 1, SCOPE_TIERS.length - 1);
+    const scope = SCOPE_TIERS[scopeRef.current];
+
     setIsGenerating(forToday ? 'today' : 'upcoming');
     try {
       const home = userProfile?.address || 'New York, NY';
       const current = userProfile?.currentLocation?.label || '';
       const locPref = userProfile?.locationPreference || 'home';
-      // Build the location context block based on the user's preference.
-      // We tell Gemini which mode we're in and give it both anchors so it
-      // can tag each event with its locationSource.
+      // Location context — incorporates the current scope tier so the
+      // radius expands as the user scrolls for more.
       let locationBlock;
       if (locPref === 'current' && current) {
-        locationBlock = `User is currently at: ${current}. ONLY suggest events near this location (within ~15 miles).`;
+        locationBlock = `User is currently at: ${current}. Scope tier: ${scope.label}. Suggest events within ~${scope.radius} of this location.`;
       } else if (locPref === 'both' && current) {
-        locationBlock = `User has TWO relevant locations: HOME=${home} and CURRENT=${current}. Suggest a mix of events near each (within ~15 miles of either). Tag each event's "locationSource" as either "home" or "current" depending on which anchor it's near. Try for at least 2 from each side.`;
+        locationBlock = `User has TWO relevant locations: HOME=${home}, CURRENT=${current}. Scope tier: ${scope.label}.
+HARD RULE: of 5 returned events, at least 2 MUST be tagged locationSource="home" and at least 2 MUST be tagged locationSource="current". Mix them.`;
       } else {
-        locationBlock = `User's home base is ${home}. Suggest events near here (within ~15 miles). Tag each event's "locationSource" as "home".`;
+        locationBlock = `User's home base is ${home}. Scope tier: ${scope.label}. Suggest events within ~${scope.radius} of home. Tag each event's "locationSource" as "home".`;
       }
       const prefs = userProfile?.preferences?.join(', ') || 'general fun';
       const kidsText = userProfile?.kids?.length ? `Kids ages: ${userProfile.kids.map((k) => k.age).join(',')}` : 'No kids';
@@ -1138,10 +1200,18 @@ const MyFeedSection = () => {
         .map(([d, slots]) => `${d} (${slots.join('/')})`)
         .join('; ');
       const today = new Date().toDateString();
+      const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toDateString();
 
       const timeframePrompt = forToday
         ? `events happening strictly TODAY, ${today}, or tonight.`
-        : `upcoming events happening within the next 30 days.`;
+        : `upcoming events happening BETWEEN ${tomorrow} AND 30 days from today. STRICTLY EXCLUDE anything happening today (${today}) or in the past.`;
+
+      // Pull existing titles from the visible feed so Gemini doesn't
+      // repeat what the user has already seen.
+      const seenTitles = feedItems
+        .map((i) => i.data?.title)
+        .filter(Boolean)
+        .slice(0, 80);
 
       const prompt = `Today is ${today}. Find 5 ACTUAL, REAL-WORLD events, pop-ups, festivals, or highly-rated specific venue activities ${timeframePrompt}
 
@@ -1156,14 +1226,21 @@ OTHER CONSTRAINTS:
 - Preferred days of week (overall): ${dowPrefs}
 - Specific dates the user is free (and the times-of-day they're free that day): ${datesWithSlots || '(none marked — fall back to the recurring weekly availability above)'}
 - HARD RULE: if the user has specific dates above, every suggested event date+time MUST fall on one of those dates AND match one of the listed times-of-day for that date (morning=before 12:00, afternoon=12:00–17:00, evening=17:00+).
-IMPORTANT:
+
+DEDUPLICATION:
+- The user has already seen these events — do NOT return any of them again: ${seenTitles.length ? seenTitles.join(' | ') : '(none yet)'}
+- If an event is RECURRING (e.g. a weekly market like Smorgasburg, a weekly concert series, a monthly run club), return it ONCE with a description that mentions the recurrence pattern ("every Sunday 11am–6pm"), NOT a separate entry for each occurrence.
+- Each event in your response must be distinct from the others — no near-duplicates of the same venue or series.
+
+IMAGE & URL:
 - Do NOT make up events. Only suggest real events you can verify via web search.
-- Ensure event dates are strictly today or in the future.
+- Ensure event dates fall within the timeframe above (no past, no today if "Upcoming").
 - For each event, include the OFFICIAL event/venue URL (no aggregator links if avoidable).
 - For imageUrl, find a real public image URL (jpg/png/webp) from the event's official website, venue site, or a major publication — verify the URL is reachable. If you can't find one, set imageUrl to null.
-- For imageKeywords, provide 3-6 specific visual words that describe what an image of this event would look like (e.g. "WNBA basketball game arena" or "outdoor jazz concert park summer"). NOT the event name — actual visual scene keywords. This is used to generate a topical fallback image.
+- For imageKeywords, provide 3-6 specific visual words describing what an image of this event would look like. Not the event name — actual visual scene keywords.
 - For locationSource, return either "home" or "current" matching the LOCATION CONTEXT above so the UI can label which anchor the event came from.
-Return ONLY a JSON array (no prose, no markdown fences) of objects with these keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords, locationSource.`;
+
+Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords, locationSource.`;
 
       const response = await fetch(GEMINI_URL, {
         method: 'POST',
@@ -1180,13 +1257,25 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with these ke
       const suggestions = extractJsonArray(data.candidates[0].content.parts[0].text);
       if (!suggestions) throw new Error('Could not parse suggestions from AI response');
       const batch = writeBatch(db);
-      suggestions.forEach((s) =>
+      suggestions.forEach((s) => {
+        // Refresh writes use serverTimestamp() (real now) so they sort at
+        // the top. Scroll writes use a deeply-past timestamp that
+        // monotonically decreases per item so each new scroll batch lands
+        // below the previous scroll batch (which is below the refreshed
+        // items).
+        let ts;
+        if (fromScroll) {
+          scrollCounterRef.current += 1;
+          ts = Timestamp.fromMillis(SCROLL_TIMESTAMP_BASE - scrollCounterRef.current);
+        } else {
+          ts = serverTimestamp();
+        }
         batch.set(doc(collection(db, `artifacts/${appId}/users/${userId}/feed`)), {
           type: 'personalSuggestion',
           data: s,
-          timestamp: serverTimestamp(),
-        })
-      );
+          timestamp: ts,
+        });
+      });
       await batch.commit();
     } catch (e) {
       console.error(e);
@@ -1215,7 +1304,12 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with these ke
         </div>
       )}
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
-        <h2 className="text-xl font-bold text-gray-800">Your Feed</h2>
+        <div>
+          <h2 className="text-xl font-bold text-gray-800">Your Feed</h2>
+          {isGenerating && (
+            <p className="text-xs text-indigo-600 mt-1 animate-pulse">{PATIENCE_MESSAGES[patienceIdx]}</p>
+          )}
+        </div>
         <div className="flex gap-2 w-full md:w-auto">
           <button onClick={() => generatePersonalSuggestions(true)} disabled={isGenerating !== false} className="flex-1 md:flex-none flex items-center justify-center gap-2 px-4 py-2 bg-gradient-to-r from-orange-400 to-pink-500 text-white rounded-lg shadow-md hover:shadow-lg transition disabled:opacity-50 font-bold">
             {isGenerating === 'today' ? <SearchIcon className="w-4 h-4 animate-spin" /> : <SparklesIcon className="w-4 h-4" />}
@@ -1352,7 +1446,7 @@ const FeedCard = ({ item, onDelete }) => {
           </a>
         )}
         <button onClick={handleCalendarClick} className="flex-1 text-sm font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 py-2.5 rounded-lg transition flex items-center justify-center gap-1">
-          <PlusIcon className="w-4 h-4" /> {googleAccessToken ? 'Save to Calendar' : 'Download .ics'}
+          <PlusIcon className="w-4 h-4" /> Add to my calendar
         </button>
         {isEvent && hasGroups && (
           <button
@@ -2051,7 +2145,7 @@ const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage 
             }}
             className="flex-1 bg-gray-50 text-gray-700 text-sm font-bold py-2.5 rounded-lg hover:bg-gray-100 transition"
           >
-            Calendar
+            Add to my calendar
           </button>
         </div>
       </div>
@@ -3135,6 +3229,7 @@ export default function App() {
   const [pendingJoinGroupId, setPendingJoinGroupId] = useState(null);
   const [unreadFeedCount, setUnreadFeedCount] = useState(0);
   const [nameSkipped, setNameSkipped] = useState(false);
+  const [feedRefreshTick, setFeedRefreshTick] = useState(0);
   const seenFeedIdsRef = useRef(null); // null until first snapshot lands
 
   // Once we have a userId + a loaded profile, decide whether the name
@@ -3282,6 +3377,8 @@ export default function App() {
           setGoogleAccessToken,
           unreadFeedCount,
           markFeedRead: () => setUnreadFeedCount(0),
+          feedRefreshTick,
+          triggerFeedRefresh: () => setFeedRefreshTick((t) => t + 1),
         }}
       >
         {!userId ? (
