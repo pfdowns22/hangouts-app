@@ -484,6 +484,51 @@ const ProfileSection = ({ onClose }) => {
   const [uploading, setUploading] = useState(false);
   const [analyzingCalendar, setAnalyzingCalendar] = useState(false);
   const [showSurvey, setShowSurvey] = useState(false);
+  const [currentLocation, setCurrentLocation] = useState(userProfile?.currentLocation || null);
+  const [locationPreference, setLocationPreference] = useState(userProfile?.locationPreference || 'home');
+  const [locatingNow, setLocatingNow] = useState(false);
+
+  const refreshCurrentLocation = async () => {
+    if (!navigator.geolocation) {
+      showGlobalMessage('Your browser does not support geolocation.', 'error');
+      return;
+    }
+    setLocatingNow(true);
+    try {
+      // Wrap the callback-style API in a promise.
+      const pos = await new Promise((resolve, reject) => {
+        navigator.geolocation.getCurrentPosition(resolve, reject, { timeout: 12000, maximumAge: 60000 });
+      });
+      const lat = pos.coords.latitude;
+      const lng = pos.coords.longitude;
+      // Reverse-geocode via BigDataCloud's keyless client endpoint.
+      let label = `${lat.toFixed(3)}, ${lng.toFixed(3)}`;
+      try {
+        const res = await fetch(
+          `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lng}&localityLanguage=en`
+        );
+        if (res.ok) {
+          const data = await res.json();
+          const parts = [data.city || data.locality, data.principalSubdivision, data.countryCode].filter(Boolean);
+          if (parts.length) label = parts.join(', ');
+        }
+      } catch {
+        /* keep coord-only label */
+      }
+      const loc = { lat, lng, label, capturedAt: new Date().toISOString() };
+      setCurrentLocation(loc);
+      showGlobalMessage(`Current location set: ${label}`);
+    } catch (e) {
+      console.error(e);
+      const msg =
+        e?.code === 1
+          ? 'Permission denied. Allow location access in your browser settings.'
+          : 'Could not get your current location.';
+      showGlobalMessage(msg, 'error');
+    } finally {
+      setLocatingNow(false);
+    }
+  };
 
   const handleImageUpload = async (e) => {
     const file = e.target.files[0];
@@ -528,6 +573,10 @@ const ProfileSection = ({ onClose }) => {
         timeOfDayPrefs: derivedTimeOfDay,
         dayOfWeekPrefs: derivedDayOfWeek,
         freeSlots,
+        currentLocation,
+        locationPreference,
+        // Mark profile as completed (used by the onboarding banner).
+        profileCompletedAt: serverTimestamp(),
       };
       await updateDoc(doc(db, `artifacts/${appId}/users/${userId}/profiles`, 'myProfile'), update);
       setUserProfile((prev) => ({ ...prev, ...update }));
@@ -693,6 +742,62 @@ Return strictly a JSON array (no prose, no markdown fences) of objects with shap
           <div>
             <label className="block text-xs font-semibold uppercase text-gray-500 mb-1">Home Base (City/Zip)</label>
             <input type="text" value={address} onChange={(e) => setAddress(e.target.value)} placeholder="e.g. New York, NY" className="w-full p-3 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:bg-white transition" />
+          </div>
+        </div>
+      </div>
+
+      <div className="space-y-3 bg-gray-50 border border-gray-200 rounded-2xl p-4">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h3 className="font-bold text-gray-800">Current location</h3>
+            <p className="text-xs text-gray-500">Use this when traveling so suggestions reflect where you actually are right now.</p>
+          </div>
+          <button
+            type="button"
+            onClick={refreshCurrentLocation}
+            disabled={locatingNow}
+            className="text-xs bg-indigo-50 text-indigo-700 px-3 py-1.5 rounded-lg font-bold flex items-center gap-1 hover:bg-indigo-100 transition disabled:opacity-50 whitespace-nowrap"
+          >
+            {locatingNow ? (
+              <div className="w-3 h-3 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />
+            ) : (
+              <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-4 h-4" />
+            )}
+            {currentLocation ? 'Update' : 'Get current location'}
+          </button>
+        </div>
+        {currentLocation && (
+          <p className="text-sm text-gray-700">
+            <span className="font-semibold">Last captured:</span> {currentLocation.label}
+            {currentLocation.capturedAt && (
+              <span className="text-gray-400 text-xs ml-2">({new Date(currentLocation.capturedAt).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })})</span>
+            )}
+          </p>
+        )}
+        <div>
+          <label className="block text-xs font-semibold uppercase text-gray-500 mb-2">When suggesting events, use…</label>
+          <div className="flex flex-wrap gap-2">
+            {[
+              { id: 'home', label: 'Home only' },
+              { id: 'current', label: 'Current location only', disabled: !currentLocation },
+              { id: 'both', label: 'Both (mix)', disabled: !currentLocation },
+            ].map((opt) => {
+              const active = locationPreference === opt.id;
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  disabled={opt.disabled}
+                  onClick={() => setLocationPreference(opt.id)}
+                  className={`px-3 py-1.5 rounded-full text-sm font-medium border transition ${
+                    active ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-700 border-gray-200 hover:border-indigo-300'
+                  } ${opt.disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+                  title={opt.disabled ? 'Get your current location first' : ''}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
           </div>
         </div>
       </div>
@@ -940,11 +1045,17 @@ const CalendarPicker = ({ selectedDates, onDateToggle }) => {
 };
 
 const MyFeedSection = () => {
-  const { userId, userProfile, showGlobalMessage } = useContext(AppContext);
+  const { userId, userProfile, showGlobalMessage, setShowProfileModal } = useContext(AppContext);
   const [feedItems, setFeedItems] = useState([]);
   const [isGenerating, setIsGenerating] = useState(false);
   const sentinelRef = useRef(null);
   const generatingRef = useRef(false);
+
+  // Onboarding banner appears for users who haven't set an address yet.
+  // Once they save their profile (which writes profileCompletedAt), the
+  // banner disappears.
+  const needsOnboarding =
+    !!userProfile && !userProfile.profileCompletedAt && (!userProfile.address || !userProfile.address.trim());
 
   useEffect(() => {
     if (!userId) return;
@@ -995,7 +1106,20 @@ const MyFeedSection = () => {
     }
     setIsGenerating(forToday ? 'today' : 'upcoming');
     try {
-      const loc = userProfile?.address || 'New York, NY';
+      const home = userProfile?.address || 'New York, NY';
+      const current = userProfile?.currentLocation?.label || '';
+      const locPref = userProfile?.locationPreference || 'home';
+      // Build the location context block based on the user's preference.
+      // We tell Gemini which mode we're in and give it both anchors so it
+      // can tag each event with its locationSource.
+      let locationBlock;
+      if (locPref === 'current' && current) {
+        locationBlock = `User is currently at: ${current}. ONLY suggest events near this location (within ~15 miles).`;
+      } else if (locPref === 'both' && current) {
+        locationBlock = `User has TWO relevant locations: HOME=${home} and CURRENT=${current}. Suggest a mix of events near each (within ~15 miles of either). Tag each event's "locationSource" as either "home" or "current" depending on which anchor it's near. Try for at least 2 from each side.`;
+      } else {
+        locationBlock = `User's home base is ${home}. Suggest events near here (within ~15 miles). Tag each event's "locationSource" as "home".`;
+      }
       const prefs = userProfile?.preferences?.join(', ') || 'general fun';
       const kidsText = userProfile?.kids?.length ? `Kids ages: ${userProfile.kids.map((k) => k.age).join(',')}` : 'No kids';
       const todsPrefs = userProfile?.timeOfDayPrefs?.length ? userProfile.timeOfDayPrefs.join(', ') : 'any time';
@@ -1019,8 +1143,12 @@ const MyFeedSection = () => {
         ? `events happening strictly TODAY, ${today}, or tonight.`
         : `upcoming events happening within the next 30 days.`;
 
-      const prompt = `Today is ${today}. Find 5 ACTUAL, REAL-WORLD events, pop-ups, festivals, or highly-rated specific venue activities CLOSE TO ${loc} (within ~15 miles / 25 km — prefer the user's own neighborhood and surrounding area, NOT generic city-wide listings) ${timeframePrompt}
-Constraints:
+      const prompt = `Today is ${today}. Find 5 ACTUAL, REAL-WORLD events, pop-ups, festivals, or highly-rated specific venue activities ${timeframePrompt}
+
+LOCATION CONTEXT (read carefully — this controls where events come from):
+${locationBlock}
+
+OTHER CONSTRAINTS:
 - Family situation: ${kidsText}
 - Interests/preferences: ${prefs}
 - Recurring weekly availability (day=times-of-day): ${weeklyStr}
@@ -1034,7 +1162,8 @@ IMPORTANT:
 - For each event, include the OFFICIAL event/venue URL (no aggregator links if avoidable).
 - For imageUrl, find a real public image URL (jpg/png/webp) from the event's official website, venue site, or a major publication — verify the URL is reachable. If you can't find one, set imageUrl to null.
 - For imageKeywords, provide 3-6 specific visual words that describe what an image of this event would look like (e.g. "WNBA basketball game arena" or "outdoor jazz concert park summer"). NOT the event name — actual visual scene keywords. This is used to generate a topical fallback image.
-Return ONLY a JSON array (no prose, no markdown fences) of objects with these keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords.`;
+- For locationSource, return either "home" or "current" matching the LOCATION CONTEXT above so the UI can label which anchor the event came from.
+Return ONLY a JSON array (no prose, no markdown fences) of objects with these keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords, locationSource.`;
 
       const response = await fetch(GEMINI_URL, {
         method: 'POST',
@@ -1069,6 +1198,22 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with these ke
 
   return (
     <div className="space-y-6">
+      {needsOnboarding && (
+        <div className="bg-gradient-to-r from-indigo-500 to-purple-500 text-white rounded-2xl p-5 flex flex-col md:flex-row items-start md:items-center justify-between gap-3 shadow-md">
+          <div>
+            <h3 className="font-bold text-lg">Welcome to Hangouts 👋</h3>
+            <p className="text-sm text-indigo-50 mt-1">
+              Set up your profile in 60 seconds — home location, interests, and when you're usually free — so we can find events you'll actually want to go to.
+            </p>
+          </div>
+          <button
+            onClick={() => setShowProfileModal(true)}
+            className="bg-white text-indigo-700 px-4 py-2.5 rounded-xl font-bold hover:bg-indigo-50 transition whitespace-nowrap shadow-sm"
+          >
+            Set up profile →
+          </button>
+        </div>
+      )}
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
         <h2 className="text-xl font-bold text-gray-800">Your Feed</h2>
         <div className="flex gap-2 w-full md:w-auto">
@@ -1178,7 +1323,15 @@ const FeedCard = ({ item, onDelete }) => {
 
       <div className="flex justify-between items-start pr-8">
         <div className="w-full">
-          {isInvite && <span className="text-xs font-bold text-amber-600 uppercase tracking-wide mb-1 block">Proposal from {data.proposerName}</span>}
+          {isInvite ? (
+            <span className="text-xs font-bold text-amber-600 uppercase tracking-wide mb-1 block">
+              Based on friend group{data.groupName ? ` · ${data.groupName}` : ''} · proposed by {data.proposerName}
+            </span>
+          ) : data.locationSource === 'current' ? (
+            <span className="text-xs font-bold text-emerald-600 uppercase tracking-wide mb-1 block">Based on current location</span>
+          ) : data.locationSource === 'home' ? (
+            <span className="text-xs font-bold text-indigo-600 uppercase tracking-wide mb-1 block">Based on home</span>
+          ) : null}
           <h3 className="font-bold text-gray-900 text-xl">{data.title}</h3>
           <p className="text-gray-600 text-sm mt-1 leading-relaxed">{data.description}</p>
           <div className="flex flex-wrap gap-4 mt-3 text-sm text-gray-500 font-medium">
@@ -2525,10 +2678,6 @@ const LegalAcceptanceModal = () => {
           </p>
         </header>
         <div className="flex-1 overflow-y-auto px-6 py-4 space-y-6 text-sm text-gray-700">
-          <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-800">
-            <strong>Not legal advice.</strong> These are template documents drafted for early private testing. They are not a substitute for advice from an attorney licensed in your jurisdiction.
-          </div>
-
           <section>
             <h3 className="font-bold text-gray-900 mb-2">Terms of Service</h3>
             <pre className="whitespace-pre-wrap font-sans text-sm bg-gray-50 border border-gray-200 rounded-xl p-4 leading-relaxed">{TOS_TEXT}</pre>
@@ -2544,7 +2693,7 @@ const LegalAcceptanceModal = () => {
           </section>
 
           <section>
-            <h3 className="font-bold text-gray-900 mb-2">Non-Disclosure Agreement (NY law)</h3>
+            <h3 className="font-bold text-gray-900 mb-2">Non-Disclosure Agreement</h3>
             <pre className="whitespace-pre-wrap font-sans text-sm bg-gray-50 border border-gray-200 rounded-xl p-4 leading-relaxed">{NDA_TEXT}</pre>
             <label className="flex items-start gap-2 mt-3 cursor-pointer">
               <input
