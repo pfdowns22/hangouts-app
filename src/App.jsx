@@ -1,4 +1,4 @@
-import React, { useState, useEffect, createContext, useContext, useCallback, useRef } from 'react';
+import React, { useState, useEffect, createContext, useContext, useCallback, useRef, useMemo } from 'react';
 import {
   signInAnonymously,
   onAuthStateChanged,
@@ -2998,24 +2998,24 @@ const SendToGroupModal = ({ event, anchorRect, onClose }) => {
 
   // Position the floating panel near the button that opened it, clamped
   // to the visible viewport so it never falls off-screen on long feeds.
-  // Vertical center-on-anchor; horizontal center on viewport.
-  const panelStyle = (() => {
+  // Vertical center-on-anchor; horizontal center on viewport. Memoized so
+  // we don't recalculate on every render of the dropdown.
+  const panelStyle = useMemo(() => {
     if (typeof window === 'undefined') return null;
     const vh = window.innerHeight;
     const vw = window.innerWidth;
-    const panelH = Math.min(560, vh - 32); // approximate; clamped by max-h CSS too
+    const panelH = Math.min(560, vh - 32);
     const panelW = Math.min(448, vw - 32);
     let top;
     if (anchorRect && (anchorRect.top || anchorRect.bottom)) {
       const anchorCenter = (anchorRect.top + anchorRect.bottom) / 2;
-      // Center panel on anchor, then clamp into viewport (16px padding).
       top = Math.max(16, Math.min(vh - panelH - 16, anchorCenter - panelH / 2));
     } else {
       top = Math.max(16, (vh - panelH) / 2);
     }
     const left = (vw - panelW) / 2;
     return { top: `${top}px`, left: `${left}px`, width: `${panelW}px`, maxHeight: `${panelH}px` };
-  })();
+  }, [anchorRect]);
 
   const groupIdsKey = userProfile?.groupIds?.join(',') || '';
 
@@ -3460,11 +3460,23 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    // Track the profile snapshot listener so we can detach it on sign-out
+    // (or on each auth-state change) — otherwise every token refresh stacked
+    // another listener and old listeners kept firing forever.
+    let profileUnsub = null;
+    const detachProfile = () => {
+      if (profileUnsub) {
+        profileUnsub();
+        profileUnsub = null;
+      }
+    };
+
     const unsub = onAuthStateChanged(auth, async (u) => {
+      detachProfile();
       if (u) {
         setUserId(u.uid);
         const profileRef = doc(db, `artifacts/${appId}/users/${u.uid}/profiles`, 'myProfile');
-        onSnapshot(profileRef, (s) => {
+        profileUnsub = onSnapshot(profileRef, (s) => {
           if (s.exists()) {
             const existing = s.data();
             setUserProfile(existing);
@@ -3490,11 +3502,13 @@ export default function App() {
         });
       } else {
         setUserId(null);
+        setUserProfile(null);
         setLoading(false);
       }
     });
     const timer = setTimeout(() => setLoading(false), 3000);
     return () => {
+      detachProfile();
       unsub();
       clearTimeout(timer);
     };
