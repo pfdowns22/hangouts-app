@@ -33,6 +33,37 @@ import { auth, db, storage, appId, geminiApiKey } from './firebase.js';
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiApiKey}`;
 
+// Small inline pills shown on every event card: pricing tier ($-$$$$) and
+// a ticketed indicator. Both render only when the field is populated, so
+// older feed items without these fields stay quiet.
+const PriceTierBadge = ({ tier }) => {
+  if (!tier) return null;
+  const isFree = tier === 'Free';
+  return (
+    <span
+      className={`inline-flex items-center px-2 py-0.5 rounded-md text-xs font-bold ${
+        isFree ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'
+      }`}
+      title={
+        isFree
+          ? 'Free event'
+          : `Typical cost: ${tier} (${{ '$': 'under $20', '$$': '$20–$50', '$$$': '$50–$100', '$$$$': '$100+' }[tier] || ''})`
+      }
+    >
+      {tier}
+    </span>
+  );
+};
+
+const TicketedBadge = ({ isTicketed }) => {
+  if (!isTicketed) return null;
+  return (
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-purple-50 text-purple-700 text-xs font-medium">
+      🎟️ Ticketed
+    </span>
+  );
+};
+
 // Build a More Info URL. If Gemini gave us a direct event URL, use it.
 // Otherwise fall back to a Google search for the event's title + location
 // — at least the user always lands somewhere useful.
@@ -1255,7 +1286,12 @@ IMAGE & URL:
 - For imageKeywords, provide 3-6 specific visual words describing what an image of this event would look like. Not the event name — actual visual scene keywords.
 - For locationSource, return either "home" or "current" matching the LOCATION CONTEXT above so the UI can label which anchor the event came from.
 
-Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords, locationSource.`;
+PRICING & TICKETS:
+- For priceTier, return one of "Free", "$", "$$", "$$$", "$$$$" based on the typical entry/ticket cost ($=under $20, $$=$20-$50, $$$=$50-$100, $$$$=$100+). If you genuinely can't determine pricing, return null.
+- For isTicketed, return true if a paid ticket is required to attend (concert, show, sports), false for free/walk-in events (markets, walks, open events). Use false if unsure.
+- For ticketsUrl: if isTicketed=true, return the DIRECT ticket purchase URL — Ticketmaster, AXS, SeatGeek, Eventbrite, or the venue's official ticketing page. If isTicketed=false or you can't find a direct ticket link, return null.
+
+Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords, locationSource, priceTier, isTicketed, ticketsUrl.`;
 
       const response = await fetch(GEMINI_URL, {
         method: 'POST',
@@ -1460,6 +1496,12 @@ const FeedCard = ({ item, onDelete }) => {
             <span className="flex items-center gap-1">
               <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-4 h-4" /> {data.location}
             </span>
+            {(data.priceTier || data.isTicketed) && (
+              <span className="flex items-center gap-2">
+                <PriceTierBadge tier={data.priceTier} />
+                <TicketedBadge isTicketed={data.isTicketed} />
+              </span>
+            )}
           </div>
         </div>
       </div>
@@ -1475,6 +1517,17 @@ const FeedCard = ({ item, onDelete }) => {
           <Icon path="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" className="w-4 h-4" />
           More Info
         </a>
+        {data.isTicketed && data.ticketsUrl && (
+          <a
+            href={data.ticketsUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex-1 text-center text-sm font-bold text-white bg-emerald-600 hover:bg-emerald-700 py-2.5 rounded-lg transition flex items-center justify-center gap-1"
+            title="Buy tickets"
+          >
+            🎟️ Buy Tickets
+          </a>
+        )}
         <button onClick={handleCalendarClick} className="flex-1 text-sm font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 py-2.5 rounded-lg transition flex items-center justify-center gap-1">
           <PlusIcon className="w-4 h-4" /> Add to my calendar
         </button>
@@ -1756,7 +1809,7 @@ const ProposalCard = ({ proposal, groupId }) => {
         {proposal.description && (
           <p className="text-gray-600 text-sm mt-1 leading-relaxed line-clamp-3">{proposal.description}</p>
         )}
-        <div className="flex flex-wrap gap-3 mt-2 text-xs text-gray-500 font-medium">
+        <div className="flex flex-wrap gap-3 mt-2 text-xs text-gray-500 font-medium items-center">
           {proposal.date && (
             <span className="flex items-center gap-1">
               <CalendarIcon className="w-3 h-3" /> {new Date(proposal.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}
@@ -1767,6 +1820,8 @@ const ProposalCard = ({ proposal, groupId }) => {
               <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-3 h-3" /> {proposal.location}
             </span>
           )}
+          <PriceTierBadge tier={proposal.priceTier} />
+          <TicketedBadge isTicketed={proposal.isTicketed} />
         </div>
 
         <div className="mt-4 flex flex-col gap-2">
@@ -1796,8 +1851,18 @@ const ProposalCard = ({ proposal, groupId }) => {
             rel="noopener noreferrer"
             className="text-center text-xs font-bold text-blue-600 bg-blue-50 hover:bg-blue-100 py-2 rounded-lg transition"
           >
-            {proposal.url ? 'More Info / Tickets' : 'Search the web'}
+            {proposal.url ? 'More Info' : 'Search the web'}
           </a>
+          {proposal.isTicketed && proposal.ticketsUrl && (
+            <a
+              href={proposal.ticketsUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-center text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 py-2 rounded-lg transition"
+            >
+              🎟️ Buy Tickets
+            </a>
+          )}
         </div>
       </div>
     </div>
@@ -2018,12 +2083,17 @@ IMPORTANT:
 - For imageUrl, find a real public image URL from the event's website, venue, or a major publication. If you can't find one, set imageUrl to null.
 - For imageKeywords, provide 3-6 specific visual scene words (e.g. "WNBA basketball arena game"). Not the event name.
 
+PRICING & TICKETS:
+- For priceTier, return one of "Free", "$", "$$", "$$$", "$$$$" ($=under $20, $$=$20-$50, $$$=$50-$100, $$$$=$100+). If pricing isn't determinable, return null.
+- For isTicketed, return true if attendance requires buying a ticket, false for free/walk-in events.
+- For ticketsUrl, if isTicketed=true return the DIRECT ticket purchase URL (Ticketmaster/AXS/SeatGeek/Eventbrite/venue site). Otherwise null.
+
 SOURCES (PREFER quality editorial / curated picks over generic listings):
 - Mine event coverage from publications like Time Out (timeout.com), The New Yorker (newyorker.com/goings-on, /culture), Brooklyn Magazine (bkmag.com), The Skint (theskint.com), Eater (eater.com), Brokelyn, Curbed, the local NYT culture section, and similar editorial outlets.
 - Avoid generic Eventbrite / Meetup / Facebook listings unless the event is also covered by editorial sources.
 - Prefer events with a distinctive angle (rooftop concert, neighborhood-specific pop-up, artist talk) over generic categories.
 
-Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords.`;
+Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords, priceTier, isTicketed, ticketsUrl.`;
 
       const res = await fetch(GEMINI_URL, {
         method: 'POST',
@@ -2168,6 +2238,12 @@ const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage 
         <p className="flex items-center gap-1">
           <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-3 h-3" /> {idea.location}
         </p>
+        {(idea.priceTier || idea.isTicketed) && (
+          <div className="flex items-center gap-2 pt-1">
+            <PriceTierBadge tier={idea.priceTier} />
+            <TicketedBadge isTicketed={idea.isTicketed} />
+          </div>
+        )}
       </div>
       <div className="flex flex-col gap-2 border-t pt-4 mt-auto">
         <a
@@ -2177,8 +2253,18 @@ const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage 
           className="flex items-center justify-center bg-blue-50 text-blue-600 text-sm font-bold p-2.5 rounded-lg hover:bg-blue-100 transition"
           title={idea.url ? 'Open the event website' : 'Search the web for this event'}
         >
-          <Icon path="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" className="w-4 h-4 mr-1" /> Info / Tickets
+          <Icon path="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" className="w-4 h-4 mr-1" /> More Info
         </a>
+        {idea.isTicketed && idea.ticketsUrl && (
+          <a
+            href={idea.ticketsUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center justify-center bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold p-2.5 rounded-lg transition"
+          >
+            🎟️ Buy Tickets
+          </a>
+        )}
         <div className="flex gap-2">
           <button onClick={() => onPropose(idea)} className="flex-1 bg-indigo-50 text-indigo-600 text-sm font-bold py-2.5 rounded-lg hover:bg-indigo-100 transition">
             Propose
@@ -3058,6 +3144,9 @@ const SendToGroupModal = ({ event, anchorRect, onClose }) => {
         url: event?.url || '',
         imageUrl: event?.imageUrl || null,
         imageKeywords: event?.imageKeywords || '',
+        priceTier: event?.priceTier || null,
+        isTicketed: typeof event?.isTicketed === 'boolean' ? event.isTicketed : false,
+        ticketsUrl: event?.ticketsUrl || null,
       };
       const proposerName = userProfile?.name || 'User';
 
