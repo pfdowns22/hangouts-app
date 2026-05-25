@@ -33,6 +33,16 @@ import { auth, db, storage, appId, geminiApiKey } from './firebase.js';
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiApiKey}`;
 
+// Build a More Info URL. If Gemini gave us a direct event URL, use it.
+// Otherwise fall back to a Google search for the event's title + location
+// — at least the user always lands somewhere useful.
+const moreInfoUrl = (event) => {
+  const direct = (event?.url || '').trim();
+  if (direct && /^https?:\/\//i.test(direct)) return direct;
+  const q = [event?.title, event?.location].filter(Boolean).join(' ');
+  return `https://www.google.com/search?q=${encodeURIComponent(q || 'events')}`;
+};
+
 // Image fallback chain when Gemini's imageUrl is null or 404s.
 // Priority order:
 // 1. Unsplash API (real photos, fast CDN) — used if VITE_UNSPLASH_KEY is set
@@ -1232,6 +1242,11 @@ DEDUPLICATION:
 - If an event is RECURRING (e.g. a weekly market like Smorgasburg, a weekly concert series, a monthly run club), return it ONCE with a description that mentions the recurrence pattern ("every Sunday 11am–6pm"), NOT a separate entry for each occurrence.
 - Each event in your response must be distinct from the others — no near-duplicates of the same venue or series.
 
+SOURCES (PREFER quality editorial / curated picks over generic listings):
+- Mine event coverage from publications like Time Out (timeout.com), The New Yorker (newyorker.com/goings-on, /culture), Brooklyn Magazine (bkmag.com), The Skint (theskint.com), Eater (eater.com), Brokelyn, Curbed, the local NYT culture section, and similar editorial outlets.
+- Avoid generic Eventbrite / Meetup / Facebook event listings unless the event is also covered by editorial sources.
+- Prefer events with a sense of place or a distinctive angle (rooftop concert, neighborhood-specific pop-up, artist talk, secret jam) over generic categories ("yoga class", "trivia night") unless they are exceptional.
+
 IMAGE & URL:
 - Do NOT make up events. Only suggest real events you can verify via web search.
 - Ensure event dates fall within the timeframe above (no past, no today if "Upcoming").
@@ -1440,11 +1455,16 @@ const FeedCard = ({ item, onDelete }) => {
       </div>
 
       <div className="mt-5 flex gap-3 border-t border-gray-100 pt-4 items-stretch">
-        {data.url && (
-          <a href={data.url} target="_blank" rel="noopener noreferrer" className="flex-1 text-center text-sm font-bold text-blue-600 bg-blue-50 hover:bg-blue-100 py-2.5 rounded-lg transition flex items-center justify-center gap-1">
-            <Icon path="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" className="w-4 h-4" /> More Info
-          </a>
-        )}
+        <a
+          href={moreInfoUrl(data)}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="flex-1 text-center text-sm font-bold text-blue-600 bg-blue-50 hover:bg-blue-100 py-2.5 rounded-lg transition flex items-center justify-center gap-1"
+          title={data.url ? 'Open the event website' : 'Search the web for this event'}
+        >
+          <Icon path="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" className="w-4 h-4" />
+          More Info
+        </a>
         <button onClick={handleCalendarClick} className="flex-1 text-sm font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 py-2.5 rounded-lg transition flex items-center justify-center gap-1">
           <PlusIcon className="w-4 h-4" /> Add to my calendar
         </button>
@@ -1753,16 +1773,14 @@ const ProposalCard = ({ proposal, groupId }) => {
               {myRsvp === 'no' ? '✗ Declined' : 'Decline'} ({no.length})
             </button>
           </div>
-          {proposal.url && (
-            <a
-              href={proposal.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-center text-xs font-bold text-blue-600 bg-blue-50 hover:bg-blue-100 py-2 rounded-lg transition"
-            >
-              More Info / Tickets
-            </a>
-          )}
+          <a
+            href={moreInfoUrl(proposal)}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-center text-xs font-bold text-blue-600 bg-blue-50 hover:bg-blue-100 py-2 rounded-lg transition"
+          >
+            {proposal.url ? 'More Info / Tickets' : 'Search the web'}
+          </a>
         </div>
       </div>
     </div>
@@ -1982,6 +2000,12 @@ IMPORTANT:
 - Include the OFFICIAL event/venue URL.
 - For imageUrl, find a real public image URL from the event's website, venue, or a major publication. If you can't find one, set imageUrl to null.
 - For imageKeywords, provide 3-6 specific visual scene words (e.g. "WNBA basketball arena game"). Not the event name.
+
+SOURCES (PREFER quality editorial / curated picks over generic listings):
+- Mine event coverage from publications like Time Out (timeout.com), The New Yorker (newyorker.com/goings-on, /culture), Brooklyn Magazine (bkmag.com), The Skint (theskint.com), Eater (eater.com), Brokelyn, Curbed, the local NYT culture section, and similar editorial outlets.
+- Avoid generic Eventbrite / Meetup / Facebook listings unless the event is also covered by editorial sources.
+- Prefer events with a distinctive angle (rooftop concert, neighborhood-specific pop-up, artist talk) over generic categories.
+
 Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords.`;
 
       const res = await fetch(GEMINI_URL, {
@@ -2129,11 +2153,15 @@ const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage 
         </p>
       </div>
       <div className="flex flex-col gap-2 border-t pt-4 mt-auto">
-        {idea.url && (
-          <a href={idea.url} target="_blank" rel="noopener noreferrer" className="flex items-center justify-center bg-blue-50 text-blue-600 text-sm font-bold p-2.5 rounded-lg hover:bg-blue-100 transition" title="More Info">
-            <Icon path="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" className="w-4 h-4 mr-1" /> Info / Tickets
-          </a>
-        )}
+        <a
+          href={moreInfoUrl(idea)}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="flex items-center justify-center bg-blue-50 text-blue-600 text-sm font-bold p-2.5 rounded-lg hover:bg-blue-100 transition"
+          title={idea.url ? 'Open the event website' : 'Search the web for this event'}
+        >
+          <Icon path="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" className="w-4 h-4 mr-1" /> Info / Tickets
+        </a>
         <div className="flex gap-2">
           <button onClick={() => onPropose(idea)} className="flex-1 bg-indigo-50 text-indigo-600 text-sm font-bold py-2.5 rounded-lg hover:bg-indigo-100 transition">
             Propose
@@ -2733,8 +2761,18 @@ const LegalAcceptanceModal = () => {
   const [ndaAgreed, setNdaAgreed] = useState(false);
   const [saving, setSaving] = useState(false);
 
+  // Anonymous users have no email from Firebase Auth, so we capture
+  // both name and email here. Google users already have both.
+  const isAnon = !!auth?.currentUser?.isAnonymous;
+  const [legalName, setLegalName] = useState(userProfile?.name && userProfile.name !== 'User' ? userProfile.name : '');
+  const [legalEmail, setLegalEmail] = useState(userProfile?.email || '');
+
+  const emailLooksValid = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(legalEmail.trim());
+  const nameLooksValid = legalName.trim().length >= 2;
+  const identityOk = !isAnon || (nameLooksValid && emailLooksValid);
+
   const accept = async () => {
-    if (!tosAgreed || !ndaAgreed) return;
+    if (!tosAgreed || !ndaAgreed || !identityOk) return;
     setSaving(true);
     try {
       const stamp = {
@@ -2742,8 +2780,18 @@ const LegalAcceptanceModal = () => {
         tosVersion: TOS_VERSION,
         ndaVersion: NDA_VERSION,
       };
+      // For anonymous users we also persist the name + email they
+      // entered, so we have a stable contact record for every accept.
+      if (isAnon) {
+        stamp.name = legalName.trim();
+        stamp.email = legalEmail.trim().toLowerCase();
+      }
       await updateDoc(doc(db, `artifacts/${appId}/users/${userId}/profiles`, 'myProfile'), stamp);
-      setUserProfile((p) => ({ ...(p || {}), ...stamp, legalAcceptedAt: new Date().toISOString() }));
+      setUserProfile((p) => ({
+        ...(p || {}),
+        ...stamp,
+        legalAcceptedAt: new Date().toISOString(),
+      }));
       showGlobalMessage('Welcome aboard.');
     } catch (e) {
       console.error(e);
@@ -2772,6 +2820,36 @@ const LegalAcceptanceModal = () => {
           </p>
         </header>
         <div className="flex-1 overflow-y-auto px-6 py-4 space-y-6 text-sm text-gray-700">
+          {isAnon && (
+            <section className="bg-indigo-50 border border-indigo-100 rounded-xl p-4 space-y-3">
+              <div>
+                <h3 className="font-bold text-gray-900 mb-1">Who's signing?</h3>
+                <p className="text-xs text-gray-600">
+                  Because you signed in anonymously, we need your real name and email so the acceptance is legally meaningful and so we can contact you if needed.
+                </p>
+              </div>
+              <div>
+                <label className="block text-xs font-semibold uppercase text-gray-500 mb-1">Full name</label>
+                <input
+                  type="text"
+                  value={legalName}
+                  onChange={(e) => setLegalName(e.target.value)}
+                  placeholder="e.g. Jane Doe"
+                  className="w-full p-2.5 bg-white border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold uppercase text-gray-500 mb-1">Email</label>
+                <input
+                  type="email"
+                  value={legalEmail}
+                  onChange={(e) => setLegalEmail(e.target.value)}
+                  placeholder="you@example.com"
+                  className="w-full p-2.5 bg-white border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500 text-sm"
+                />
+              </div>
+            </section>
+          )}
           <section>
             <h3 className="font-bold text-gray-900 mb-2">Terms of Service</h3>
             <pre className="whitespace-pre-wrap font-sans text-sm bg-gray-50 border border-gray-200 rounded-xl p-4 leading-relaxed">{TOS_TEXT}</pre>
@@ -2810,8 +2888,9 @@ const LegalAcceptanceModal = () => {
           </button>
           <button
             onClick={accept}
-            disabled={!tosAgreed || !ndaAgreed || saving}
+            disabled={!tosAgreed || !ndaAgreed || !identityOk || saving}
             className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white py-3 rounded-xl font-bold disabled:opacity-50 transition"
+            title={!identityOk ? 'Enter your name and a valid email to continue' : ''}
           >
             {saving ? 'Recording…' : 'I Accept'}
           </button>
@@ -3334,9 +3413,23 @@ export default function App() {
         const profileRef = doc(db, `artifacts/${appId}/users/${u.uid}/profiles`, 'myProfile');
         onSnapshot(profileRef, (s) => {
           if (s.exists()) {
-            setUserProfile(s.data());
+            const existing = s.data();
+            setUserProfile(existing);
+            // Backfill missing email/isAnonymous for accounts created
+            // before we started capturing them. Google-account users have
+            // u.email available straight from Firebase Auth.
+            const patch = {};
+            if (!existing.email && u.email) patch.email = u.email;
+            if (typeof existing.isAnonymous !== 'boolean') patch.isAnonymous = !!u.isAnonymous;
+            if (Object.keys(patch).length) updateDoc(profileRef, patch).catch(() => {});
           } else {
-            const newProfile = { name: u.displayName || 'User', createdAt: serverTimestamp(), photoURL: u.photoURL };
+            const newProfile = {
+              name: u.displayName || 'User',
+              email: u.email || '',
+              isAnonymous: !!u.isAnonymous,
+              createdAt: serverTimestamp(),
+              photoURL: u.photoURL,
+            };
             setDoc(profileRef, newProfile);
             setUserProfile(newProfile);
           }
