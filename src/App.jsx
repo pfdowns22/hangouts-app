@@ -454,6 +454,16 @@ const ProfileSection = ({ onClose }) => {
   const [preferences, setPreferences] = useState(userProfile?.preferences || []);
   const [currentPreference, setCurrentPreference] = useState('');
   const [availableDates, setAvailableDates] = useState(userProfile?.availability || []);
+  // Per-date slot picker. Map of "YYYY-MM-DD" -> ["morning"|"afternoon"|"evening"].
+  // Migration: if a date is in availability but missing from slots, treat as all-day.
+  const [availabilitySlots, setAvailabilitySlots] = useState(() => {
+    const existing = userProfile?.availabilitySlots || {};
+    const migrated = { ...existing };
+    (userProfile?.availability || []).forEach((d) => {
+      if (!migrated[d]) migrated[d] = ['morning', 'afternoon', 'evening'];
+    });
+    return migrated;
+  });
   const [timeOfDayPrefs, setTimeOfDayPrefs] = useState(userProfile?.timeOfDayPrefs || []);
   const [dayOfWeekPrefs, setDayOfWeekPrefs] = useState(userProfile?.dayOfWeekPrefs || []);
   const [freeSlots, setFreeSlots] = useState(userProfile?.freeSlots || []);
@@ -489,6 +499,7 @@ const ProfileSection = ({ onClose }) => {
         kids,
         preferences,
         availability: availableDates,
+        availabilitySlots,
         timeOfDayPrefs,
         dayOfWeekPrefs,
         freeSlots,
@@ -596,8 +607,31 @@ Return strictly a JSON array (no prose, no markdown fences) of objects with shap
     }
   };
   const removePreference = (p) => setPreferences(preferences.filter((pref) => pref !== p));
-  const handleDateToggle = (d) =>
+  const handleDateToggle = (d) => {
     setAvailableDates((prev) => (prev.includes(d) ? prev.filter((x) => x !== d) : [...prev, d].sort()));
+    setAvailabilitySlots((prev) => {
+      if (prev[d]) {
+        // Toggling off — drop the entry entirely
+        const { [d]: _drop, ...rest } = prev;
+        return rest;
+      }
+      // Toggling on — default to all-day available
+      return { ...prev, [d]: ['morning', 'afternoon', 'evening'] };
+    });
+  };
+  const handleSlotToggle = (date, slot) => {
+    setAvailabilitySlots((prev) => {
+      const current = prev[date] || ['morning', 'afternoon', 'evening'];
+      const next = current.includes(slot) ? current.filter((s) => s !== slot) : [...current, slot];
+      // If the user clears every slot, drop the date from availability too
+      if (next.length === 0) {
+        const { [date]: _drop, ...rest } = prev;
+        setAvailableDates((d) => d.filter((x) => x !== date));
+        return rest;
+      }
+      return { ...prev, [date]: next };
+    });
+  };
 
   return (
     <div className="space-y-8">
@@ -738,6 +772,52 @@ Return strictly a JSON array (no prose, no markdown fences) of objects with shap
           </button>
         </div>
         <CalendarPicker selectedDates={availableDates} onDateToggle={handleDateToggle} />
+
+        {availableDates.length > 0 && (
+          <div className="mt-4 space-y-2 max-h-72 overflow-y-auto pr-1">
+            <p className="text-xs font-semibold uppercase text-gray-500 px-1">Times of day for each date</p>
+            {availableDates.map((d) => {
+              const slots = availabilitySlots[d] || ['morning', 'afternoon', 'evening'];
+              const labelDate = new Date(d + 'T12:00');
+              const label = labelDate.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+              return (
+                <div key={d} className="flex items-center justify-between gap-2 bg-gray-50 rounded-xl p-2.5">
+                  <span className="text-sm font-medium text-gray-800 w-32 shrink-0">{label}</span>
+                  <div className="flex gap-1 flex-1 justify-end flex-wrap">
+                    {[
+                      { id: 'morning', short: 'AM' },
+                      { id: 'afternoon', short: 'PM' },
+                      { id: 'evening', short: 'Eve' },
+                    ].map(({ id, short }) => {
+                      const on = slots.includes(id);
+                      return (
+                        <button
+                          key={id}
+                          type="button"
+                          onClick={() => handleSlotToggle(d, id)}
+                          className={`px-2.5 py-1 rounded-md text-xs font-semibold border transition ${
+                            on ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-500 border-gray-200 hover:border-indigo-300'
+                          }`}
+                        >
+                          {short}
+                        </button>
+                      );
+                    })}
+                    <button
+                      type="button"
+                      onClick={() => handleDateToggle(d)}
+                      className="ml-1 p-1 text-gray-400 hover:text-red-500 transition"
+                      title="Remove date"
+                    >
+                      <CloseIcon className="w-3 h-3" />
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
         {freeSlots.length > 0 && (
           <div className="mt-4 bg-indigo-50 border border-indigo-100 rounded-xl p-4">
             <h4 className="text-sm font-bold text-indigo-900 mb-2">Free time blocks ({freeSlots.length})</h4>
@@ -875,6 +955,12 @@ const MyFeedSection = () => {
       const kidsText = userProfile?.kids?.length ? `Kids ages: ${userProfile.kids.map((k) => k.age).join(',')}` : 'No kids';
       const todsPrefs = userProfile?.timeOfDayPrefs?.length ? userProfile.timeOfDayPrefs.join(', ') : 'any time';
       const dowPrefs = userProfile?.dayOfWeekPrefs?.length ? userProfile.dayOfWeekPrefs.join(', ') : 'any day';
+      const slotsByDate = userProfile?.availabilitySlots || {};
+      const datesWithSlots = Object.entries(slotsByDate)
+        .filter(([, slots]) => Array.isArray(slots) && slots.length)
+        .slice(0, 30)
+        .map(([d, slots]) => `${d} (${slots.join('/')})`)
+        .join('; ');
       const today = new Date().toDateString();
 
       const timeframePrompt = forToday
@@ -887,6 +973,8 @@ Constraints:
 - Interests/preferences: ${prefs}
 - Preferred times of day: ${todsPrefs}
 - Preferred days of week: ${dowPrefs}
+- Specific dates the user is free (and the times-of-day they're free that day): ${datesWithSlots || '(none marked — fall back to the preferences above)'}
+- HARD RULE: if the user has specific dates above, every suggested event date+time MUST fall on one of those dates AND match one of the listed times-of-day for that date (morning=before 12:00, afternoon=12:00–17:00, evening=17:00+).
 IMPORTANT:
 - Do NOT make up events. Only suggest real events you can verify via web search.
 - Ensure event dates are strictly today or in the future.
@@ -1521,13 +1609,24 @@ const SuggestionSection = () => {
       const allKids = memberProfiles.flatMap((p) => p.kids || []);
       const loc = userProfile?.address || memberProfiles.find((p) => p.address)?.address || 'New York';
 
-      // Each member's free time blocks, capped to the next 14 entries each
-      // so we don't blow the prompt budget on very busy users.
+      // Each member's free time blocks (from Gemini calendar analysis),
+      // capped to 14 entries each so we don't blow the prompt budget.
       const availability = memberProfiles
         .filter((p) => p.freeSlots?.length)
         .map((p) => ({
           name: p.name?.split(' ')[0] || 'Member',
           slots: p.freeSlots.slice(0, 14),
+        }));
+
+      // Each member's hand-picked date + slot-of-day availability.
+      const pickedAvailability = memberProfiles
+        .filter((p) => p.availabilitySlots && Object.keys(p.availabilitySlots).length)
+        .map((p) => ({
+          name: p.name?.split(' ')[0] || 'Member',
+          entries: Object.entries(p.availabilitySlots)
+            .filter(([, s]) => Array.isArray(s) && s.length)
+            .slice(0, 30)
+            .map(([d, s]) => `${d} (${s.join('/')})`),
         }));
 
       const today = new Date().toDateString();
@@ -1541,12 +1640,22 @@ GROUP CONTEXT:
 - Family situation: ${allKids.length ? `Group includes children ages ${allKids.map((k) => k.age).join(', ')} — prefer family-friendly options.` : 'No children — adult-friendly options are fine.'}
 - Anchor location: ${loc} (events must be within ~15 miles / 25 km of here)
 
-MEMBER AVAILABILITY (free time blocks, next 30 days):
+MEMBER AVAILABILITY (free time blocks from Gemini calendar analysis, next 30 days):
 ${
   availability.length
     ? availability.map((m) => `- ${m.name}: ${m.slots.map((s) => `${s.date} ${s.start}-${s.end}`).join('; ')}`).join('\n')
-    : '(No members have synced calendars yet — pick popular times: Friday/Saturday evenings and weekend afternoons.)'
+    : '(No members have synced calendars.)'
 }
+
+MEMBER HAND-PICKED AVAILABILITY (dates members manually marked as free, with which times-of-day):
+${
+  pickedAvailability.length
+    ? pickedAvailability.map((m) => `- ${m.name}: ${m.entries.join('; ')}`).join('\n')
+    : '(No members have hand-picked dates.)'
+}
+
+If neither source above has data, fall back to Friday/Saturday evenings and weekend afternoons.
+When you do have hand-picked availability, weight it MORE than the auto-analyzed blocks — those are the times the user explicitly said they want to socialize. Suggest events that align with the largest overlap of members' hand-picked slots first, then their Gemini-analyzed free blocks.
 
 YOUR TASK:
 Search the web for 6 ACTUAL, REAL-WORLD events happening near ${loc} in the next 30 days. PRIORITIZE events whose date/time overlaps with the most members' free blocks above. If no member availability is provided, prioritize Friday/Saturday evenings and weekend afternoons.
