@@ -1371,8 +1371,18 @@ const FeedCard = ({ item, onDelete }) => {
   const bgColor = isInvite ? 'bg-amber-50 border-amber-100' : 'bg-white border-gray-100';
   const imageSrc = useEventImage(data);
   const [showSend, setShowSend] = useState(false);
+  const [sendAnchorRect, setSendAnchorRect] = useState(null);
+  const sendBtnRef = useRef(null);
   const isEvent = type === 'personalSuggestion' || type === 'groupProposal';
   const hasGroups = (userProfile?.groupIds?.length || 0) > 0;
+
+  const openSendModal = () => {
+    if (sendBtnRef.current) {
+      const r = sendBtnRef.current.getBoundingClientRect();
+      setSendAnchorRect({ top: r.top, bottom: r.bottom, left: r.left, right: r.right });
+    }
+    setShowSend(true);
+  };
 
   if (type === 'groupJoin')
     return (
@@ -1470,7 +1480,8 @@ const FeedCard = ({ item, onDelete }) => {
         </button>
         {isEvent && hasGroups && (
           <button
-            onClick={() => setShowSend(true)}
+            ref={sendBtnRef}
+            onClick={openSendModal}
             className="w-11 flex items-center justify-center text-amber-600 bg-amber-50 hover:bg-amber-100 rounded-lg transition"
             title="Send to a group"
             aria-label="Send to a group"
@@ -1479,7 +1490,13 @@ const FeedCard = ({ item, onDelete }) => {
           </button>
         )}
       </div>
-      {showSend && <SendToGroupModal event={data} onClose={() => setShowSend(false)} />}
+      {showSend && (
+        <SendToGroupModal
+          event={data}
+          anchorRect={sendAnchorRect}
+          onClose={() => setShowSend(false)}
+        />
+      )}
     </div>
   );
 };
@@ -2972,12 +2989,33 @@ const NameSettingModal = ({ onClose }) => {
 // they're a member of. Mirrors the SuggestionSection propose flow:
 // canonical proposal lives in the group's /proposals subcollection;
 // lightweight pings go into other members' feeds for toast + badge.
-const SendToGroupModal = ({ event, onClose }) => {
+const SendToGroupModal = ({ event, anchorRect, onClose }) => {
   const { userId, userProfile, showGlobalMessage } = useContext(AppContext);
   const [groups, setGroups] = useState([]);
   const [loadingGroups, setLoadingGroups] = useState(true);
   const [sendingTo, setSendingTo] = useState(null);
   const [errorMsg, setErrorMsg] = useState('');
+
+  // Position the floating panel near the button that opened it, clamped
+  // to the visible viewport so it never falls off-screen on long feeds.
+  // Vertical center-on-anchor; horizontal center on viewport.
+  const panelStyle = (() => {
+    if (typeof window === 'undefined') return null;
+    const vh = window.innerHeight;
+    const vw = window.innerWidth;
+    const panelH = Math.min(560, vh - 32); // approximate; clamped by max-h CSS too
+    const panelW = Math.min(448, vw - 32);
+    let top;
+    if (anchorRect && (anchorRect.top || anchorRect.bottom)) {
+      const anchorCenter = (anchorRect.top + anchorRect.bottom) / 2;
+      // Center panel on anchor, then clamp into viewport (16px padding).
+      top = Math.max(16, Math.min(vh - panelH - 16, anchorCenter - panelH / 2));
+    } else {
+      top = Math.max(16, (vh - panelH) / 2);
+    }
+    const left = (vw - panelW) / 2;
+    return { top: `${top}px`, left: `${left}px`, width: `${panelW}px`, maxHeight: `${panelH}px` };
+  })();
 
   const groupIdsKey = userProfile?.groupIds?.join(',') || '';
 
@@ -3066,8 +3104,22 @@ const SendToGroupModal = ({ event, onClose }) => {
   };
 
   return (
-    <Modal onClose={onClose} title="Send to a group">
-      <div className="space-y-3">
+    <div
+      className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50"
+      onClick={onClose}
+    >
+      <div
+        className="absolute bg-white rounded-2xl shadow-2xl overflow-y-auto flex flex-col"
+        style={panelStyle || { top: '10vh', left: '50%', transform: 'translateX(-50%)', width: '90%', maxWidth: '448px' }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <header className="flex justify-between items-center p-4 border-b border-gray-100 sticky top-0 bg-white z-10">
+          <h2 className="text-base font-bold text-gray-800">Send to a group</h2>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-700 p-1 rounded-full hover:bg-gray-100 transition">
+            <CloseIcon className="w-5 h-5" />
+          </button>
+        </header>
+        <div className="p-4 space-y-3">
         <p className="text-sm text-gray-500">
           Propose <span className="font-semibold text-gray-700">"{event.title}"</span> to one of your groups. Members will see it on the group's Proposed Events tab.
         </p>
@@ -3106,8 +3158,9 @@ const SendToGroupModal = ({ event, onClose }) => {
             ))}
           </div>
         )}
+        </div>
       </div>
-    </Modal>
+    </div>
   );
 };
 
