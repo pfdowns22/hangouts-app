@@ -1943,7 +1943,15 @@ const AuthScreen = () => {
           <UsersIcon className="w-10 h-10" />
         </div>
         <h1 className="text-4xl font-black text-gray-900 mb-2">Hangouts</h1>
-        <p className="text-gray-500 mb-8">Effortless social planning powered by AI &amp; Live Search.</p>
+        <p className="text-gray-500 mb-4">Effortless social planning powered by AI &amp; Live Search.</p>
+        <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 mb-6 text-left">
+          <p className="text-xs font-bold text-amber-800 mb-1">⚠️ A note on Google sign-in</p>
+          <p className="text-xs text-amber-700 leading-relaxed">
+            Because this is a private beta, Google will show a "Google hasn't verified this app" warning. That's expected.
+            Click <span className="font-semibold">Advanced</span> → <span className="font-semibold">Go to Hangouts Planner (unsafe)</span> to continue.
+            It's safe — the app is the one you got the passcode for.
+          </p>
+        </div>
         <div className="space-y-3">
           <button onClick={handleGoogleSignIn} className="w-full py-3 px-4 bg-white border border-gray-200 rounded-xl hover:bg-gray-50 font-bold text-gray-700 flex items-center justify-center gap-3 transition">
             <GoogleIcon /> Continue with Google
@@ -2401,6 +2409,175 @@ Return ONLY a JSON array (no prose, no markdown) of objects with keys: question 
   );
 };
 
+// --- Legal Acceptance (TOS + NDA gate) ---
+// Required acceptance before using the private beta. Stores
+// profile.legalAcceptedAt timestamp; while missing, the modal blocks
+// the rest of the app. The two documents are template boilerplate
+// drafted for NY law; for production use the owner should have an
+// actual attorney review them.
+const TOS_VERSION = '2026-05-25';
+const NDA_VERSION = '2026-05-25';
+
+const TOS_TEXT = `Terms of Service
+Last updated: ${TOS_VERSION}
+
+By accessing Hangouts ("the Service"), you agree to these Terms of Service. If you do not agree, do not use the Service.
+
+1. The Service. Hangouts is a private-beta social planning application provided by Paul Downs ("Owner") for testing and feedback purposes only. The Service is not generally available and may be modified, suspended, or terminated at any time without notice.
+
+2. Eligibility. You must be at least 18 years old to use the Service.
+
+3. Acceptable Use. You agree to use the Service only for lawful purposes and not to:
+   • Reverse engineer, copy, or extract the underlying technology or business concept;
+   • Use the Service to harass, harm, or impersonate others;
+   • Upload illegal or infringing content.
+
+4. Account & Data. You are responsible for activity on your account. The Owner stores the data you provide (display name, location, calendar information you sync, group activity) solely to operate the Service. The Owner will not sell your data to third parties during this private beta.
+
+5. No Warranties. THE SERVICE IS PROVIDED "AS IS" AND "AS AVAILABLE" WITHOUT WARRANTIES OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
+
+6. Limitation of Liability. To the maximum extent permitted by law, the Owner shall not be liable for any indirect, incidental, special, consequential, or punitive damages arising from your use of, or inability to use, the Service.
+
+7. Changes. The Owner may update these Terms at any time. Continued use after changes constitutes acceptance of the updated Terms.
+
+8. Governing Law. These Terms are governed by the laws of the State of New York, without regard to conflict-of-law principles.
+
+9. Disputes. Any dispute arising out of or relating to these Terms shall be resolved in the state or federal courts located in the State of New York, and you consent to the exclusive jurisdiction and venue of such courts.`;
+
+const NDA_TEXT = `Non-Disclosure Agreement
+Last updated: ${NDA_VERSION}
+
+This Non-Disclosure Agreement ("Agreement") is entered into between you ("Recipient") and Paul Downs ("Discloser"), and governs your access to confidential information about Hangouts ("the Service") during its private-beta period.
+
+1. Confidential Information. "Confidential Information" means all non-public information about the Service that you observe or that is disclosed to you, including without limitation: the application's concept and design, features and roadmap, user-interface, source code and architecture, business plans and strategies, marketing approach, user data, screenshots, recordings, and any feedback or analysis that incorporates the foregoing.
+
+2. Recipient Obligations. Recipient agrees, during the term of this Agreement and thereafter:
+   (a) Not to disclose Confidential Information to any third party (including without limitation friends, colleagues, employers, investors, journalists, competitors, or potential users) without the prior written consent of Discloser;
+   (b) Not to use Confidential Information for any purpose other than evaluating and providing feedback on the Service, and specifically not to build, fund, advise, or assist any product or service that competes with or copies the Service;
+   (c) Not to copy, reproduce, screenshot, record, or create derivative works based on Confidential Information, except as necessary to use the Service as intended;
+   (d) To use the same degree of care to protect Confidential Information as Recipient uses for its own confidential information of like importance, and in any event no less than a reasonable standard of care;
+   (e) To promptly notify Discloser in writing of any unauthorized disclosure, access, or use of Confidential Information.
+
+3. Exclusions. Confidential Information does not include information that:
+   (a) Was lawfully and demonstrably in Recipient's possession prior to disclosure by Discloser;
+   (b) Was or becomes publicly known through no fault, act, or omission of Recipient;
+   (c) Is independently developed by Recipient without any use of or reference to Confidential Information;
+   (d) Is disclosed to Recipient by a third party rightfully in possession of such information and not under any obligation of confidentiality.
+
+4. Term. This Agreement is effective from the moment Recipient first accesses the Service and continues for two (2) years from Recipient's last access, or until the Confidential Information becomes publicly known through Discloser's own authorized disclosure, whichever occurs first.
+
+5. Return or Destruction. Upon Discloser's written request, Recipient shall promptly return or destroy all Confidential Information in its possession and, if requested, certify such destruction in writing.
+
+6. Equitable Remedies. Recipient acknowledges that any breach of this Agreement may cause irreparable harm to Discloser for which monetary damages may be inadequate. Accordingly, Discloser shall be entitled to seek equitable relief, including without limitation a temporary restraining order, preliminary injunction, and specific performance, in addition to any other remedies available at law or in equity, and without the requirement to post a bond.
+
+7. No License. Nothing in this Agreement grants Recipient any license, title, or interest in or to the Confidential Information, except the limited right to evaluate the Service in accordance with these terms.
+
+8. Governing Law. This Agreement is governed by the laws of the State of New York, without regard to conflict-of-law principles.
+
+9. Venue. The parties consent to exclusive personal jurisdiction and venue in the state and federal courts located in the State of New York.
+
+10. Entire Agreement. This Agreement constitutes the entire agreement between the parties concerning Confidential Information and supersedes all prior or contemporaneous understandings, communications, or agreements on the subject matter. No modification of this Agreement is effective unless in writing and signed by both parties.
+
+By checking the box and clicking "I Accept" below, you acknowledge that you have read, understood, and agree to be legally bound by this Agreement.`;
+
+const LegalAcceptanceModal = () => {
+  const { userId, userProfile, setUserProfile, showGlobalMessage } = useContext(AppContext);
+  const [tosAgreed, setTosAgreed] = useState(false);
+  const [ndaAgreed, setNdaAgreed] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  const accept = async () => {
+    if (!tosAgreed || !ndaAgreed) return;
+    setSaving(true);
+    try {
+      const stamp = {
+        legalAcceptedAt: serverTimestamp(),
+        tosVersion: TOS_VERSION,
+        ndaVersion: NDA_VERSION,
+      };
+      await updateDoc(doc(db, `artifacts/${appId}/users/${userId}/profiles`, 'myProfile'), stamp);
+      setUserProfile((p) => ({ ...(p || {}), ...stamp, legalAcceptedAt: new Date().toISOString() }));
+      showGlobalMessage('Welcome aboard.');
+    } catch (e) {
+      console.error(e);
+      showGlobalMessage('Could not record acceptance. Please try again.', 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const decline = async () => {
+    try {
+      await signOut(auth);
+      if (typeof window !== 'undefined') window.localStorage.removeItem(UNLOCK_KEY);
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[60] flex justify-center items-center p-4">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[92vh] flex flex-col">
+        <header className="p-5 border-b border-gray-100">
+          <h2 className="text-xl font-bold text-gray-800">Before you continue</h2>
+          <p className="text-xs text-gray-500 mt-1">
+            Hangouts is in private beta. Please read and accept the Terms of Service and Non-Disclosure Agreement below.
+          </p>
+        </header>
+        <div className="flex-1 overflow-y-auto px-6 py-4 space-y-6 text-sm text-gray-700">
+          <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-800">
+            <strong>Not legal advice.</strong> These are template documents drafted for early private testing. They are not a substitute for advice from an attorney licensed in your jurisdiction.
+          </div>
+
+          <section>
+            <h3 className="font-bold text-gray-900 mb-2">Terms of Service</h3>
+            <pre className="whitespace-pre-wrap font-sans text-sm bg-gray-50 border border-gray-200 rounded-xl p-4 leading-relaxed">{TOS_TEXT}</pre>
+            <label className="flex items-start gap-2 mt-3 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={tosAgreed}
+                onChange={(e) => setTosAgreed(e.target.checked)}
+                className="mt-1 w-4 h-4 text-indigo-600 rounded focus:ring-indigo-500"
+              />
+              <span className="text-sm text-gray-700">I have read and agree to the <strong>Terms of Service</strong>.</span>
+            </label>
+          </section>
+
+          <section>
+            <h3 className="font-bold text-gray-900 mb-2">Non-Disclosure Agreement (NY law)</h3>
+            <pre className="whitespace-pre-wrap font-sans text-sm bg-gray-50 border border-gray-200 rounded-xl p-4 leading-relaxed">{NDA_TEXT}</pre>
+            <label className="flex items-start gap-2 mt-3 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={ndaAgreed}
+                onChange={(e) => setNdaAgreed(e.target.checked)}
+                className="mt-1 w-4 h-4 text-indigo-600 rounded focus:ring-indigo-500"
+              />
+              <span className="text-sm text-gray-700">I have read and agree to the <strong>Non-Disclosure Agreement</strong>, and understand that violating it could lead to legal action.</span>
+            </label>
+          </section>
+        </div>
+        <footer className="p-5 border-t border-gray-100 flex gap-3">
+          <button
+            onClick={decline}
+            disabled={saving}
+            className="flex-1 bg-gray-100 hover:bg-gray-200 text-gray-700 py-3 rounded-xl font-medium transition disabled:opacity-50"
+          >
+            Decline &amp; Sign Out
+          </button>
+          <button
+            onClick={accept}
+            disabled={!tosAgreed || !ndaAgreed || saving}
+            className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white py-3 rounded-xl font-bold disabled:opacity-50 transition"
+          >
+            {saving ? 'Recording…' : 'I Accept'}
+          </button>
+        </footer>
+      </div>
+    </div>
+  );
+};
+
 // --- Name Setting (for anonymous + new users) ---
 // Anonymous Firebase Auth users come in with no displayName, so their
 // profile defaults to "User". When that's the case (or the name is
@@ -2479,14 +2656,6 @@ const SendToGroupModal = ({ event, onClose }) => {
   const [loadingGroups, setLoadingGroups] = useState(true);
   const [sendingTo, setSendingTo] = useState(null);
   const [errorMsg, setErrorMsg] = useState('');
-
-  // Scroll the page to the top when the modal opens so the centered overlay
-  // doesn't end up hidden behind dev tools / off-screen on long feeds.
-  useEffect(() => {
-    if (typeof window !== 'undefined') {
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    }
-  }, []);
 
   const groupIdsKey = userProfile?.groupIds?.join(',') || '';
 
@@ -2827,6 +2996,18 @@ export default function App() {
     !nameSkipped &&
     (!userProfile.name || userProfile.name === 'User' || userProfile.name.trim() === '');
 
+  // Block all app interaction until the user has accepted the current TOS
+  // and NDA versions. We check the stored version so a future doc revision
+  // can force re-acceptance by bumping TOS_VERSION/NDA_VERSION.
+  const needsLegal =
+    !!userId &&
+    !!userProfile &&
+    (
+      !userProfile.legalAcceptedAt ||
+      userProfile.tosVersion !== TOS_VERSION ||
+      userProfile.ndaVersion !== NDA_VERSION
+    );
+
   const showGlobalMessage = useCallback((text, type = 'success') => {
     setMsg({ text, type });
     setTimeout(() => setMsg(null), 3000);
@@ -2972,6 +3153,7 @@ export default function App() {
             <JoinGroupModal groupId={pendingJoinGroupId} onClose={() => setPendingJoinGroupId(null)} />
           )}
           {needsName && <NameSettingModal onClose={() => setNameSkipped(true)} />}
+          {needsLegal && <LegalAcceptanceModal />}
           <FeedbackButton />
         </div>
         )}
