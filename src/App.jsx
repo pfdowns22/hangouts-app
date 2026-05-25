@@ -2085,6 +2085,7 @@ const SendToGroupModal = ({ event, onClose }) => {
   const [loadingGroups, setLoadingGroups] = useState(true);
   const [sendingTo, setSendingTo] = useState(null);
   const [errorMsg, setErrorMsg] = useState('');
+  const [debugSteps, setDebugSteps] = useState([]);
 
   const groupIdsKey = userProfile?.groupIds?.join(',') || '';
 
@@ -2113,24 +2114,27 @@ const SendToGroupModal = ({ event, onClose }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [groupIdsKey]);
 
+  const log = (line) => setDebugSteps((prev) => [...prev, line]);
+
   const send = async (group) => {
     setSendingTo(group.id);
     setErrorMsg('');
+    setDebugSteps([]);
+    log(`1. send() called for "${group.name}" (id=${group.id?.slice(0, 8) || '?'}, members=${group.members?.length ?? '?'})`);
     try {
-      // Sanitize every field — Firestore rejects writes that contain
-      // `undefined`, and Gemini's event payloads often leave imageUrl /
-      // imageKeywords / url unset. Falling back to safe defaults keeps
-      // the batch.commit() from blowing up.
       const safe = {
-        title: event.title || '',
-        description: event.description || '',
-        location: event.location || '',
-        date: event.date || '',
-        url: event.url || '',
-        imageUrl: event.imageUrl || null,
-        imageKeywords: event.imageKeywords || '',
+        title: event?.title || '',
+        description: event?.description || '',
+        location: event?.location || '',
+        date: event?.date || '',
+        url: event?.url || '',
+        imageUrl: event?.imageUrl || null,
+        imageKeywords: event?.imageKeywords || '',
       };
+      log(`2. payload sanitized (title="${safe.title?.slice(0, 40)}")`);
+
       const proposerName = userProfile?.name || 'User';
+      log(`3. as proposer="${proposerName}" uid=${userId?.slice(0, 8) || '?'}`);
 
       const proposalData = {
         ...safe,
@@ -2141,15 +2145,19 @@ const SendToGroupModal = ({ event, onClose }) => {
         rsvps: { [userId]: 'yes' },
         createdAt: serverTimestamp(),
       };
+
+      log(`4. calling addDoc to groups/${group.id?.slice(0, 8)}/proposals…`);
       const proposalRef = await addDoc(
         collection(db, `artifacts/${appId}/public/data/groups/${group.id}/proposals`),
         proposalData
       );
+      log(`5. addDoc resolved (proposalId=${proposalRef.id.slice(0, 8)})`);
 
-      // Ping other members' feeds (for toast + badge)
       const batch = writeBatch(db);
+      let pings = 0;
       (group.members || []).forEach((memberId) => {
         if (memberId === userId) return;
+        pings += 1;
         batch.set(doc(collection(db, `artifacts/${appId}/users/${memberId}/feed`)), {
           type: 'groupProposal',
           data: {
@@ -2162,12 +2170,16 @@ const SendToGroupModal = ({ event, onClose }) => {
           timestamp: serverTimestamp(),
         });
       });
+      log(`6. batched ${pings} feed ping(s), committing…`);
       await batch.commit();
+      log('7. batch.commit() resolved');
+
       showGlobalMessage(`Sent "${safe.title}" to ${group.name}!`);
       onClose();
     } catch (e) {
       console.error('Send-to-group failed:', e);
       const detail = e?.code ? `${e.code}: ${e.message || ''}` : (e?.message || String(e));
+      log(`ERROR: ${detail}`);
       setErrorMsg(`Could not send. ${detail}`);
       showGlobalMessage('Could not send to that group.', 'error');
     } finally {
@@ -2194,6 +2206,13 @@ const SendToGroupModal = ({ event, onClose }) => {
             {errorMsg && (
               <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-700 break-words">
                 {errorMsg}
+              </div>
+            )}
+            {debugSteps.length > 0 && (
+              <div className="p-3 bg-gray-900 text-emerald-300 font-mono text-xs rounded-xl break-words space-y-0.5 max-h-48 overflow-y-auto">
+                {debugSteps.map((step, i) => (
+                  <div key={i}>{step}</div>
+                ))}
               </div>
             )}
             {groups.map((g) => (
