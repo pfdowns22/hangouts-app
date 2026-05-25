@@ -1107,6 +1107,11 @@ const SCOPE_TIERS = [
   { label: 'the wider metro region (~60 miles)', radius: '60 miles' },
 ];
 
+// Map priceTier strings to a numeric sort weight; events without a tier
+// land at the bottom of price-sorted lists.
+const PRICE_WEIGHT = { Free: 0, '$': 1, '$$': 2, '$$$': 3, '$$$$': 4 };
+const priceWeight = (tier) => (PRICE_WEIGHT[tier] !== undefined ? PRICE_WEIGHT[tier] : 99);
+
 // A reference timestamp far in the past. Items written with timestamps
 // less than ~year 2010 will always sort below items written with
 // serverTimestamp() in desc order. We decrement from this base for each
@@ -1119,10 +1124,40 @@ const MyFeedSection = () => {
   const [feedItems, setFeedItems] = useState([]);
   const [isGenerating, setIsGenerating] = useState(false);
   const [patienceIdx, setPatienceIdx] = useState(0);
+  const [filterMode, setFilterMode] = useState('all'); // all | free | cheap | expensive | ticketed
+  const [sortMode, setSortMode] = useState('feed'); // feed | dateAsc | dateDesc | priceAsc | priceDesc
   const sentinelRef = useRef(null);
   const generatingRef = useRef(false);
   const scopeRef = useRef(0); // expanding scope tier; reset on refresh
   const scrollCounterRef = useRef(0); // decrements scroll timestamps so later items sink lower
+
+  // Compute the filtered/sorted view of feedItems for rendering.
+  const displayItems = useMemo(() => {
+    const matchesFilter = (item) => {
+      const d = item.data || {};
+      switch (filterMode) {
+        case 'free':
+          return d.priceTier === 'Free';
+        case 'cheap':
+          return d.priceTier === '$' || d.priceTier === '$$';
+        case 'expensive':
+          return d.priceTier === '$$$' || d.priceTier === '$$$$';
+        case 'ticketed':
+          return d.isTicketed === true;
+        default:
+          return true;
+      }
+    };
+    const arr = feedItems.filter(matchesFilter);
+    if (sortMode === 'feed') return arr;
+    const sorted = [...arr];
+    const dateOf = (it) => new Date(it.data?.date || 0).getTime() || 0;
+    if (sortMode === 'dateAsc') sorted.sort((a, b) => dateOf(a) - dateOf(b));
+    if (sortMode === 'dateDesc') sorted.sort((a, b) => dateOf(b) - dateOf(a));
+    if (sortMode === 'priceAsc') sorted.sort((a, b) => priceWeight(a.data?.priceTier) - priceWeight(b.data?.priceTier));
+    if (sortMode === 'priceDesc') sorted.sort((a, b) => priceWeight(b.data?.priceTier) - priceWeight(a.data?.priceTier));
+    return sorted;
+  }, [feedItems, filterMode, sortMode]);
 
   // Onboarding banner appears for users who haven't set an address yet.
   const needsOnboarding =
@@ -1381,9 +1416,53 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
         </div>
       ) : (
         <div className="space-y-4">
-          {feedItems.map((item) => (
-            <FeedCard key={item.id} item={item} onDelete={() => deleteFeedItem(item.id)} />
-          ))}
+          {/* Filter + Sort bar */}
+          <div className="flex flex-wrap gap-3 items-center bg-white/60 border border-gray-100 rounded-2xl p-3">
+            <div className="flex flex-wrap gap-1.5 flex-1 min-w-0">
+              {[
+                { id: 'all', label: 'All' },
+                { id: 'free', label: 'Free' },
+                { id: 'cheap', label: '$ – $$' },
+                { id: 'expensive', label: '$$$+' },
+                { id: 'ticketed', label: '🎟️ Ticketed' },
+              ].map((opt) => {
+                const on = filterMode === opt.id;
+                return (
+                  <button
+                    key={opt.id}
+                    onClick={() => setFilterMode(opt.id)}
+                    className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition ${
+                      on ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-600 border-gray-200 hover:border-indigo-300'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                );
+              })}
+            </div>
+            <select
+              value={sortMode}
+              onChange={(e) => setSortMode(e.target.value)}
+              className="text-xs font-semibold p-2 pr-8 rounded-lg border border-gray-200 bg-white text-gray-700 focus:ring-2 focus:ring-indigo-500"
+              title="Sort feed"
+            >
+              <option value="feed">Newly added</option>
+              <option value="dateAsc">Event date · earliest first</option>
+              <option value="dateDesc">Event date · latest first</option>
+              <option value="priceAsc">Price · low to high</option>
+              <option value="priceDesc">Price · high to low</option>
+            </select>
+          </div>
+
+          {displayItems.length === 0 ? (
+            <div className="text-center py-8 text-gray-500 text-sm bg-white/40 rounded-2xl border border-dashed border-gray-200">
+              No events match this filter. Clear it to see your full feed.
+            </div>
+          ) : (
+            displayItems.map((item) => (
+              <FeedCard key={item.id} item={item} onDelete={() => deleteFeedItem(item.id)} />
+            ))
+          )}
           {/* Infinite scroll sentinel: when visible, fetch more upcoming events */}
           <div ref={sentinelRef} className="h-12 flex items-center justify-center text-sm text-gray-400">
             {isGenerating === 'upcoming' ? (
@@ -1931,6 +2010,7 @@ const SuggestionSection = () => {
   const [generating, setGenerating] = useState(false);
   const [ideas, setIdeas] = useState([]);
   const [memberSummary, setMemberSummary] = useState(null);
+  const [generateError, setGenerateError] = useState('');
 
   const groupIdsKey = userProfile?.groupIds?.join(',') || '';
 
@@ -1985,6 +2065,7 @@ const SuggestionSection = () => {
       return;
     }
     setGenerating(true);
+    setGenerateError('');
     try {
       const group = groups.find((g) => g.id === selectedId);
 
@@ -2104,13 +2185,23 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
         }),
       });
       const data = await res.json();
+      if (!res.ok || data.error) {
+        const code = data?.error?.code || res.status;
+        const message = data?.error?.message || res.statusText || 'Unknown error';
+        throw new Error(`${code}: ${message}`);
+      }
       if (!data.candidates) throw new Error('AI returned empty response');
       const parsed = extractJsonArray(data.candidates[0].content.parts[0].text);
-      if (!parsed) throw new Error('Could not parse ideas from AI response');
+      if (!parsed) {
+        const rawSnippet = (data.candidates[0]?.content?.parts?.[0]?.text || '').slice(0, 240);
+        throw new Error(`Could not parse JSON from AI response. Raw start: ${rawSnippet}`);
+      }
       setIdeas(parsed);
     } catch (e) {
-      console.error(e);
-      showGlobalMessage('Could not fetch real events. Try again.', 'error');
+      console.error('Group suggestions failed:', e);
+      const detail = e?.message || String(e);
+      setGenerateError(detail);
+      showGlobalMessage('Could not fetch real events. See details in the panel.', 'error');
     } finally {
       setGenerating(false);
     }
@@ -2176,6 +2267,12 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
         </button>
       </div>
 
+      {generateError && (
+        <div className="mb-4 bg-red-50 border border-red-200 rounded-2xl p-4 text-sm text-red-700 break-words">
+          <p className="font-bold mb-1">Couldn't get group suggestions</p>
+          <p className="text-xs font-mono">{generateError}</p>
+        </div>
+      )}
       {memberSummary && (
         <div className="mb-8 bg-white border border-indigo-100 rounded-2xl p-4 text-sm text-gray-700">
           <p className="font-semibold text-gray-800 mb-1 flex items-center gap-2">
