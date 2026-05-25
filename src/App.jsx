@@ -464,8 +464,21 @@ const ProfileSection = ({ onClose }) => {
     });
     return migrated;
   });
-  const [timeOfDayPrefs, setTimeOfDayPrefs] = useState(userProfile?.timeOfDayPrefs || []);
-  const [dayOfWeekPrefs, setDayOfWeekPrefs] = useState(userProfile?.dayOfWeekPrefs || []);
+  // weeklyAvailability is the canonical recurring-availability field:
+  // { Mon: ['morning','evening'], Sat: ['afternoon','evening'], ... }
+  // Migration from the old separate pickers: cross-product the old
+  // dayOfWeekPrefs × timeOfDayPrefs values to backfill.
+  const [weeklyAvailability, setWeeklyAvailability] = useState(() => {
+    if (userProfile?.weeklyAvailability && typeof userProfile.weeklyAvailability === 'object') {
+      return userProfile.weeklyAvailability;
+    }
+    const days = userProfile?.dayOfWeekPrefs || [];
+    const times = userProfile?.timeOfDayPrefs || [];
+    if (!days.length || !times.length) return {};
+    const slotMap = { Mornings: 'morning', Afternoons: 'afternoon', Evenings: 'evening' };
+    const slots = times.map((t) => slotMap[t]).filter(Boolean);
+    return Object.fromEntries(days.map((d) => [d, slots]));
+  });
   const [freeSlots, setFreeSlots] = useState(userProfile?.freeSlots || []);
   const [isSaving, setIsSaving] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -493,6 +506,16 @@ const ProfileSection = ({ onClose }) => {
   const handleSaveProfile = async () => {
     setIsSaving(true);
     try {
+      // Derive legacy timeOfDayPrefs / dayOfWeekPrefs from the new
+      // weeklyAvailability matrix so any older code paths (and the
+      // group-suggestion fallback prompt) keep working.
+      const slotToLabel = { morning: 'Mornings', afternoon: 'Afternoons', evening: 'Evenings' };
+      const derivedDayOfWeek = Object.entries(weeklyAvailability)
+        .filter(([, s]) => Array.isArray(s) && s.length)
+        .map(([d]) => d);
+      const derivedTimeOfDay = [
+        ...new Set(Object.values(weeklyAvailability).flat().map((s) => slotToLabel[s]).filter(Boolean)),
+      ];
       const update = {
         name,
         address,
@@ -500,8 +523,9 @@ const ProfileSection = ({ onClose }) => {
         preferences,
         availability: availableDates,
         availabilitySlots,
-        timeOfDayPrefs,
-        dayOfWeekPrefs,
+        weeklyAvailability,
+        timeOfDayPrefs: derivedTimeOfDay,
+        dayOfWeekPrefs: derivedDayOfWeek,
         freeSlots,
       };
       await updateDoc(doc(db, `artifacts/${appId}/users/${userId}/profiles`, 'myProfile'), update);
@@ -517,6 +541,18 @@ const ProfileSection = ({ onClose }) => {
 
   const togglePref = (list, setter, value) =>
     setter(list.includes(value) ? list.filter((x) => x !== value) : [...list, value]);
+
+  const toggleWeeklySlot = (day, slot) => {
+    setWeeklyAvailability((prev) => {
+      const current = prev[day] || [];
+      const next = current.includes(slot) ? current.filter((s) => s !== slot) : [...current, slot];
+      if (next.length === 0) {
+        const { [day]: _drop, ...rest } = prev;
+        return rest;
+      }
+      return { ...prev, [day]: next };
+    });
+  };
 
   const analyzeCalendarWithGemini = async () => {
     if (!googleAccessToken) {
@@ -717,45 +753,37 @@ Return strictly a JSON array (no prose, no markdown fences) of objects with shap
 
       <div className="space-y-3">
         <h3 className="font-bold text-gray-800">When are you usually free?</h3>
-        <div>
-          <label className="block text-xs font-semibold uppercase text-gray-500 mb-2">Times of day</label>
-          <div className="flex flex-wrap gap-2">
-            {['Mornings', 'Afternoons', 'Evenings'].map((slot) => {
-              const active = timeOfDayPrefs.includes(slot);
-              return (
-                <button
-                  key={slot}
-                  type="button"
-                  onClick={() => togglePref(timeOfDayPrefs, setTimeOfDayPrefs, slot)}
-                  className={`px-3 py-1.5 rounded-full text-sm font-medium border transition ${
-                    active ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-700 border-gray-200 hover:border-indigo-300'
-                  }`}
-                >
-                  {slot}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-        <div>
-          <label className="block text-xs font-semibold uppercase text-gray-500 mb-2">Days of week</label>
-          <div className="flex flex-wrap gap-2">
-            {['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map((day) => {
-              const active = dayOfWeekPrefs.includes(day);
-              return (
-                <button
-                  key={day}
-                  type="button"
-                  onClick={() => togglePref(dayOfWeekPrefs, setDayOfWeekPrefs, day)}
-                  className={`px-3 py-1.5 rounded-full text-sm font-medium border transition ${
-                    active ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-700 border-gray-200 hover:border-indigo-300'
-                  }`}
-                >
-                  {day}
-                </button>
-              );
-            })}
-          </div>
+        <p className="text-xs text-gray-500">Tap the times you're typically open for each day. Each row is independent.</p>
+        <div className="space-y-1.5">
+          {['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map((day) => {
+            const daySlots = weeklyAvailability[day] || [];
+            return (
+              <div key={day} className="flex items-center justify-between gap-2 bg-gray-50 rounded-xl p-2.5">
+                <span className="text-sm font-semibold text-gray-800 w-12 shrink-0">{day}</span>
+                <div className="flex gap-1 flex-1 justify-end">
+                  {[
+                    { id: 'morning', short: 'AM' },
+                    { id: 'afternoon', short: 'PM' },
+                    { id: 'evening', short: 'Eve' },
+                  ].map(({ id, short }) => {
+                    const on = daySlots.includes(id);
+                    return (
+                      <button
+                        key={id}
+                        type="button"
+                        onClick={() => toggleWeeklySlot(day, id)}
+                        className={`px-3 py-1 rounded-md text-xs font-semibold border transition ${
+                          on ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-500 border-gray-200 hover:border-indigo-300'
+                        }`}
+                      >
+                        {short}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
         </div>
       </div>
 
@@ -955,6 +983,13 @@ const MyFeedSection = () => {
       const kidsText = userProfile?.kids?.length ? `Kids ages: ${userProfile.kids.map((k) => k.age).join(',')}` : 'No kids';
       const todsPrefs = userProfile?.timeOfDayPrefs?.length ? userProfile.timeOfDayPrefs.join(', ') : 'any time';
       const dowPrefs = userProfile?.dayOfWeekPrefs?.length ? userProfile.dayOfWeekPrefs.join(', ') : 'any day';
+      const weekly = userProfile?.weeklyAvailability || {};
+      const weeklyStr = Object.keys(weekly).length
+        ? Object.entries(weekly)
+            .filter(([, s]) => Array.isArray(s) && s.length)
+            .map(([d, s]) => `${d}=${s.join('/')}`)
+            .join(', ')
+        : '(none specified)';
       const slotsByDate = userProfile?.availabilitySlots || {};
       const datesWithSlots = Object.entries(slotsByDate)
         .filter(([, slots]) => Array.isArray(slots) && slots.length)
@@ -971,9 +1006,10 @@ const MyFeedSection = () => {
 Constraints:
 - Family situation: ${kidsText}
 - Interests/preferences: ${prefs}
-- Preferred times of day: ${todsPrefs}
-- Preferred days of week: ${dowPrefs}
-- Specific dates the user is free (and the times-of-day they're free that day): ${datesWithSlots || '(none marked — fall back to the preferences above)'}
+- Recurring weekly availability (day=times-of-day): ${weeklyStr}
+- Preferred times of day (overall): ${todsPrefs}
+- Preferred days of week (overall): ${dowPrefs}
+- Specific dates the user is free (and the times-of-day they're free that day): ${datesWithSlots || '(none marked — fall back to the recurring weekly availability above)'}
 - HARD RULE: if the user has specific dates above, every suggested event date+time MUST fall on one of those dates AND match one of the listed times-of-day for that date (morning=before 12:00, afternoon=12:00–17:00, evening=17:00+).
 IMPORTANT:
 - Do NOT make up events. Only suggest real events you can verify via web search.
@@ -1607,6 +1643,15 @@ const SuggestionSection = () => {
       const allTimeOfDay = [...new Set(memberProfiles.flatMap((p) => p.timeOfDayPrefs || []))];
       const allDayOfWeek = [...new Set(memberProfiles.flatMap((p) => p.dayOfWeekPrefs || []))];
       const allKids = memberProfiles.flatMap((p) => p.kids || []);
+      // Per-member weekly availability (day -> [slots])
+      const memberWeekly = memberProfiles
+        .filter((p) => p.weeklyAvailability && Object.keys(p.weeklyAvailability).length)
+        .map((p) => ({
+          name: p.name?.split(' ')[0] || 'Member',
+          entries: Object.entries(p.weeklyAvailability)
+            .filter(([, s]) => Array.isArray(s) && s.length)
+            .map(([d, s]) => `${d}=${s.join('/')}`),
+        }));
       const loc = userProfile?.address || memberProfiles.find((p) => p.address)?.address || 'New York';
 
       // Each member's free time blocks (from Gemini calendar analysis),
@@ -1635,10 +1680,17 @@ const SuggestionSection = () => {
 
 GROUP CONTEXT:
 - Combined interests across all members: ${allPrefs.length ? allPrefs.join(', ') : 'general fun'}
-- Preferred times of day (union across members): ${allTimeOfDay.length ? allTimeOfDay.join(', ') : 'any time'}
-- Preferred days of week (union across members): ${allDayOfWeek.length ? allDayOfWeek.join(', ') : 'any day'}
 - Family situation: ${allKids.length ? `Group includes children ages ${allKids.map((k) => k.age).join(', ')} — prefer family-friendly options.` : 'No children — adult-friendly options are fine.'}
 - Anchor location: ${loc} (events must be within ~15 miles / 25 km of here)
+- Preferred times of day (union across members): ${allTimeOfDay.length ? allTimeOfDay.join(', ') : 'any time'}
+- Preferred days of week (union across members): ${allDayOfWeek.length ? allDayOfWeek.join(', ') : 'any day'}
+
+MEMBER RECURRING WEEKLY AVAILABILITY (day=times-of-day each member is usually free):
+${
+  memberWeekly.length
+    ? memberWeekly.map((m) => `- ${m.name}: ${m.entries.join(', ')}`).join('\n')
+    : '(No members have set a recurring weekly schedule.)'
+}
 
 MEMBER AVAILABILITY (free time blocks from Gemini calendar analysis, next 30 days):
 ${
