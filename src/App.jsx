@@ -660,9 +660,14 @@ const ProfileSection = ({ onClose }) => {
   const [aiProvider, setAiProvider] = useState(userProfile?.aiProvider || 'gemini');
   const [aiKeyInput, setAiKeyInput] = useState('');
   const [aiKeySaved, setAiKeySaved] = useState(false);
+  // Collapsed by default — only expand the BYO-key picker if the user is
+  // already off the shared Gemini default.
+  const [showOwnAI, setShowOwnAI] = useState(
+    !!(userProfile?.aiProvider && userProfile.aiProvider !== 'gemini')
+  );
 
   // Load any stored key for the currently-selected provider when it changes
-  // so the field shows the user's existing value (masked).
+  // so the field shows the user's existing value.
   useEffect(() => {
     if (aiProvider === 'gemini') {
       setAiKeyInput('');
@@ -678,6 +683,11 @@ const ProfileSection = ({ onClose }) => {
     setAiKeyInput(val);
     storeKey(aiProvider, val.trim());
     setAiKeySaved(!!val.trim());
+  };
+
+  const collapseToDefault = () => {
+    setShowOwnAI(false);
+    setAiProvider('gemini');
   };
 
   const refreshCurrentLocation = async () => {
@@ -977,53 +987,80 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with shape:
       </div>
 
       <div className="space-y-3 bg-gray-50 border border-gray-200 rounded-2xl p-4">
-        <div>
-          <h3 className="font-bold text-gray-800">AI Provider</h3>
-          <p className="text-xs text-gray-500">
-            The shared Gemini key is the default. If you run out of free quota or want a different model, pick a provider and paste your own API key. Your key is stored only on this device (localStorage), never on our server.
-          </p>
-        </div>
-        <div className="space-y-2">
-          {AI_PROVIDERS.map((p) => {
-            const active = aiProvider === p.id;
-            return (
-              <label
-                key={p.id}
-                className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition ${
-                  active ? 'border-indigo-500 bg-indigo-50' : 'border-gray-200 bg-white hover:border-indigo-300'
-                }`}
-              >
-                <input
-                  type="radio"
-                  name="aiProvider"
-                  checked={active}
-                  onChange={() => setAiProvider(p.id)}
-                  className="mt-1"
-                />
-                <div className="flex-1">
-                  <p className="text-sm font-medium text-gray-800">{p.label}</p>
-                  {p.keyHint && active && (
-                    <p className="text-xs text-gray-500 mt-1">Get a key at <span className="font-mono">{p.keyHint}</span></p>
-                  )}
-                </div>
-              </label>
-            );
-          })}
-        </div>
-        {AI_PROVIDERS.find((p) => p.id === aiProvider)?.needsKey && (
-          <div>
-            <label className="block text-xs font-semibold uppercase text-gray-500 mb-1">Your API key</label>
-            <input
-              type="password"
-              value={aiKeyInput}
-              onChange={(e) => handleAiKeyChange(e.target.value)}
-              placeholder="Paste your key here"
-              className="w-full p-3 bg-white border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500 text-sm font-mono"
-            />
-            <p className="text-xs text-gray-400 mt-1">
-              {aiKeySaved ? '✓ Saved on this device. Never synced.' : 'Key is stored locally only.'}
-            </p>
+        {!showOwnAI ? (
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div>
+              <h3 className="font-bold text-gray-800">AI Provider</h3>
+              <p className="text-xs text-gray-500">Using the shared Gemini key (free, may hit a rate limit on heavy days).</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowOwnAI(true)}
+              className="text-xs bg-indigo-50 text-indigo-700 px-3 py-1.5 rounded-lg font-bold hover:bg-indigo-100 transition whitespace-nowrap"
+            >
+              Use my own AI →
+            </button>
           </div>
+        ) : (
+          <>
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="font-bold text-gray-800">Use my own AI</h3>
+                <p className="text-xs text-gray-500 leading-relaxed">
+                  Heads up: this needs a developer API key from one of the providers below — your ChatGPT/Claude/Gemini subscription does <span className="font-semibold">not</span> include API access (they're separate products). The key stays only on this device.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={collapseToDefault}
+                className="text-xs text-gray-500 hover:text-gray-800 underline whitespace-nowrap"
+              >
+                Back to default
+              </button>
+            </div>
+            <div className="space-y-2">
+              {AI_PROVIDERS.filter((p) => p.id !== 'gemini').map((p) => {
+                const active = aiProvider === p.id;
+                return (
+                  <label
+                    key={p.id}
+                    className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition ${
+                      active ? 'border-indigo-500 bg-indigo-50' : 'border-gray-200 bg-white hover:border-indigo-300'
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="aiProvider"
+                      checked={active}
+                      onChange={() => setAiProvider(p.id)}
+                      className="mt-1"
+                    />
+                    <div className="flex-1">
+                      <p className="text-sm font-medium text-gray-800">{p.label.replace(' (use my own API key)', '').replace(' (use my own Anthropic key)', '').replace(' (use my own key)', '')}</p>
+                      {p.keyHint && active && (
+                        <p className="text-xs text-gray-500 mt-1">Get a key at <span className="font-mono">{p.keyHint}</span></p>
+                      )}
+                    </div>
+                  </label>
+                );
+              })}
+            </div>
+            {AI_PROVIDERS.find((p) => p.id === aiProvider)?.needsKey && (
+              <div>
+                <label className="block text-xs font-semibold uppercase text-gray-500 mb-1">Your API key</label>
+                <input
+                  type="password"
+                  value={aiKeyInput}
+                  onChange={(e) => handleAiKeyChange(e.target.value)}
+                  placeholder="Paste your key here"
+                  className="w-full p-3 bg-white border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500 text-sm font-mono"
+                />
+                <p className="text-xs text-gray-400 mt-1">
+                  {aiKeySaved ? '✓ Saved on this device. Never synced.' : 'Key is stored locally only.'}
+                </p>
+              </div>
+            )}
+          </>
         )}
       </div>
 
