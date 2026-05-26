@@ -31,7 +31,133 @@ import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { auth, db, storage, appId, geminiApiKey } from './firebase.js';
 
 const GEMINI_MODEL = 'gemini-2.5-flash';
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiApiKey}`;
+const GEMINI_URL_FOR_KEY = (key) =>
+  `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${key}`;
+const GEMINI_URL = GEMINI_URL_FOR_KEY(geminiApiKey); // legacy alias
+
+// --- Multi-provider AI dispatcher ---
+// `aiProvider` lives on the user's profile (synced via Firestore).
+// User-provided API keys live in localStorage only — NEVER synced — so
+// they stay on the user's device. Default ("gemini") uses the app's shared
+// Gemini key, which has a free-tier quota and is the right thing for
+// quick demos. For sustained use, users pick their own provider/key.
+const AI_PROVIDERS = [
+  { id: 'gemini', label: 'Gemini (shared app key — default)', needsKey: false },
+  { id: 'gemini-own', label: 'Gemini (use my own API key)', needsKey: true, keyHint: 'aistudio.google.com/app/apikey' },
+  { id: 'claude', label: 'Claude (use my own Anthropic key)', needsKey: true, keyHint: 'console.anthropic.com → API keys' },
+  { id: 'openai', label: 'OpenAI / ChatGPT (use my own key)', needsKey: true, keyHint: 'platform.openai.com/api-keys' },
+];
+
+const getStoredKey = (provider) => {
+  if (typeof window === 'undefined') return '';
+  return window.localStorage.getItem(`hangouts_ai_key_${provider}`) || '';
+};
+
+const storeKey = (provider, key) => {
+  if (typeof window === 'undefined') return;
+  if (key) window.localStorage.setItem(`hangouts_ai_key_${provider}`, key);
+  else window.localStorage.removeItem(`hangouts_ai_key_${provider}`);
+};
+
+// Call a Gemini model. Used for both the shared key and user-supplied
+// Gemini keys. Returns the raw text from the first candidate.
+const callGemini = async (prompt, key, useWebSearch) => {
+  if (!key) throw new Error('Missing Gemini API key.');
+  const body = { contents: [{ parts: [{ text: prompt }] }] };
+  if (useWebSearch) body.tools = [{ google_search: {} }];
+  const res = await fetch(GEMINI_URL_FOR_KEY(key), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) {
+    const code = data?.error?.code || res.status;
+    const message = data?.error?.message || res.statusText || 'Unknown error';
+    throw new Error(`Gemini ${code}: ${message}`);
+  }
+  if (!data.candidates) throw new Error('Gemini returned no candidates.');
+  return data.candidates[0]?.content?.parts?.[0]?.text || '';
+};
+
+// Call Claude (Anthropic Messages API). Browser calls require the
+// `anthropic-dangerous-direct-browser-access` header. The key lives only
+// in the user's browser, so the "danger" warning is the right tradeoff
+// for our friends-and-family setup.
+const callClaude = async (prompt, key, useWebSearch) => {
+  if (!key) throw new Error('Missing Claude API key — paste it in Profile → AI Provider.');
+  const body = {
+    model: 'claude-3-5-sonnet-20241022',
+    max_tokens: 4096,
+    messages: [{ role: 'user', content: prompt }],
+  };
+  if (useWebSearch) {
+    body.tools = [{ type: 'web_search_20250305', name: 'web_search' }];
+  }
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': key,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) {
+    const message = data?.error?.message || res.statusText || 'Unknown error';
+    throw new Error(`Claude ${res.status}: ${message}`);
+  }
+  const text = (data.content || [])
+    .filter((c) => c.type === 'text')
+    .map((c) => c.text)
+    .join('\n');
+  if (!text) throw new Error('Claude returned no text content.');
+  return text;
+};
+
+// Call OpenAI (Responses API — supports web search via tools). The
+// `dangerouslyAllowBrowser` SDK flag is unnecessary when calling the REST
+// endpoint directly; the key is just sent in the Authorization header.
+const callOpenAI = async (prompt, key, useWebSearch) => {
+  if (!key) throw new Error('Missing OpenAI API key — paste it in Profile → AI Provider.');
+  const body = {
+    model: useWebSearch ? 'gpt-4o-mini-search-preview' : 'gpt-4o-mini',
+    input: prompt,
+  };
+  if (useWebSearch) body.tools = [{ type: 'web_search_preview' }];
+  const res = await fetch('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${key}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) {
+    const message = data?.error?.message || res.statusText || 'Unknown error';
+    throw new Error(`OpenAI ${res.status}: ${message}`);
+  }
+  // Prefer the convenience output_text if present; fall back to walking the output array.
+  if (typeof data.output_text === 'string' && data.output_text) return data.output_text;
+  const piece = (data.output || []).find((o) => Array.isArray(o.content));
+  const text = (piece?.content || []).filter((c) => c.type === 'output_text' || c.type === 'text').map((c) => c.text).join('\n');
+  if (!text) throw new Error('OpenAI returned no text content.');
+  return text;
+};
+
+// Dispatcher used by every AI call site in the app. The caller passes
+// the provider object directly (we don't read from React state here so
+// it stays as a pure function callable from class-free helpers).
+const callAI = async ({ prompt, useWebSearch = false, provider = 'gemini' }) => {
+  if (provider === 'gemini') return callGemini(prompt, geminiApiKey, useWebSearch);
+  if (provider === 'gemini-own') return callGemini(prompt, getStoredKey('gemini-own'), useWebSearch);
+  if (provider === 'claude') return callClaude(prompt, getStoredKey('claude'), useWebSearch);
+  if (provider === 'openai') return callOpenAI(prompt, getStoredKey('openai'), useWebSearch);
+  throw new Error(`Unknown AI provider: ${provider}`);
+};
 
 // Small inline pills shown on every event card: pricing tier ($-$$$$) and
 // a ticketed indicator. Both render only when the field is populated, so
@@ -529,6 +655,30 @@ const ProfileSection = ({ onClose }) => {
   const [currentLocation, setCurrentLocation] = useState(userProfile?.currentLocation || null);
   const [locationPreference, setLocationPreference] = useState(userProfile?.locationPreference || 'home');
   const [locatingNow, setLocatingNow] = useState(false);
+  // AI provider preference + user-supplied key. Provider syncs to profile;
+  // the key lives only in localStorage so it never leaves the device.
+  const [aiProvider, setAiProvider] = useState(userProfile?.aiProvider || 'gemini');
+  const [aiKeyInput, setAiKeyInput] = useState('');
+  const [aiKeySaved, setAiKeySaved] = useState(false);
+
+  // Load any stored key for the currently-selected provider when it changes
+  // so the field shows the user's existing value (masked).
+  useEffect(() => {
+    if (aiProvider === 'gemini') {
+      setAiKeyInput('');
+      setAiKeySaved(false);
+      return;
+    }
+    const existing = getStoredKey(aiProvider);
+    setAiKeyInput(existing);
+    setAiKeySaved(!!existing);
+  }, [aiProvider]);
+
+  const handleAiKeyChange = (val) => {
+    setAiKeyInput(val);
+    storeKey(aiProvider, val.trim());
+    setAiKeySaved(!!val.trim());
+  };
 
   const refreshCurrentLocation = async () => {
     if (!navigator.geolocation) {
@@ -617,6 +767,7 @@ const ProfileSection = ({ onClose }) => {
         freeSlots,
         currentLocation,
         locationPreference,
+        aiProvider,
         // Mark profile as completed (used by the onboarding banner).
         profileCompletedAt: serverTimestamp(),
       };
@@ -680,35 +831,13 @@ Rules:
 - Prefer evenings (after 17:00) and weekend afternoons; only suggest weekday daytime blocks if I have a clearly open calendar.
 - Skip any block that ends less than 30 minutes before the next event (need transit/buffer time).
 - Cap at the 25 best blocks.
-Return strictly a JSON array (no prose, no markdown fences) of objects with shape:
+Return ONLY a JSON array (no prose, no markdown fences) of objects with shape:
 { "date": "YYYY-MM-DD", "start": "HH:MM", "end": "HH:MM", "label": "short human label like 'Tue evening' or 'Sat afternoon'" }`;
 
-      const geminiRes = await fetch(GEMINI_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          generationConfig: {
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: 'ARRAY',
-              items: {
-                type: 'OBJECT',
-                properties: {
-                  date: { type: 'STRING' },
-                  start: { type: 'STRING' },
-                  end: { type: 'STRING' },
-                  label: { type: 'STRING' },
-                },
-                required: ['date', 'start', 'end'],
-              },
-            },
-          },
-        }),
-      });
-      const data = await geminiRes.json();
-      if (!data.candidates) throw new Error('AI generated empty response.');
-      const slots = JSON.parse(data.candidates[0].content.parts[0].text);
+      const provider = userProfile?.aiProvider || 'gemini';
+      const text = await callAI({ prompt, useWebSearch: false, provider });
+      const slots = extractJsonArray(text);
+      if (!slots) throw new Error('Could not parse calendar analysis JSON.');
       setFreeSlots(slots);
       // Keep the day-level checked state in sync so the calendar reflects which days have any availability
       const days = [...new Set(slots.map((s) => s.date))].sort();
@@ -818,6 +947,7 @@ Return strictly a JSON array (no prose, no markdown fences) of objects with shap
             )}
           </p>
         )}
+        {/* moved to AI provider section below */}
         <div>
           <label className="block text-xs font-semibold uppercase text-gray-500 mb-2">When suggesting events, use…</label>
           <div className="flex flex-wrap gap-2">
@@ -844,6 +974,57 @@ Return strictly a JSON array (no prose, no markdown fences) of objects with shap
             })}
           </div>
         </div>
+      </div>
+
+      <div className="space-y-3 bg-gray-50 border border-gray-200 rounded-2xl p-4">
+        <div>
+          <h3 className="font-bold text-gray-800">AI Provider</h3>
+          <p className="text-xs text-gray-500">
+            The shared Gemini key is the default. If you run out of free quota or want a different model, pick a provider and paste your own API key. Your key is stored only on this device (localStorage), never on our server.
+          </p>
+        </div>
+        <div className="space-y-2">
+          {AI_PROVIDERS.map((p) => {
+            const active = aiProvider === p.id;
+            return (
+              <label
+                key={p.id}
+                className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition ${
+                  active ? 'border-indigo-500 bg-indigo-50' : 'border-gray-200 bg-white hover:border-indigo-300'
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="aiProvider"
+                  checked={active}
+                  onChange={() => setAiProvider(p.id)}
+                  className="mt-1"
+                />
+                <div className="flex-1">
+                  <p className="text-sm font-medium text-gray-800">{p.label}</p>
+                  {p.keyHint && active && (
+                    <p className="text-xs text-gray-500 mt-1">Get a key at <span className="font-mono">{p.keyHint}</span></p>
+                  )}
+                </div>
+              </label>
+            );
+          })}
+        </div>
+        {AI_PROVIDERS.find((p) => p.id === aiProvider)?.needsKey && (
+          <div>
+            <label className="block text-xs font-semibold uppercase text-gray-500 mb-1">Your API key</label>
+            <input
+              type="password"
+              value={aiKeyInput}
+              onChange={(e) => handleAiKeyChange(e.target.value)}
+              placeholder="Paste your key here"
+              className="w-full p-3 bg-white border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500 text-sm font-mono"
+            />
+            <p className="text-xs text-gray-400 mt-1">
+              {aiKeySaved ? '✓ Saved on this device. Never synced.' : 'Key is stored locally only.'}
+            </p>
+          </div>
+        )}
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
@@ -1231,7 +1412,8 @@ const MyFeedSection = () => {
 
   const generatePersonalSuggestions = async (forToday = false, opts = {}) => {
     const { fromScroll = false } = opts;
-    if (!geminiApiKey) {
+    const provider = userProfile?.aiProvider || 'gemini';
+    if (provider === 'gemini' && !geminiApiKey) {
       showGlobalMessage('Gemini API key missing. Set VITE_GEMINI_API_KEY in your environment.', 'error');
       return;
     }
@@ -1328,19 +1510,8 @@ PRICING & TICKETS:
 
 Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords, locationSource, priceTier, isTicketed, ticketsUrl.`;
 
-      const response = await fetch(GEMINI_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          tools: [{ google_search: {} }],
-        }),
-      });
-
-      if (!response.ok) throw new Error('API call failed');
-      const data = await response.json();
-      if (!data.candidates) throw new Error('AI returned empty response');
-      const suggestions = extractJsonArray(data.candidates[0].content.parts[0].text);
+      const text = await callAI({ prompt, useWebSearch: true, provider });
+      const suggestions = extractJsonArray(text);
       if (!suggestions) throw new Error('Could not parse suggestions from AI response');
       const batch = writeBatch(db);
       suggestions.forEach((s) => {
@@ -2176,25 +2347,11 @@ SOURCES (PREFER quality editorial / curated picks over generic listings):
 
 Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords, priceTier, isTicketed, ticketsUrl.`;
 
-      const res = await fetch(GEMINI_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          tools: [{ google_search: {} }],
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        const code = data?.error?.code || res.status;
-        const message = data?.error?.message || res.statusText || 'Unknown error';
-        throw new Error(`${code}: ${message}`);
-      }
-      if (!data.candidates) throw new Error('AI returned empty response');
-      const parsed = extractJsonArray(data.candidates[0].content.parts[0].text);
+      const provider = userProfile?.aiProvider || 'gemini';
+      const text = await callAI({ prompt, useWebSearch: true, provider });
+      const parsed = extractJsonArray(text);
       if (!parsed) {
-        const rawSnippet = (data.candidates[0]?.content?.parts?.[0]?.text || '').slice(0, 240);
-        throw new Error(`Could not parse JSON from AI response. Raw start: ${rawSnippet}`);
+        throw new Error(`Could not parse JSON from AI response. Raw start: ${text.slice(0, 240)}`);
       }
       setIdeas(parsed);
     } catch (e) {
@@ -2729,31 +2886,9 @@ Generate exactly 3 follow-up questions that drill into their stated interests. E
 Return ONLY a JSON array (no prose, no markdown) of objects with keys: question (string), type ("single" or "multi"), options (array of strings).`;
 
     try {
-      const res = await fetch(GEMINI_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: 'ARRAY',
-              items: {
-                type: 'OBJECT',
-                properties: {
-                  question: { type: 'STRING' },
-                  type: { type: 'STRING' },
-                  options: { type: 'ARRAY', items: { type: 'STRING' } },
-                },
-                required: ['question', 'type', 'options'],
-              },
-            },
-          },
-        }),
-      });
-      const data = await res.json();
-      if (!data.candidates) throw new Error('AI returned empty response');
-      const generated = JSON.parse(data.candidates[0].content.parts[0].text);
+      const provider = userProfile?.aiProvider || 'gemini';
+      const text = await callAI({ prompt, useWebSearch: false, provider });
+      const generated = extractJsonArray(text);
       return Array.isArray(generated) ? generated.slice(0, 3) : null;
     } catch (e) {
       console.error('Survey follow-up generation failed:', e);
