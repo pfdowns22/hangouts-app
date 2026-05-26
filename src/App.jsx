@@ -1346,7 +1346,43 @@ const MyFeedSection = () => {
   const [filterMode, setFilterMode] = useState('all'); // all | free | cheap | expensive | ticketed
   const [sortMode, setSortMode] = useState('feed'); // feed | dateAsc | dateDesc | priceAsc | priceDesc
   const [showFilterPanel, setShowFilterPanel] = useState(false);
+  const [filterAnchorRect, setFilterAnchorRect] = useState(null);
+  const filterBtnRef = useRef(null);
   const filterActive = filterMode !== 'all' || sortMode !== 'feed';
+
+  const openFilterPanel = () => {
+    if (filterBtnRef.current) {
+      const r = filterBtnRef.current.getBoundingClientRect();
+      setFilterAnchorRect({ top: r.top, bottom: r.bottom, left: r.left, right: r.right });
+    }
+    setShowFilterPanel(true);
+  };
+
+  // Compute a popover style anchored just below the funnel button, with
+  // sensible clamps so it never escapes the viewport. Memoized so we don't
+  // re-run the layout math on every parent re-render.
+  const filterPanelStyle = useMemo(() => {
+    if (typeof window === 'undefined') return null;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const width = Math.min(380, vw - 32);
+    const estimatedHeight = 540;
+    if (!filterAnchorRect) {
+      return { top: '16px', right: '50%', width: `${width}px`, transform: 'translateX(50%)' };
+    }
+    // Default to dropping the panel below the button; flip above if there
+    // isn't enough room below.
+    let top = filterAnchorRect.bottom + 8;
+    if (top + estimatedHeight > vh - 16) {
+      top = Math.max(16, filterAnchorRect.top - estimatedHeight - 8);
+    }
+    // Right-align to the button, clamped so the panel's left edge stays
+    // visible on small screens.
+    let right = vw - filterAnchorRect.right;
+    right = Math.min(right, vw - width - 16);
+    right = Math.max(16, right);
+    return { top: `${top}px`, right: `${right}px`, width: `${width}px`, maxHeight: `${vh - 32}px` };
+  }, [filterAnchorRect]);
   const sentinelRef = useRef(null);
   const generatingRef = useRef(false);
   const scopeRef = useRef(0); // expanding scope tier; reset on refresh
@@ -1633,7 +1669,8 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
               {displayItems.length} of {feedItems.length} {feedItems.length === 1 ? 'event' : 'events'}
             </span>
             <button
-              onClick={() => setShowFilterPanel(true)}
+              ref={filterBtnRef}
+              onClick={openFilterPanel}
               className="relative w-10 h-10 flex items-center justify-center rounded-full bg-white border border-gray-200 hover:border-indigo-400 hover:text-indigo-600 text-gray-600 shadow-sm transition"
               title="Filter & sort"
               aria-label="Filter and sort feed"
@@ -1667,82 +1704,94 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
         </div>
       )}
       {showFilterPanel && (
-        <Modal onClose={() => setShowFilterPanel(false)} title="Filter & Sort">
-          <div className="space-y-6">
-            <section>
-              <h4 className="text-xs font-bold uppercase text-gray-500 mb-2">Filter by</h4>
-              <div className="flex flex-wrap gap-2">
-                {[
-                  { id: 'all', label: 'All events' },
-                  { id: 'free', label: 'Free' },
-                  { id: 'cheap', label: '$ – $$' },
-                  { id: 'expensive', label: '$$$ – $$$$' },
-                  { id: 'ticketed', label: '🎟️ Ticketed' },
-                ].map((opt) => {
-                  const on = filterMode === opt.id;
-                  return (
-                    <button
-                      key={opt.id}
-                      onClick={() => setFilterMode(opt.id)}
-                      className={`px-3.5 py-2 rounded-full text-sm font-semibold border transition ${
-                        on ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-700 border-gray-200 hover:border-indigo-300'
-                      }`}
-                    >
-                      {opt.label}
-                    </button>
-                  );
-                })}
-              </div>
-            </section>
-
-            <section>
-              <h4 className="text-xs font-bold uppercase text-gray-500 mb-2">Sort by</h4>
-              <div className="space-y-2">
-                {[
-                  { id: 'feed', label: 'Newly added (default)' },
-                  { id: 'dateAsc', label: 'Event date · earliest first' },
-                  { id: 'dateDesc', label: 'Event date · latest first' },
-                  { id: 'priceAsc', label: 'Price · low to high' },
-                  { id: 'priceDesc', label: 'Price · high to low' },
-                ].map((opt) => {
-                  const on = sortMode === opt.id;
-                  return (
-                    <label
-                      key={opt.id}
-                      className={`flex items-center gap-3 p-3 rounded-xl border cursor-pointer transition ${
-                        on ? 'border-indigo-500 bg-indigo-50' : 'border-gray-200 bg-white hover:border-indigo-300'
-                      }`}
-                    >
-                      <input
-                        type="radio"
-                        name="sortMode"
-                        checked={on}
-                        onChange={() => setSortMode(opt.id)}
-                      />
-                      <span className="text-sm text-gray-700">{opt.label}</span>
-                    </label>
-                  );
-                })}
-              </div>
-            </section>
-
-            <div className="flex gap-2 pt-2 border-t border-gray-100">
-              <button
-                onClick={() => { setFilterMode('all'); setSortMode('feed'); }}
-                disabled={!filterActive}
-                className="flex-1 py-2.5 rounded-xl text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 disabled:opacity-50 transition"
-              >
-                Reset
+        <div className="fixed inset-0 z-50" onClick={() => setShowFilterPanel(false)}>
+          <div
+            className="absolute bg-white rounded-2xl shadow-2xl border border-gray-200 overflow-y-auto"
+            style={filterPanelStyle || { top: '16px', right: '16px', width: '380px' }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <header className="flex justify-between items-center p-4 border-b border-gray-100 sticky top-0 bg-white z-10">
+              <h3 className="text-base font-bold text-gray-800">Filter & Sort</h3>
+              <button onClick={() => setShowFilterPanel(false)} className="text-gray-400 hover:text-gray-700 p-1 rounded-full hover:bg-gray-100 transition">
+                <CloseIcon className="w-5 h-5" />
               </button>
-              <button
-                onClick={() => setShowFilterPanel(false)}
-                className="flex-1 py-2.5 rounded-xl text-sm font-bold text-white bg-indigo-600 hover:bg-indigo-700 transition"
-              >
-                Done
-              </button>
+            </header>
+            <div className="p-4 space-y-6">
+              <section>
+                <h4 className="text-xs font-bold uppercase text-gray-500 mb-2">Filter by</h4>
+                <div className="flex flex-wrap gap-2">
+                  {[
+                    { id: 'all', label: 'All events' },
+                    { id: 'free', label: 'Free' },
+                    { id: 'cheap', label: '$ – $$' },
+                    { id: 'expensive', label: '$$$ – $$$$' },
+                    { id: 'ticketed', label: '🎟️ Ticketed' },
+                  ].map((opt) => {
+                    const on = filterMode === opt.id;
+                    return (
+                      <button
+                        key={opt.id}
+                        onClick={() => setFilterMode(opt.id)}
+                        className={`px-3.5 py-1.5 rounded-full text-sm font-semibold border transition ${
+                          on ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-700 border-gray-200 hover:border-indigo-300'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </section>
+
+              <section>
+                <h4 className="text-xs font-bold uppercase text-gray-500 mb-2">Sort by</h4>
+                <div className="space-y-1.5">
+                  {[
+                    { id: 'feed', label: 'Newly added (default)' },
+                    { id: 'dateAsc', label: 'Event date · earliest first' },
+                    { id: 'dateDesc', label: 'Event date · latest first' },
+                    { id: 'priceAsc', label: 'Price · low to high' },
+                    { id: 'priceDesc', label: 'Price · high to low' },
+                  ].map((opt) => {
+                    const on = sortMode === opt.id;
+                    return (
+                      <label
+                        key={opt.id}
+                        className={`flex items-center gap-3 p-2.5 rounded-xl border cursor-pointer transition ${
+                          on ? 'border-indigo-500 bg-indigo-50' : 'border-gray-200 bg-white hover:border-indigo-300'
+                        }`}
+                      >
+                        <input
+                          type="radio"
+                          name="sortMode"
+                          checked={on}
+                          onChange={() => setSortMode(opt.id)}
+                        />
+                        <span className="text-sm text-gray-700">{opt.label}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </section>
+
+              <div className="flex gap-2 pt-2 border-t border-gray-100">
+                <button
+                  onClick={() => { setFilterMode('all'); setSortMode('feed'); }}
+                  disabled={!filterActive}
+                  className="flex-1 py-2.5 rounded-xl text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 disabled:opacity-50 transition"
+                >
+                  Reset
+                </button>
+                <button
+                  onClick={() => setShowFilterPanel(false)}
+                  className="flex-1 py-2.5 rounded-xl text-sm font-bold text-white bg-indigo-600 hover:bg-indigo-700 transition"
+                >
+                  Done
+                </button>
+              </div>
             </div>
           </div>
-        </Modal>
+        </div>
       )}
     </div>
   );
