@@ -335,6 +335,7 @@ const CopyIcon = ({ className = 'w-6 h-6' }) => <Icon path="M8 16H6a2 2 0 01-2-2
 const MailIcon = ({ className = 'w-6 h-6' }) => <Icon path="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" className={className} />;
 const InviteIcon = ({ className = 'w-6 h-6' }) => <Icon path="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z" className={className} />;
 const ShareIcon = ({ className = 'w-6 h-6' }) => <Icon path="M4 12v8a2 2 0 002 2h12a2 2 0 002-2v-8m-4-6l-4-4-4 4m4-4v12" className={className} />;
+const FunnelIcon = ({ className = 'w-6 h-6' }) => <Icon path="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z" className={className} />;
 
 // --- Calendar Utilities ---
 const generateICSFile = (suggestion) => {
@@ -1344,6 +1345,8 @@ const MyFeedSection = () => {
   const [patienceIdx, setPatienceIdx] = useState(0);
   const [filterMode, setFilterMode] = useState('all'); // all | free | cheap | expensive | ticketed
   const [sortMode, setSortMode] = useState('feed'); // feed | dateAsc | dateDesc | priceAsc | priceDesc
+  const [showFilterPanel, setShowFilterPanel] = useState(false);
+  const filterActive = filterMode !== 'all' || sortMode !== 'feed';
   const sentinelRef = useRef(null);
   const generatingRef = useRef(false);
   const scopeRef = useRef(0); // expanding scope tier; reset on refresh
@@ -1624,42 +1627,22 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
         </div>
       ) : (
         <div className="space-y-4">
-          {/* Filter + Sort bar */}
-          <div className="flex flex-wrap gap-3 items-center bg-white/60 border border-gray-100 rounded-2xl p-3">
-            <div className="flex flex-wrap gap-1.5 flex-1 min-w-0">
-              {[
-                { id: 'all', label: 'All' },
-                { id: 'free', label: 'Free' },
-                { id: 'cheap', label: '$ – $$' },
-                { id: 'expensive', label: '$$$+' },
-                { id: 'ticketed', label: '🎟️ Ticketed' },
-              ].map((opt) => {
-                const on = filterMode === opt.id;
-                return (
-                  <button
-                    key={opt.id}
-                    onClick={() => setFilterMode(opt.id)}
-                    className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition ${
-                      on ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-600 border-gray-200 hover:border-indigo-300'
-                    }`}
-                  >
-                    {opt.label}
-                  </button>
-                );
-              })}
-            </div>
-            <select
-              value={sortMode}
-              onChange={(e) => setSortMode(e.target.value)}
-              className="text-xs font-semibold p-2 pr-8 rounded-lg border border-gray-200 bg-white text-gray-700 focus:ring-2 focus:ring-indigo-500"
-              title="Sort feed"
+          {/* Filter & Sort icon (single button, opens modal) */}
+          <div className="flex justify-end items-center gap-3 px-1">
+            <span className="text-xs text-gray-400">
+              {displayItems.length} of {feedItems.length} {feedItems.length === 1 ? 'event' : 'events'}
+            </span>
+            <button
+              onClick={() => setShowFilterPanel(true)}
+              className="relative w-10 h-10 flex items-center justify-center rounded-full bg-white border border-gray-200 hover:border-indigo-400 hover:text-indigo-600 text-gray-600 shadow-sm transition"
+              title="Filter & sort"
+              aria-label="Filter and sort feed"
             >
-              <option value="feed">Newly added</option>
-              <option value="dateAsc">Event date · earliest first</option>
-              <option value="dateDesc">Event date · latest first</option>
-              <option value="priceAsc">Price · low to high</option>
-              <option value="priceDesc">Price · high to low</option>
-            </select>
+              <FunnelIcon className="w-5 h-5" />
+              {filterActive && (
+                <span className="absolute top-1.5 right-1.5 w-2 h-2 bg-indigo-600 rounded-full ring-2 ring-white" />
+              )}
+            </button>
           </div>
 
           {displayItems.length === 0 ? (
@@ -1682,6 +1665,84 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
             )}
           </div>
         </div>
+      )}
+      {showFilterPanel && (
+        <Modal onClose={() => setShowFilterPanel(false)} title="Filter & Sort">
+          <div className="space-y-6">
+            <section>
+              <h4 className="text-xs font-bold uppercase text-gray-500 mb-2">Filter by</h4>
+              <div className="flex flex-wrap gap-2">
+                {[
+                  { id: 'all', label: 'All events' },
+                  { id: 'free', label: 'Free' },
+                  { id: 'cheap', label: '$ – $$' },
+                  { id: 'expensive', label: '$$$ – $$$$' },
+                  { id: 'ticketed', label: '🎟️ Ticketed' },
+                ].map((opt) => {
+                  const on = filterMode === opt.id;
+                  return (
+                    <button
+                      key={opt.id}
+                      onClick={() => setFilterMode(opt.id)}
+                      className={`px-3.5 py-2 rounded-full text-sm font-semibold border transition ${
+                        on ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-700 border-gray-200 hover:border-indigo-300'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </section>
+
+            <section>
+              <h4 className="text-xs font-bold uppercase text-gray-500 mb-2">Sort by</h4>
+              <div className="space-y-2">
+                {[
+                  { id: 'feed', label: 'Newly added (default)' },
+                  { id: 'dateAsc', label: 'Event date · earliest first' },
+                  { id: 'dateDesc', label: 'Event date · latest first' },
+                  { id: 'priceAsc', label: 'Price · low to high' },
+                  { id: 'priceDesc', label: 'Price · high to low' },
+                ].map((opt) => {
+                  const on = sortMode === opt.id;
+                  return (
+                    <label
+                      key={opt.id}
+                      className={`flex items-center gap-3 p-3 rounded-xl border cursor-pointer transition ${
+                        on ? 'border-indigo-500 bg-indigo-50' : 'border-gray-200 bg-white hover:border-indigo-300'
+                      }`}
+                    >
+                      <input
+                        type="radio"
+                        name="sortMode"
+                        checked={on}
+                        onChange={() => setSortMode(opt.id)}
+                      />
+                      <span className="text-sm text-gray-700">{opt.label}</span>
+                    </label>
+                  );
+                })}
+              </div>
+            </section>
+
+            <div className="flex gap-2 pt-2 border-t border-gray-100">
+              <button
+                onClick={() => { setFilterMode('all'); setSortMode('feed'); }}
+                disabled={!filterActive}
+                className="flex-1 py-2.5 rounded-xl text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 disabled:opacity-50 transition"
+              >
+                Reset
+              </button>
+              <button
+                onClick={() => setShowFilterPanel(false)}
+                className="flex-1 py-2.5 rounded-xl text-sm font-bold text-white bg-indigo-600 hover:bg-indigo-700 transition"
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </Modal>
       )}
     </div>
   );
