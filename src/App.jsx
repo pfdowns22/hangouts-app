@@ -235,6 +235,19 @@ const moreInfoUrl = (event) => {
   return `https://www.google.com/search?q=${encodeURIComponent(q || 'events')}`;
 };
 
+// Tickets action for an event card. Returns null for non-ticketed events.
+// Uses the direct purchase URL when a source provides one (Ticketmaster, some
+// AI results); otherwise falls back to a ticket web search so ticketed events
+// from sources without a link (e.g. PredictHQ) are still actionable rather
+// than showing no button at all.
+const ticketAction = (event) => {
+  if (!event?.isTicketed) return null;
+  const direct = (event?.ticketsUrl || '').trim();
+  if (direct && /^https?:\/\//i.test(direct)) return { href: direct, label: '🎟️ Buy Tickets' };
+  const q = ['tickets', event?.title, event?.location].filter(Boolean).join(' ');
+  return { href: `https://www.google.com/search?q=${encodeURIComponent(q)}`, label: '🎟️ Find Tickets' };
+};
+
 // Image fallback chain when Gemini's imageUrl is null or 404s.
 // Priority order:
 // 1. Unsplash API (real photos, fast CDN) — used if VITE_UNSPLASH_KEY is set
@@ -2152,17 +2165,20 @@ const FeedCard = ({ item, onDelete }) => {
           <Icon path="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" className="w-4 h-4" />
           More Info
         </a>
-        {data.isTicketed && data.ticketsUrl && (
-          <a
-            href={data.ticketsUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex-1 text-center text-sm font-bold text-white bg-emerald-600 hover:bg-emerald-700 py-2.5 rounded-lg transition flex items-center justify-center gap-1"
-            title="Buy tickets"
-          >
-            🎟️ Buy Tickets
-          </a>
-        )}
+        {(() => {
+          const t = ticketAction(data);
+          return t ? (
+            <a
+              href={t.href}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex-1 text-center text-sm font-bold text-white bg-emerald-600 hover:bg-emerald-700 py-2.5 rounded-lg transition flex items-center justify-center gap-1"
+              title={t.label}
+            >
+              {t.label}
+            </a>
+          ) : null;
+        })()}
         <button onClick={handleCalendarClick} className="flex-1 text-sm font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 py-2.5 rounded-lg transition flex items-center justify-center gap-1">
           <PlusIcon className="w-4 h-4" /> Add to my calendar
         </button>
@@ -2489,16 +2505,19 @@ const ProposalCard = ({ proposal, groupId }) => {
           >
             {proposal.url ? 'More Info' : 'Search the web'}
           </a>
-          {proposal.isTicketed && proposal.ticketsUrl && (
-            <a
-              href={proposal.ticketsUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-center text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 py-2 rounded-lg transition"
-            >
-              🎟️ Buy Tickets
-            </a>
-          )}
+          {(() => {
+            const t = ticketAction(proposal);
+            return t ? (
+              <a
+                href={t.href}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-center text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 py-2 rounded-lg transition"
+              >
+                {t.label}
+              </a>
+            ) : null;
+          })()}
         </div>
       </div>
     </div>
@@ -2928,16 +2947,19 @@ const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage 
         >
           <Icon path="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" className="w-4 h-4 mr-1" /> More Info
         </a>
-        {idea.isTicketed && idea.ticketsUrl && (
-          <a
-            href={idea.ticketsUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex items-center justify-center bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold p-2.5 rounded-lg transition"
-          >
-            🎟️ Buy Tickets
-          </a>
-        )}
+        {(() => {
+          const t = ticketAction(idea);
+          return t ? (
+            <a
+              href={t.href}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center justify-center bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold p-2.5 rounded-lg transition"
+            >
+              {t.label}
+            </a>
+          ) : null;
+        })()}
         <div className="flex gap-2">
           <button onClick={() => onPropose(idea)} className="flex-1 bg-indigo-50 text-indigo-600 text-sm font-bold py-2.5 rounded-lg hover:bg-indigo-100 transition">
             Propose
@@ -3779,24 +3801,27 @@ const SendToGroupModal = ({ event, anchorRect, onClose }) => {
   const [sendingTo, setSendingTo] = useState(null);
   const [errorMsg, setErrorMsg] = useState('');
 
-  // Position the floating panel near the button that opened it, clamped
-  // to the visible viewport so it never falls off-screen on long feeds.
-  // Vertical center-on-anchor; horizontal center on viewport. Memoized so
-  // we don't recalculate on every render of the dropdown.
+  // Position the floating panel right at the button that opened it: drop it
+  // just below the button, and flip above only when there isn't room below.
+  // Coordinates are viewport-relative (getBoundingClientRect), matching the
+  // panel's absolute-in-fixed positioning, so it lands where you clicked
+  // regardless of how far down a long feed you've scrolled. Memoized.
   const panelStyle = useMemo(() => {
     if (typeof window === 'undefined') return null;
     const vh = window.innerHeight;
     const vw = window.innerWidth;
-    const panelH = Math.min(560, vh - 32);
+    const panelH = Math.min(480, vh - 32);
     const panelW = Math.min(448, vw - 32);
-    let top;
-    if (anchorRect && (anchorRect.top || anchorRect.bottom)) {
-      const anchorCenter = (anchorRect.top + anchorRect.bottom) / 2;
-      top = Math.max(16, Math.min(vh - panelH - 16, anchorCenter - panelH / 2));
-    } else {
-      top = Math.max(16, (vh - panelH) / 2);
+    if (!anchorRect || (!anchorRect.top && !anchorRect.bottom)) {
+      return { top: `${Math.max(16, (vh - panelH) / 2)}px`, left: `${(vw - panelW) / 2}px`, width: `${panelW}px`, maxHeight: `${panelH}px` };
     }
-    const left = (vw - panelW) / 2;
+    // Prefer dropping below the button; flip above if it would overflow.
+    let top = anchorRect.bottom + 8;
+    if (top + panelH > vh - 16) top = anchorRect.top - panelH - 8;
+    top = Math.max(16, Math.min(top, vh - panelH - 16));
+    // Right-align the panel to the button, clamped to the viewport.
+    let left = Math.min(anchorRect.right, vw) - panelW;
+    left = Math.max(16, Math.min(left, vw - panelW - 16));
     return { top: `${top}px`, left: `${left}px`, width: `${panelW}px`, maxHeight: `${panelH}px` };
   }, [anchorRect]);
 
