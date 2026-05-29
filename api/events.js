@@ -154,8 +154,11 @@ const predicthq = {
       within: `${Math.round(radius)}mi@${lat},${lng}`,
       'active.gte': startDate,
       'active.lte': endDate,
+      // Restrict to social/leisure categories — PredictHQ otherwise returns a
+      // lot of noise (academic terms, public holidays, observances, weather).
+      category: 'concerts,festivals,performing-arts,sports,community,expos',
       limit: String(size),
-      sort: 'start',
+      sort: 'rank', // most notable first, before the global date sort/slice
     });
     if (keywords) params.set('q', keywords);
     const res = await fetch(`https://api.predicthq.com/v1/events/?${params}`, {
