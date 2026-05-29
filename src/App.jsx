@@ -28,6 +28,8 @@ import {
 } from 'firebase/firestore';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 
+import { createPortal } from 'react-dom';
+
 import { auth, db, storage, appId, geminiApiKey } from './firebase.js';
 import { fetchRealEvents } from './events.js';
 
@@ -208,19 +210,20 @@ const TicketedBadge = ({ isTicketed }) => {
   );
 };
 
-// Where an event came from — lets users (and us) see the multi-source mix at a
-// glance. 'ai' = Gemini web search; the rest are the partner-event APIs.
+// Badge shown for events sourced from a named partner API. The AI ('ai')
+// source is intentionally omitted so users never see "suggested by AI" — those
+// events simply show no source badge.
 const SOURCE_LABELS = {
-  ai: '✨ AI pick',
   ticketmaster: 'Ticketmaster',
   seatgeek: 'SeatGeek',
   predicthq: 'PredictHQ',
 };
 const SourceBadge = ({ source }) => {
-  if (!source) return null;
+  const label = SOURCE_LABELS[source];
+  if (!label) return null;
   return (
     <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-gray-100 text-gray-600 text-xs font-medium">
-      {SOURCE_LABELS[source] || source}
+      {label}
     </span>
   );
 };
@@ -413,6 +416,48 @@ ${JSON.stringify(slim)}`;
   } catch (e) {
     console.warn('Event ranking failed; using raw partner events:', e);
     return events.slice(0, max);
+  }
+};
+
+// Gather interests shared across the members of the user's groups — the
+// "overlapping interests" used to seed a few group-oriented suggestions in the
+// personal feed. Returns interests held by 2+ members, most common first.
+// Bounded (≤5 groups, ≤25 members) to keep the read burst small.
+const gatherGroupInterests = async (profile) => {
+  const groupIds = (profile?.groupIds || []).slice(0, 5);
+  if (!groupIds.length) return [];
+  try {
+    const groups = await Promise.all(
+      groupIds.map(async (gid) => {
+        try {
+          const s = await getDoc(doc(db, `artifacts/${appId}/public/data/groups`, gid));
+          return s.exists() ? s.data() : null;
+        } catch {
+          return null;
+        }
+      })
+    );
+    const memberIds = [...new Set(groups.filter(Boolean).flatMap((g) => g.members || []))].slice(0, 25);
+    if (!memberIds.length) return [];
+    const profiles = await Promise.all(
+      memberIds.map(async (uid) => {
+        try {
+          const s = await getDoc(doc(db, `artifacts/${appId}/users/${uid}/profiles`, 'myProfile'));
+          return s.exists() ? s.data() : null;
+        } catch {
+          return null;
+        }
+      })
+    );
+    const freq = {};
+    profiles.filter(Boolean).forEach((p) => (p.preferences || []).forEach((pref) => { if (pref) freq[pref] = (freq[pref] || 0) + 1; }));
+    return Object.entries(freq)
+      .filter(([, n]) => n >= 2)
+      .sort((a, b) => b[1] - a[1])
+      .map(([k]) => k)
+      .slice(0, 8);
+  } catch {
+    return [];
   }
 };
 
@@ -1656,6 +1701,23 @@ const MyFeedSection = () => {
     }
   };
 
+  // Clear every event currently in the feed (both tabs). Confirmed first since
+  // it's destructive; only affects the user's own feed.
+  const clearAllFeed = async () => {
+    if (!feedItems.length) return;
+    if (typeof window !== 'undefined' && !window.confirm('Clear all events from your feed? This removes every card from both Today and Upcoming.')) return;
+    try {
+      const batch = writeBatch(db);
+      feedItems.forEach((it) => batch.delete(doc(db, `artifacts/${appId}/users/${userId}/feed/${it.id}`)));
+      await batch.commit();
+      setShowFilterPanel(false);
+      showGlobalMessage('Cleared all events from your feed.');
+    } catch (e) {
+      console.error(e);
+      showGlobalMessage('Could not clear the feed.', 'error');
+    }
+  };
+
   const generatePersonalSuggestions = async (forToday = false, opts = {}) => {
     const { fromScroll = false } = opts;
     const provider = userProfile?.aiProvider || 'gemini';
@@ -1687,6 +1749,10 @@ HARD RULE: of 5 returned events, at least 2 MUST be tagged locationSource="home"
         locationBlock = `User's home base is ${home}. Scope tier: ${scope.label}. Suggest events within ~${scope.radius} of home. Tag each event's "locationSource" as "home".`;
       }
       const prefs = userProfile?.preferences?.join(', ') || 'general fun';
+      // Some suggestions should reflect what the user's groups enjoy together.
+      // Only computed on a full refresh (not on every scroll fetch) to keep
+      // infinite scroll snappy and the Firestore reads bounded.
+      const groupInterests = fromScroll ? [] : await gatherGroupInterests(userProfile);
       const kidsText = userProfile?.kids?.length ? `Kids ages: ${userProfile.kids.map((k) => k.age).join(',')}` : 'No kids';
       const todsPrefs = userProfile?.timeOfDayPrefs?.length ? userProfile.timeOfDayPrefs.join(', ') : 'any time';
       const dowPrefs = userProfile?.dayOfWeekPrefs?.length ? userProfile.dayOfWeekPrefs.join(', ') : 'any day';
@@ -1725,6 +1791,7 @@ ${locationBlock}
 OTHER CONSTRAINTS:
 - Family situation: ${kidsText}
 - Interests/preferences: ${prefs}
+${groupInterests.length ? `- SHARED GROUP INTERESTS — things the user's friend groups enjoy together: ${groupInterests.join(', ')}. Make 1-2 of the suggestions a great fit for these shared interests (so the user finds things to do WITH their groups); the remaining suggestions should follow the personal interests above.` : ''}
 - Recurring weekly availability (day=times-of-day): ${weeklyStr}
 - Preferred times of day (overall): ${todsPrefs}
 - Preferred days of week (overall): ${dowPrefs}
@@ -2039,6 +2106,14 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
                   Done
                 </button>
               </div>
+
+              <button
+                onClick={clearAllFeed}
+                disabled={feedItems.length === 0}
+                className="w-full py-2.5 rounded-xl text-sm font-bold text-red-600 bg-red-50 hover:bg-red-100 disabled:opacity-40 transition flex items-center justify-center gap-2"
+              >
+                <TrashIcon className="w-4 h-4" /> Clear all events
+              </button>
             </div>
           </div>
         </div>
@@ -2143,7 +2218,7 @@ const FeedCard = ({ item, onDelete }) => {
             <span className="flex items-center gap-1">
               <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-4 h-4" /> {data.location}
             </span>
-            {(data.priceTier || data.isTicketed || data.source) && (
+            {(data.priceTier || data.isTicketed || SOURCE_LABELS[data.source]) && (
               <span className="flex items-center gap-2 flex-wrap">
                 <PriceTierBadge tier={data.priceTier} />
                 <TicketedBadge isTicketed={data.isTicketed} />
@@ -2929,7 +3004,7 @@ const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage 
         <p className="flex items-center gap-1">
           <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-3 h-3" /> {idea.location}
         </p>
-        {(idea.priceTier || idea.isTicketed || idea.source) && (
+        {(idea.priceTier || idea.isTicketed || SOURCE_LABELS[idea.source]) && (
           <div className="flex items-center gap-2 pt-1 flex-wrap">
             <PriceTierBadge tier={idea.priceTier} />
             <TicketedBadge isTicketed={idea.isTicketed} />
@@ -3914,7 +3989,10 @@ const SendToGroupModal = ({ event, anchorRect, onClose }) => {
     }
   };
 
-  return (
+  // Render via a portal to <body> so the fixed overlay and its positioned
+  // panel are relative to the viewport, not trapped inside the FeedCard's
+  // `overflow-hidden`/positioned container (which pinned it to the top).
+  return createPortal(
     <div
       className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50"
       onClick={onClose}
@@ -3971,7 +4049,8 @@ const SendToGroupModal = ({ event, anchorRect, onClose }) => {
         )}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 };
 
