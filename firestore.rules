@@ -41,6 +41,15 @@ service cloud.firestore {
         && request.resource.data.userId == request.auth.uid;
     }
 
+    // Legal acceptances: append-only audit log of who accepted the ToS/NDA.
+    // Any signed-in user can create their own record; no client reads or
+    // edits (owner views via Firebase Console). Each record must carry the
+    // submitter's own uid so it can't be forged on someone else's behalf.
+    match /artifacts/{appId}/public/data/legalAcceptances/{acceptId} {
+      allow create: if request.auth != null
+        && request.resource.data.userId == request.auth.uid;
+    }
+
     // Group docs: any signed-in user can read.
     // Existing members can update any field.
     // Non-members can ONLY add themselves to members[] (used by the invite-link join flow).

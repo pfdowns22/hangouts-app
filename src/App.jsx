@@ -1348,11 +1348,32 @@ const priceWeight = (tier) => (PRICE_WEIGHT[tier] !== undefined ? PRICE_WEIGHT[t
 // ones, all of them below any refreshed/proposed items.
 const SCROLL_TIMESTAMP_BASE = new Date('2005-01-01').getTime();
 
+// Classify a feed item by its event date relative to now, for the
+// Today / Upcoming tab split:
+//   'today'    — the event is happening today
+//   'upcoming' — the event is on a future day
+//   'past'     — the event already happened (hidden from both tabs)
+//   'undated'  — no parseable date; surfaced under Upcoming so nothing
+//                silently disappears from the feed.
+const eventDateBucket = (item) => {
+  const raw = item?.data?.date;
+  const t = raw ? new Date(raw).getTime() : NaN;
+  if (!raw || Number.isNaN(t)) return 'undated';
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  const tomorrow = new Date(start);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  if (t < start.getTime()) return 'past';
+  if (t < tomorrow.getTime()) return 'today';
+  return 'upcoming';
+};
+
 const MyFeedSection = () => {
   const { userId, userProfile, showGlobalMessage, setShowProfileModal, feedRefreshTick } = useContext(AppContext);
   const [feedItems, setFeedItems] = useState([]);
   const [isGenerating, setIsGenerating] = useState(false);
   const [patienceIdx, setPatienceIdx] = useState(0);
+  const [feedTab, setFeedTab] = useState('today'); // today | upcoming
   const [filterMode, setFilterMode] = useState('all'); // all | free | cheap | expensive | ticketed
   const [sortMode, setSortMode] = useState('feed'); // feed | dateAsc | dateDesc | priceAsc | priceDesc
   const [showFilterPanel, setShowFilterPanel] = useState(false);
@@ -1398,8 +1419,27 @@ const MyFeedSection = () => {
   const scopeRef = useRef(0); // expanding scope tier; reset on refresh
   const scrollCounterRef = useRef(0); // decrements scroll timestamps so later items sink lower
 
-  // Compute the filtered/sorted view of feedItems for rendering.
+  // How many items fall under each tab (drives the tab labels). Past-dated
+  // items are counted in neither — they're hidden from both tabs.
+  const tabCounts = useMemo(() => {
+    let today = 0;
+    let upcoming = 0;
+    for (const it of feedItems) {
+      const b = eventDateBucket(it);
+      if (b === 'today') today += 1;
+      else if (b === 'upcoming' || b === 'undated') upcoming += 1;
+    }
+    return { today, upcoming };
+  }, [feedItems]);
+
+  // Compute the filtered/sorted view of feedItems for rendering. Items are
+  // first partitioned by the active Today/Upcoming tab, then narrowed by the
+  // funnel filter, then sorted.
   const displayItems = useMemo(() => {
+    const inTab = (item) => {
+      const b = eventDateBucket(item);
+      return feedTab === 'today' ? b === 'today' : b === 'upcoming' || b === 'undated';
+    };
     const matchesFilter = (item) => {
       const d = item.data || {};
       switch (filterMode) {
@@ -1415,7 +1455,7 @@ const MyFeedSection = () => {
           return true;
       }
     };
-    const arr = feedItems.filter(matchesFilter);
+    const arr = feedItems.filter((it) => inTab(it) && matchesFilter(it));
     if (sortMode === 'feed') return arr;
     const sorted = [...arr];
     const dateOf = (it) => new Date(it.data?.date || 0).getTime() || 0;
@@ -1424,7 +1464,7 @@ const MyFeedSection = () => {
     if (sortMode === 'priceAsc') sorted.sort((a, b) => priceWeight(a.data?.priceTier) - priceWeight(b.data?.priceTier));
     if (sortMode === 'priceDesc') sorted.sort((a, b) => priceWeight(b.data?.priceTier) - priceWeight(a.data?.priceTier));
     return sorted;
-  }, [feedItems, filterMode, sortMode]);
+  }, [feedItems, filterMode, sortMode, feedTab]);
 
   // Onboarding banner appears for users who haven't set an address yet.
   const needsOnboarding =
@@ -1483,8 +1523,10 @@ const MyFeedSection = () => {
     );
     observer.observe(sentinelRef.current);
     return () => observer.disconnect();
+    // feedTab is included so the observer re-attaches when the sentinel
+    // (re)mounts on switching to the Upcoming tab.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [feedItems.length, userProfile]);
+  }, [feedItems.length, userProfile, feedTab]);
 
   const deleteFeedItem = async (itemId) => {
     try {
@@ -1673,10 +1715,33 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
         </div>
       ) : (
         <div className="space-y-4">
+          {/* Today / Upcoming tabs — Today shows only events happening today;
+              Upcoming shows future days (past-dated items are hidden). */}
+          <div className="flex gap-1 border-b border-gray-200">
+            {[
+              { id: 'today', label: 'Today', count: tabCounts.today },
+              { id: 'upcoming', label: 'Upcoming', count: tabCounts.upcoming },
+            ].map((t) => {
+              const on = feedTab === t.id;
+              return (
+                <button
+                  key={t.id}
+                  onClick={() => setFeedTab(t.id)}
+                  className={`relative px-4 py-2.5 text-sm font-bold transition -mb-px border-b-2 ${
+                    on ? 'border-indigo-600 text-indigo-600' : 'border-transparent text-gray-500 hover:text-gray-700'
+                  }`}
+                >
+                  {t.label}
+                  <span className={`ml-1.5 text-xs font-semibold ${on ? 'text-indigo-400' : 'text-gray-400'}`}>{t.count}</span>
+                </button>
+              );
+            })}
+          </div>
+
           {/* Filter & Sort icon (single button, opens modal) */}
           <div className="flex justify-end items-center gap-3 px-1">
             <span className="text-xs text-gray-400">
-              {displayItems.length} of {feedItems.length} {feedItems.length === 1 ? 'event' : 'events'}
+              {displayItems.length} of {tabCounts[feedTab]} {tabCounts[feedTab] === 1 ? 'event' : 'events'}
             </span>
             <button
               ref={filterBtnRef}
@@ -1694,23 +1759,31 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
 
           {displayItems.length === 0 ? (
             <div className="text-center py-8 text-gray-500 text-sm bg-white/40 rounded-2xl border border-dashed border-gray-200">
-              No events match this filter. Clear it to see your full feed.
+              {tabCounts[feedTab] === 0
+                ? feedTab === 'today'
+                  ? 'Nothing on for today yet. Tap “Ideas for Today” above to find events happening today.'
+                  : 'No upcoming events yet. Tap “Upcoming” above to find events for the days ahead.'
+                : 'No events match this filter. Clear it to see your full feed.'}
             </div>
           ) : (
             displayItems.map((item) => (
               <FeedCard key={item.id} item={item} onDelete={() => deleteFeedItem(item.id)} />
             ))
           )}
-          {/* Infinite scroll sentinel: when visible, fetch more upcoming events */}
-          <div ref={sentinelRef} className="h-12 flex items-center justify-center text-sm text-gray-400">
-            {isGenerating === 'upcoming' ? (
-              <span className="flex items-center gap-2">
-                <SearchIcon className="w-4 h-4 animate-spin" /> Finding more events…
-              </span>
-            ) : (
-              'Scroll for more'
-            )}
-          </div>
+          {/* Infinite scroll sentinel (Upcoming tab only): when visible, fetch
+              more upcoming events. Disabled on Today — "more" always means
+              future days. */}
+          {feedTab === 'upcoming' && (
+            <div ref={sentinelRef} className="h-12 flex items-center justify-center text-sm text-gray-400">
+              {isGenerating === 'upcoming' ? (
+                <span className="flex items-center gap-2">
+                  <SearchIcon className="w-4 h-4 animate-spin" /> Finding more events…
+                </span>
+              ) : (
+                'Scroll for more'
+              )}
+            </div>
+          )}
         </div>
       )}
       {showFilterPanel && (
@@ -3284,6 +3357,52 @@ const LegalAcceptanceModal = () => {
         ...stamp,
         legalAcceptedAt: new Date().toISOString(),
       }));
+
+      // Who just signed (for the audit record + owner notification).
+      const signerName = isAnon ? legalName.trim() : (userProfile?.name || 'User');
+      const signerEmail = isAnon ? legalEmail.trim().toLowerCase() : (userProfile?.email || '(no email on file)');
+
+      // Append-only audit record, separate from the per-user profile stamp,
+      // so the owner has one queryable list of every acceptance. Non-fatal:
+      // the binding acceptance is already recorded on the profile above.
+      try {
+        await addDoc(collection(db, `artifacts/${appId}/public/data/legalAcceptances`), {
+          userId,
+          name: signerName,
+          email: signerEmail,
+          tosVersion: TOS_VERSION,
+          ndaVersion: NDA_VERSION,
+          acceptedAt: serverTimestamp(),
+          userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
+        });
+      } catch (e) {
+        console.warn('Could not write legal acceptance audit record:', e);
+      }
+
+      // Notify the owner by email (same Web3Forms channel as feedback).
+      // Also non-fatal — failing to email never blocks the user from entering.
+      if (FEEDBACK_KEY) {
+        try {
+          await fetch('https://api.web3forms.com/submit', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({
+              access_key: FEEDBACK_KEY,
+              subject: 'Hangouts — Terms & NDA accepted',
+              from_name: signerName,
+              message:
+                `${signerName} (${signerEmail}) accepted the Terms of Service and Non-Disclosure Agreement.\n\n` +
+                `uid: ${userId}\n` +
+                `ToS version: ${TOS_VERSION}\n` +
+                `NDA version: ${NDA_VERSION}\n` +
+                `When: ${new Date().toISOString()}`,
+            }),
+          });
+        } catch (e) {
+          console.warn('Web3Forms legal-acceptance email failed:', e);
+        }
+      }
+
       showGlobalMessage('Welcome aboard.');
     } catch (e) {
       console.error(e);
