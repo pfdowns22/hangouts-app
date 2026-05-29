@@ -29,6 +29,7 @@ import {
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 
 import { auth, db, storage, appId, geminiApiKey } from './firebase.js';
+import { fetchRealEvents } from './events.js';
 
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_URL_FOR_KEY = (key) =>
@@ -297,6 +298,84 @@ const extractJsonArray = (text) => {
     return JSON.parse(candidate.slice(start, end + 1));
   } catch {
     return null;
+  }
+};
+
+// --- Multi-source event helpers ---------------------------------------
+// The feed and group suggestions gather events from two kinds of source in
+// parallel: (A) the existing Gemini grounded web search, and (B) structured
+// partner APIs via /api/events. These helpers handle the partner side and the
+// merge.
+
+// Local calendar date as YYYY-MM-DD. Must NOT use toISOString() (that's UTC):
+// for a user west of UTC in the evening, the UTC date is already "tomorrow",
+// which would make the Today tab query the wrong day.
+const ymdLocal = (d) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+// YYYY-MM-DD date window for the partner-events proxy. Today = just today;
+// otherwise tomorrow → +30 days (mirrors the AI-search timeframe split).
+const dateWindow = (forToday) => {
+  if (forToday) {
+    const t = ymdLocal(new Date());
+    return { startDate: t, endDate: t };
+  }
+  return {
+    startDate: ymdLocal(new Date(Date.now() + 864e5)),
+    endDate: ymdLocal(new Date(Date.now() + 30 * 864e5)),
+  };
+};
+
+// Merge several event lists, collapsing the same (lowercased) title on the
+// same calendar day so an event surfaced by both Gemini and a partner API
+// shows once.
+const mergeEvents = (...lists) => {
+  const seen = new Map();
+  for (const ev of [].concat(...lists)) {
+    if (!ev?.title) continue;
+    const key = `${ev.title.trim().toLowerCase()}|${(ev.date || '').slice(0, 10) || 'na'}`;
+    if (!seen.has(key)) seen.set(key, ev);
+  }
+  return [...seen.values()];
+};
+
+// Ask the AI to rank/personalize a list of REAL partner-API events. It may
+// reorder, drop weak matches, and rewrite each description, but we only ever
+// copy back the chosen description — every other (factual) field comes from the
+// original event object, so dates/links/prices can't be altered or invented.
+// Falls back to the raw events if the ranking call fails.
+const rankAndPersonalizeEvents = async ({ events, contextText, provider, max = 6 }) => {
+  if (!events.length) return [];
+  const slim = events.slice(0, 20).map((e, i) => ({
+    i,
+    title: e.title,
+    description: (e.description || '').slice(0, 280),
+    location: e.location,
+    date: e.date,
+    category: e.category,
+    priceTier: e.priceTier,
+  }));
+  const prompt = `${contextText}
+
+Below is a JSON array of REAL events (already verified via partner APIs). Choose the ${max} best matches, ordered best first, and for each write a warm, specific 1-2 sentence description of why it fits. Do NOT invent events and do NOT change any field other than the description.
+
+Return ONLY a JSON array of objects: {"i": <original index>, "description": "<personalized blurb>"}. Include only the events you selected.
+
+EVENTS:
+${JSON.stringify(slim)}`;
+  try {
+    const text = await callAI({ prompt, useWebSearch: false, provider });
+    const picks = extractJsonArray(text);
+    if (!Array.isArray(picks)) return events.slice(0, max);
+    const out = [];
+    for (const p of picks) {
+      const orig = events[p?.i];
+      if (orig) out.push({ ...orig, description: p?.description || orig.description });
+    }
+    return out.length ? out : events.slice(0, max);
+  } catch (e) {
+    console.warn('Event ranking failed; using raw partner events:', e);
+    return events.slice(0, max);
   }
 };
 
@@ -1330,10 +1409,10 @@ const PATIENCE_MESSAGES = [
 // next tier so we keep finding fresh content instead of repeating the
 // same local venues. Refresh resets the user to tier 0.
 const SCOPE_TIERS = [
-  { label: 'your immediate neighborhood (~3 miles)', radius: '3 miles' },
-  { label: 'adjacent neighborhoods (~10 miles)', radius: '10 miles' },
-  { label: 'your full city / borough (~25 miles)', radius: '25 miles' },
-  { label: 'the wider metro region (~60 miles)', radius: '60 miles' },
+  { label: 'your immediate neighborhood (~3 miles)', radius: '3 miles', radiusMiles: 3 },
+  { label: 'adjacent neighborhoods (~10 miles)', radius: '10 miles', radiusMiles: 10 },
+  { label: 'your full city / borough (~25 miles)', radius: '25 miles', radiusMiles: 25 },
+  { label: 'the wider metro region (~60 miles)', radius: '60 miles', radiusMiles: 60 },
 ];
 
 // Map priceTier strings to a numeric sort weight; events without a tier
@@ -1493,17 +1572,17 @@ const MyFeedSection = () => {
   }, [isGenerating]);
 
   // External refresh trigger — fired from ProfileSection on save (and
-  // any other entry point we add later). Resets scope and runs a fresh
-  // "Upcoming" generation.
+  // any other entry point we add later). Resets scope and refreshes BOTH
+  // tabs so today and upcoming reflect the updated profile.
   useEffect(() => {
     if (feedRefreshTick === 0 || !userId || !userProfile) return;
     scopeRef.current = 0;
-    generatePersonalSuggestions(false);
+    generateAll();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [feedRefreshTick]);
 
   // Infinite scroll: when sentinel becomes visible and we already have content,
-  // auto-fetch another batch of upcoming events. Guarded by generatingRef so we
+  // auto-fetch another batch for the active tab. Guarded by generatingRef so we
   // never fire concurrent fetches.
   useEffect(() => {
     if (!sentinelRef.current || feedItems.length === 0) return;
@@ -1511,7 +1590,9 @@ const MyFeedSection = () => {
       (entries) => {
         if (entries[0].isIntersecting && !generatingRef.current) {
           generatingRef.current = true;
-          generatePersonalSuggestions(false, { fromScroll: true }).finally(() => {
+          // Generate for whichever tab the user is viewing: Today fetches
+          // more events happening today, Upcoming fetches more future days.
+          generatePersonalSuggestions(feedTab === 'today', { fromScroll: true }).finally(() => {
             // brief cooldown so a single scroll-to-bottom doesn't spam requests
             setTimeout(() => { generatingRef.current = false; }, 800);
           });
@@ -1638,9 +1719,41 @@ PRICING & TICKETS:
 
 Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords, locationSource, priceTier, isTicketed, ticketsUrl.`;
 
-      const text = await callAI({ prompt, useWebSearch: true, provider });
-      const suggestions = extractJsonArray(text);
-      if (!suggestions) throw new Error('Could not parse suggestions from AI response');
+      // Source A — existing Gemini grounded web search (behavior unchanged).
+      const aiSearch = (async () => {
+        try {
+          const text = await callAI({ prompt, useWebSearch: true, provider });
+          return extractJsonArray(text) || [];
+        } catch (err) {
+          console.warn('AI-search source failed:', err);
+          return [];
+        }
+      })();
+
+      // Source B — structured partner-event APIs via the proxy, AI-ranked.
+      const partnerSearch = (async () => {
+        const { startDate, endDate } = dateWindow(forToday);
+        const useCurrent = locPref !== 'home' && userProfile?.currentLocation?.lat != null;
+        const raw = await fetchRealEvents({
+          lat: useCurrent ? userProfile.currentLocation.lat : undefined,
+          lng: useCurrent ? userProfile.currentLocation.lng : undefined,
+          location: useCurrent ? undefined : home,
+          startDate,
+          endDate,
+          radius: scope.radiusMiles,
+          keywords: (userProfile?.preferences || []).slice(0, 4).join(' '),
+          size: 12,
+        });
+        if (!raw.length) return [];
+        const ctx = `Recommend events for someone interested in: ${prefs}. Home area: ${home}. ${kidsText}.`;
+        return rankAndPersonalizeEvents({ events: raw, contextText: ctx, provider, max: 6 });
+      })();
+
+      // Run both sources in parallel and merge (a failure in one never blocks
+      // the other; partner events de-dupe against AI-found ones).
+      const [aEvents, bEvents] = await Promise.all([aiSearch, partnerSearch]);
+      const suggestions = mergeEvents(aEvents, bEvents);
+      if (!suggestions.length) throw new Error('No events found from AI search or partner APIs.');
       const batch = writeBatch(db);
       suggestions.forEach((s) => {
         // Refresh writes use serverTimestamp() (real now) so they sort at
@@ -1670,6 +1783,20 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
     }
   };
 
+  // Single entry point for the "Generate Ideas" button (and the profile-save
+  // refresh): populate BOTH tabs — today and upcoming — in one action.
+  // Re-entrancy is guarded so it can't overlap a scroll-triggered fetch.
+  const generateAll = async () => {
+    if (generatingRef.current) return;
+    generatingRef.current = true;
+    try {
+      await generatePersonalSuggestions(true); // Today
+      await generatePersonalSuggestions(false); // Upcoming
+    } finally {
+      generatingRef.current = false;
+    }
+  };
+
   return (
     <div className="space-y-6">
       {needsOnboarding && (
@@ -1696,13 +1823,9 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
           )}
         </div>
         <div className="flex gap-2 w-full md:w-auto">
-          <button onClick={() => generatePersonalSuggestions(true)} disabled={isGenerating !== false} className="flex-1 md:flex-none flex items-center justify-center gap-2 px-4 py-2 bg-gradient-to-r from-orange-400 to-pink-500 text-white rounded-lg shadow-md hover:shadow-lg transition disabled:opacity-50 font-bold">
-            {isGenerating === 'today' ? <SearchIcon className="w-4 h-4 animate-spin" /> : <SparklesIcon className="w-4 h-4" />}
-            Ideas for Today
-          </button>
-          <button onClick={() => generatePersonalSuggestions(false)} disabled={isGenerating !== false} className="flex-1 md:flex-none flex items-center justify-center gap-2 px-4 py-2 bg-gradient-to-r from-indigo-500 to-purple-600 text-white rounded-lg shadow-md hover:shadow-lg transition disabled:opacity-50 font-bold">
-            {isGenerating === 'upcoming' ? <SearchIcon className="w-4 h-4 animate-spin" /> : <CalendarIcon className="w-4 h-4" />}
-            Upcoming
+          <button onClick={generateAll} disabled={isGenerating !== false} className="flex-1 md:flex-none flex items-center justify-center gap-2 px-5 py-2 bg-gradient-to-r from-indigo-500 to-purple-600 text-white rounded-lg shadow-md hover:shadow-lg transition disabled:opacity-50 font-bold">
+            {isGenerating !== false ? <SearchIcon className="w-4 h-4 animate-spin" /> : <SparklesIcon className="w-4 h-4" />}
+            {isGenerating !== false ? 'Generating…' : 'Generate Ideas'}
           </button>
         </div>
       </div>
@@ -1711,7 +1834,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
         <div className="text-center py-16 bg-white/50 rounded-2xl border border-dashed border-gray-300">
           <SparklesIcon className="w-12 h-12 mx-auto text-gray-300 mb-3" />
           <h3 className="text-lg font-bold text-gray-600">Your feed is empty</h3>
-          <p className="text-sm text-gray-500 max-w-sm mx-auto mt-2">Click one of the buttons above to let AI find real-world events happening around you.</p>
+          <p className="text-sm text-gray-500 max-w-sm mx-auto mt-2">Click <strong>Generate Ideas</strong> above to let AI find real-world events happening around you.</p>
         </div>
       ) : (
         <div className="space-y-4">
@@ -1761,8 +1884,8 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
             <div className="text-center py-8 text-gray-500 text-sm bg-white/40 rounded-2xl border border-dashed border-gray-200">
               {tabCounts[feedTab] === 0
                 ? feedTab === 'today'
-                  ? 'Nothing on for today yet. Tap “Ideas for Today” above to find events happening today.'
-                  : 'No upcoming events yet. Tap “Upcoming” above to find events for the days ahead.'
+                  ? 'Nothing on for today yet. Tap “Generate Ideas” above to find events happening today.'
+                  : 'No upcoming events yet. Tap “Generate Ideas” above to find events for the days ahead.'
                 : 'No events match this filter. Clear it to see your full feed.'}
             </div>
           ) : (
@@ -1770,12 +1893,13 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
               <FeedCard key={item.id} item={item} onDelete={() => deleteFeedItem(item.id)} />
             ))
           )}
-          {/* Infinite scroll sentinel (Upcoming tab only): when visible, fetch
-              more upcoming events. Disabled on Today — "more" always means
-              future days. */}
-          {feedTab === 'upcoming' && (
+          {/* Infinite scroll sentinel (both tabs): when visible, fetch more
+              events for the active tab — more of today on Today, more future
+              days on Upcoming. Only rendered once the tab already has cards, so
+              an empty tab doesn't auto-trigger generation (use the button). */}
+          {displayItems.length > 0 && (
             <div ref={sentinelRef} className="h-12 flex items-center justify-center text-sm text-gray-400">
-              {isGenerating === 'upcoming' ? (
+              {isGenerating !== false ? (
                 <span className="flex items-center gap-2">
                   <SearchIcon className="w-4 h-4 animate-spin" /> Finding more events…
                 </span>
@@ -2578,10 +2702,38 @@ SOURCES (PREFER quality editorial / curated picks over generic listings):
 Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords, priceTier, isTicketed, ticketsUrl.`;
 
       const provider = userProfile?.aiProvider || 'gemini';
-      const text = await callAI({ prompt, useWebSearch: true, provider });
-      const parsed = extractJsonArray(text);
-      if (!parsed) {
-        throw new Error(`Could not parse JSON from AI response. Raw start: ${text.slice(0, 240)}`);
+
+      // Source A — existing Gemini grounded web search (behavior unchanged).
+      const aiSearch = (async () => {
+        try {
+          const text = await callAI({ prompt, useWebSearch: true, provider });
+          return extractJsonArray(text) || [];
+        } catch (err) {
+          console.warn('AI-search source failed:', err);
+          return [];
+        }
+      })();
+
+      // Source B — structured partner-event APIs via the proxy, AI-ranked
+      // against the group's combined interests.
+      const partnerSearch = (async () => {
+        const raw = await fetchRealEvents({
+          location: loc,
+          startDate: ymdLocal(new Date()),
+          endDate: ymdLocal(new Date(Date.now() + 30 * 864e5)),
+          radius: 25,
+          keywords: allPrefs.slice(0, 4).join(' '),
+          size: 12,
+        });
+        if (!raw.length) return [];
+        const ctx = `Recommend events for a group of ${memberProfiles.length} friends ("${group.name}") interested in: ${allPrefs.length ? allPrefs.join(', ') : 'general fun'}. Anchor location: ${loc}.`;
+        return rankAndPersonalizeEvents({ events: raw, contextText: ctx, provider, max: 6 });
+      })();
+
+      const [aEvents, bEvents] = await Promise.all([aiSearch, partnerSearch]);
+      const parsed = mergeEvents(aEvents, bEvents);
+      if (!parsed.length) {
+        throw new Error('No events found from AI search or partner APIs.');
       }
       setIdeas(parsed);
     } catch (e) {
