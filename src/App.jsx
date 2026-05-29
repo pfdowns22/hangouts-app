@@ -64,7 +64,14 @@ const storeKey = (provider, key) => {
 // Gemini keys. Returns the raw text from the first candidate.
 const callGemini = async (prompt, key, useWebSearch) => {
   if (!key) throw new Error('Missing Gemini API key.');
-  const body = { contents: [{ parts: [{ text: prompt }] }] };
+  const body = {
+    contents: [{ parts: [{ text: prompt }] }],
+    // Give output room and disable "thinking": gemini-2.5-flash otherwise
+    // spends the output budget on hidden reasoning and can return
+    // finishReason MAX_TOKENS with no text (the intermittent "couldn't fetch").
+    // Event discovery/ranking needs no deep reasoning.
+    generationConfig: { maxOutputTokens: 8192, thinkingConfig: { thinkingBudget: 0 } },
+  };
   if (useWebSearch) body.tools = [{ google_search: {} }];
   const res = await fetch(GEMINI_URL_FOR_KEY(key), {
     method: 'POST',
@@ -197,6 +204,23 @@ const TicketedBadge = ({ isTicketed }) => {
   return (
     <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-purple-50 text-purple-700 text-xs font-medium">
       🎟️ Ticketed
+    </span>
+  );
+};
+
+// Where an event came from — lets users (and us) see the multi-source mix at a
+// glance. 'ai' = Gemini web search; the rest are the partner-event APIs.
+const SOURCE_LABELS = {
+  ai: '✨ AI pick',
+  ticketmaster: 'Ticketmaster',
+  seatgeek: 'SeatGeek',
+  predicthq: 'PredictHQ',
+};
+const SourceBadge = ({ source }) => {
+  if (!source) return null;
+  return (
+    <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-gray-100 text-gray-600 text-xs font-medium">
+      {SOURCE_LABELS[source] || source}
     </span>
   );
 };
@@ -1720,11 +1744,13 @@ PRICING & TICKETS:
 Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords, locationSource, priceTier, isTicketed, ticketsUrl.`;
 
       // Source A — existing Gemini grounded web search (behavior unchanged).
+      let aiError = null;
       const aiSearch = (async () => {
         try {
           const text = await callAI({ prompt, useWebSearch: true, provider });
-          return extractJsonArray(text) || [];
+          return (extractJsonArray(text) || []).map((e) => ({ ...e, source: e.source || 'ai' }));
         } catch (err) {
+          aiError = err;
           console.warn('AI-search source failed:', err);
           return [];
         }
@@ -1753,7 +1779,11 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
       // the other; partner events de-dupe against AI-found ones).
       const [aEvents, bEvents] = await Promise.all([aiSearch, partnerSearch]);
       const suggestions = mergeEvents(aEvents, bEvents);
-      if (!suggestions.length) throw new Error('No events found from AI search or partner APIs.');
+      if (!suggestions.length) {
+        throw new Error(
+          aiError ? `AI search failed — ${aiError.message}` : 'No events found. Try again, or add a partner-events key.'
+        );
+      }
       const batch = writeBatch(db);
       suggestions.forEach((s) => {
         // Refresh writes use serverTimestamp() (real now) so they sort at
@@ -1777,7 +1807,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
       await batch.commit();
     } catch (e) {
       console.error(e);
-      showGlobalMessage('Could not fetch real events. Try again.', 'error');
+      showGlobalMessage(e?.message || 'Could not fetch real events. Try again.', 'error');
     } finally {
       setIsGenerating(false);
     }
@@ -2100,10 +2130,11 @@ const FeedCard = ({ item, onDelete }) => {
             <span className="flex items-center gap-1">
               <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-4 h-4" /> {data.location}
             </span>
-            {(data.priceTier || data.isTicketed) && (
-              <span className="flex items-center gap-2">
+            {(data.priceTier || data.isTicketed || data.source) && (
+              <span className="flex items-center gap-2 flex-wrap">
                 <PriceTierBadge tier={data.priceTier} />
                 <TicketedBadge isTicketed={data.isTicketed} />
+                <SourceBadge source={data.source} />
               </span>
             )}
           </div>
@@ -2426,6 +2457,7 @@ const ProposalCard = ({ proposal, groupId }) => {
           )}
           <PriceTierBadge tier={proposal.priceTier} />
           <TicketedBadge isTicketed={proposal.isTicketed} />
+          <SourceBadge source={proposal.source} />
         </div>
 
         <div className="mt-4 flex flex-col gap-2">
@@ -2704,11 +2736,13 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
       const provider = userProfile?.aiProvider || 'gemini';
 
       // Source A — existing Gemini grounded web search (behavior unchanged).
+      let aiError = null;
       const aiSearch = (async () => {
         try {
           const text = await callAI({ prompt, useWebSearch: true, provider });
-          return extractJsonArray(text) || [];
+          return (extractJsonArray(text) || []).map((e) => ({ ...e, source: e.source || 'ai' }));
         } catch (err) {
+          aiError = err;
           console.warn('AI-search source failed:', err);
           return [];
         }
@@ -2733,7 +2767,9 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
       const [aEvents, bEvents] = await Promise.all([aiSearch, partnerSearch]);
       const parsed = mergeEvents(aEvents, bEvents);
       if (!parsed.length) {
-        throw new Error('No events found from AI search or partner APIs.');
+        throw new Error(
+          aiError ? `AI search failed — ${aiError.message}` : 'No events found. Try again, or add a partner-events key.'
+        );
       }
       setIdeas(parsed);
     } catch (e) {
@@ -2874,10 +2910,11 @@ const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage 
         <p className="flex items-center gap-1">
           <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-3 h-3" /> {idea.location}
         </p>
-        {(idea.priceTier || idea.isTicketed) && (
-          <div className="flex items-center gap-2 pt-1">
+        {(idea.priceTier || idea.isTicketed || idea.source) && (
+          <div className="flex items-center gap-2 pt-1 flex-wrap">
             <PriceTierBadge tier={idea.priceTier} />
             <TicketedBadge isTicketed={idea.isTicketed} />
+            <SourceBadge source={idea.source} />
           </div>
         )}
       </div>
