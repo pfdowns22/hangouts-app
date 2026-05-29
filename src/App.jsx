@@ -76,8 +76,18 @@ const callGemini = async (prompt, key, useWebSearch) => {
     const message = data?.error?.message || res.statusText || 'Unknown error';
     throw new Error(`Gemini ${code}: ${message}`);
   }
-  if (!data.candidates) throw new Error('Gemini returned no candidates.');
-  return data.candidates[0]?.content?.parts?.[0]?.text || '';
+  const cand = data.candidates?.[0];
+  if (!cand) throw new Error('Gemini returned no candidates.');
+  // Grounded (google_search) responses split the answer across multiple
+  // parts, so join them all — reading only parts[0] silently drops the JSON.
+  const text = (cand.content?.parts || []).map((p) => p.text || '').join('');
+  if (!text) {
+    // gemini-2.5-flash is a thinking model: thinking tokens can exhaust the
+    // output budget, returning finishReason MAX_TOKENS with no visible text.
+    // Surface it so callers don't fail later as an opaque "can't parse JSON".
+    throw new Error(`Gemini returned no text (finishReason: ${cand.finishReason || 'unknown'}).`);
+  }
+  return text;
 };
 
 // Call Claude (Anthropic Messages API). Browser calls require the
