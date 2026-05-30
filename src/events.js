@@ -26,8 +26,8 @@ export const fetchRealEvents = async ({ lat, lng, location, startDate, endDate, 
   }
 };
 
-// Fetch highly-rated PLACES (restaurants/bars/activities) from Yelp via the
-// proxy's ?kind=places mode. Returns [] on any failure (never throws).
+// Fetch highly-rated PLACES (restaurants/bars/activities) from Google Places
+// via the proxy's ?kind=places mode. Returns [] on any failure (never throws).
 export const fetchPlaces = async ({ lat, lng, location, radius, term, categories, size } = {}) => {
   try {
     const params = new URLSearchParams({ kind: 'places' });

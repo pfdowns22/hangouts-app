@@ -247,7 +247,7 @@ const SOURCE_LABELS = {
   ticketmaster: 'Ticketmaster',
   seatgeek: 'SeatGeek',
   predicthq: 'PredictHQ',
-  yelp: 'Yelp',
+  google: 'Google',
 };
 const SourceBadge = ({ source }) => {
   const label = SOURCE_LABELS[source];
@@ -291,7 +291,7 @@ const searchUrl = (event, extra = '') => {
 // AI ('ai') and PredictHQ URLs are unreliable (homepage, fabricated, or
 // absent), so for those we send users to a search of the card's details, which
 // surfaces the actual event listing rather than a no-info landing page.
-const TRUSTED_URL_SOURCES = new Set(['ticketmaster', 'seatgeek', 'yelp']);
+const TRUSTED_URL_SOURCES = new Set(['ticketmaster', 'seatgeek', 'google']);
 
 // "More Info" target: the event's own URL only when it comes from a trusted
 // source and is valid; otherwise a rich search of the card's details.
@@ -316,7 +316,7 @@ const ticketAction = (event) => {
 };
 
 // Broad interests worth drilling into specifics for, so recommendations (and
-// especially Yelp place picks) match real taste. Maps a broad label →
+// especially place picks) match real taste. Maps a broad label →
 // { key (where specifics are stored in profile.preferenceDetails), question,
 // options }. The `match` list lets a free-typed interest map to a bucket.
 const INTEREST_TAXONOMY = {
@@ -2009,7 +2009,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
         return rankAndPersonalizeEvents({ events: raw, contextText: ctx, provider, max: 6 });
       })();
 
-      // Source C — Yelp PLACES tied to the user's free slots. Only on the
+      // Source C — Google Places tied to the user's free slots. Only on the
       // Upcoming full-refresh pass (not Today, not scroll) so it runs once per
       // "Generate Ideas", and only when they have food/drink tastes + free time.
       const placesSearch = (async () => {
@@ -3652,7 +3652,7 @@ Return ONLY a JSON array (no prose, no markdown) of objects with keys: question 
       const newPrefs = [...new Set([...(userProfile?.preferences || []), ...allOptions])];
 
       // Route drill-down answers into structured preferenceDetails (food /
-      // drinks / music specifics) so Yelp + ranking can use them precisely.
+      // drinks / music specifics) so place picks + ranking can use them precisely.
       const questions = [...INITIAL_SURVEY_QUESTIONS, ...followUps];
       const details = { ...(userProfile?.preferenceDetails || {}) };
       questions.forEach((q, i) => {

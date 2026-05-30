@@ -191,48 +191,64 @@ const predicthq = {
 
 const PROVIDERS = [ticketmaster, seatgeek, predicthq];
 
-// Yelp is a PLACES source (restaurants/bars/activities), not dated events, so
-// it's queried separately via ?kind=places and assigned to a user's free slot
-// client-side. Returns only well-reviewed spots.
-const yelp = {
-  id: 'yelp',
+// Google Places (New) is the PLACES source — restaurants/bars/activities, not
+// dated events. Queried via ?kind=places and pinned to a user's free slot
+// client-side. Returns only well-reviewed spots. Uses Text Search; no photos
+// (those need a key-bearing media URL) — the client's image fallback covers it.
+const PRICE_LEVEL_TIER = {
+  PRICE_LEVEL_FREE: 'Free',
+  PRICE_LEVEL_INEXPENSIVE: '$',
+  PRICE_LEVEL_MODERATE: '$$',
+  PRICE_LEVEL_EXPENSIVE: '$$$',
+  PRICE_LEVEL_VERY_EXPENSIVE: '$$$$',
+};
+const googlePlaces = {
+  id: 'google',
   get enabled() {
-    return !!process.env.YELP_API_KEY;
+    return !!process.env.GOOGLE_PLACES_KEY;
   },
-  async fetch({ lat, lng, radius, term, categories, size }) {
-    const params = new URLSearchParams({
-      latitude: String(lat),
-      longitude: String(lng),
-      radius: String(Math.min(Math.round(radius * 1609), 40000)), // miles→meters, Yelp max 40km
-      sort_by: 'rating',
-      limit: String(Math.min(size * 3, 50)), // over-fetch so the rating/review filter still leaves enough
+  async fetch({ lat, lng, radius, term, size }) {
+    const body = {
+      textQuery: `${term || 'popular'} restaurants and bars`,
+      maxResultCount: Math.min(size * 3, 20),
+      locationBias: {
+        circle: {
+          center: { latitude: lat, longitude: lng },
+          radius: Math.min(Math.round(radius * 1609), 50000), // miles→meters, max 50km
+        },
+      },
+    };
+    const res = await fetch('https://places.googleapis.com/v1/places:searchText', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': process.env.GOOGLE_PLACES_KEY,
+        'X-Goog-FieldMask':
+          'places.displayName,places.rating,places.userRatingCount,places.priceLevel,places.formattedAddress,places.googleMapsUri,places.location,places.primaryTypeDisplayName',
+      },
+      body: JSON.stringify(body),
     });
-    if (term) params.set('term', term);
-    if (categories) params.set('categories', categories);
-    const res = await fetch(`https://api.yelp.com/v3/businesses/search?${params}`, {
-      headers: { Authorization: `Bearer ${process.env.YELP_API_KEY}`, Accept: 'application/json' },
-    });
-    if (!res.ok) throw new Error(`yelp ${res.status}`);
+    if (!res.ok) throw new Error(`google ${res.status}`);
     const data = await res.json();
-    return (data?.businesses || [])
-      .filter((b) => !b.is_closed && (b.rating || 0) >= 4.0 && (b.review_count || 0) >= 25)
-      .map((b) => ({
-        source: 'yelp',
-        title: b.name,
-        description: `${b.rating}★ (${b.review_count} reviews) · ${(b.categories || []).map((c) => c.title).slice(0, 3).join(', ')}`,
-        location: (b.location?.display_address || []).join(', '),
+    return (data?.places || [])
+      .filter((p) => (p.rating || 0) >= 4.0 && (p.userRatingCount || 0) >= 25)
+      .map((p) => ({
+        source: 'google',
+        title: p.displayName?.text || 'Place',
+        description: `${p.rating}★ (${p.userRatingCount} reviews)${p.primaryTypeDisplayName?.text ? ' · ' + p.primaryTypeDisplayName.text : ''}`,
+        location: p.formattedAddress || '',
         date: null, // not dated — the client pins it to one of the user's free slots
-        url: b.url || null, // real Yelp business page (hours/photos/reviews/map)
-        imageUrl: b.image_url || null,
-        imageKeywords: (b.categories || []).map((c) => c.title).join(' '),
-        priceTier: b.price || null, // Yelp already uses $ / $$ / $$$ / $$$$
+        url: p.googleMapsUri || null, // real Google Maps listing (hours/photos/reviews/map)
+        imageUrl: null,
+        imageKeywords: [p.primaryTypeDisplayName?.text, p.displayName?.text].filter(Boolean).join(' '),
+        priceTier: PRICE_LEVEL_TIER[p.priceLevel] || null,
         isTicketed: false,
         ticketsUrl: null,
-        lat: b.coordinates?.latitude ?? null,
-        lng: b.coordinates?.longitude ?? null,
-        category: (b.categories || [])[0]?.title || 'place',
-        rating: b.rating ?? null,
-        reviewCount: b.review_count ?? null,
+        lat: p.location?.latitude ?? null,
+        lng: p.location?.longitude ?? null,
+        category: p.primaryTypeDisplayName?.text || 'place',
+        rating: p.rating ?? null,
+        reviewCount: p.userRatingCount ?? null,
       }));
   },
 };
@@ -266,26 +282,25 @@ export default async function handler(req, res) {
     }
   }
 
-  // Places mode (Yelp): restaurants/bars/activities, not dated events.
+  // Places mode (Google Places): restaurants/bars/activities, not dated events.
   if ((q.kind || '').toString() === 'places') {
-    if (lat == null || Number.isNaN(lat) || !yelp.enabled) {
+    if (lat == null || Number.isNaN(lat) || !googlePlaces.enabled) {
       res.status(200).json({
         events: [],
         sources: {},
-        errors: !yelp.enabled ? ['yelp not configured'] : ['could not resolve location'],
+        errors: !googlePlaces.enabled ? ['places API not configured'] : ['could not resolve location'],
       });
       return;
     }
     try {
       const term = (q.term || '').toString().slice(0, 120);
-      const categories = (q.categories || '').toString().slice(0, 120);
-      const places = (await yelp.fetch({ lat, lng, radius, term, categories, size }))
+      const places = (await googlePlaces.fetch({ lat, lng, radius, term, size }))
         .sort((a, b) => (b.rating || 0) - (a.rating || 0))
         .slice(0, size);
       res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=600');
-      res.status(200).json({ events: places, sources: { yelp: places.length }, errors: [] });
+      res.status(200).json({ events: places, sources: { google: places.length }, errors: [] });
     } catch (e) {
-      res.status(200).json({ events: [], sources: { yelp: 0 }, errors: [`yelp: ${e.message}`] });
+      res.status(200).json({ events: [], sources: { google: 0 }, errors: [`google: ${e.message}`] });
     }
     return;
   }
