@@ -36,6 +36,18 @@ const normalizeType = (raw) => {
   return 'Other';
 };
 
+// Places (New) Text Search accepts only a RECTANGLE for locationRestriction
+// (a circle is valid for locationBias only). Convert a center + radius (meters)
+// to a bounding box so we can hard-restrict results to the local area.
+const radiusRectangle = (lat, lng, meters) => {
+  const dLat = meters / 111320;
+  const dLng = meters / (111320 * Math.max(0.01, Math.cos((lat * Math.PI) / 180)));
+  return {
+    low: { latitude: lat - dLat, longitude: lng - dLng },
+    high: { latitude: lat + dLat, longitude: lng + dLng },
+  };
+};
+
 // Combine a YYYY-MM-DD date and optional HH:MM:SS time into the app's
 // "YYYY-MM-DD HH:MM" event-date string. Falls back to noon when time is absent.
 const toEventDate = (date, time) => {
@@ -272,13 +284,9 @@ const googlePlaces = {
       textQuery: `${term || 'popular'} restaurants and bars`,
       maxResultCount: Math.min(size * 3, 20),
       // Hard restriction (not bias) so results stay strictly within the radius —
-      // a soft bias let a Park Slope query return New Jersey.
-      locationRestriction: {
-        circle: {
-          center: { latitude: lat, longitude: lng },
-          radius: Math.min(Math.round(radius * 1609), 50000), // miles→meters, max 50km
-        },
-      },
+      // a soft bias let a Park Slope query return New Jersey. Text Search needs
+      // a rectangle here (circle is bias-only).
+      locationRestriction: { rectangle: radiusRectangle(lat, lng, Math.min(Math.round(radius * 1609), 50000)) },
     };
     const res = await fetch('https://places.googleapis.com/v1/places:searchText', {
       method: 'POST',
@@ -324,9 +332,7 @@ const googleVerify = async ({ name, lat, lng, radius }) => {
   const body = {
     textQuery: name,
     maxResultCount: 1,
-    locationRestriction: {
-      circle: { center: { latitude: lat, longitude: lng }, radius: Math.min(Math.round(radius * 1609), 50000) },
-    },
+    locationRestriction: { rectangle: radiusRectangle(lat, lng, Math.min(Math.round(radius * 1609), 50000)) },
   };
   const res = await fetch('https://places.googleapis.com/v1/places:searchText', {
     method: 'POST',
