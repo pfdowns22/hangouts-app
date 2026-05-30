@@ -3,7 +3,7 @@
 // hiccup never blocks the always-on Gemini AI-search source that runs in
 // parallel with it.
 
-export const fetchRealEvents = async ({ lat, lng, location, startDate, endDate, radius, keywords, size } = {}) => {
+export const fetchRealEvents = async ({ lat, lng, location, startDate, endDate, radius, keywords, size, borough } = {}) => {
   try {
     const params = new URLSearchParams();
     if (lat != null && lng != null) {
@@ -16,6 +16,7 @@ export const fetchRealEvents = async ({ lat, lng, location, startDate, endDate, 
     if (radius) params.set('radius', String(radius));
     if (keywords) params.set('keywords', keywords);
     if (size) params.set('size', String(size));
+    if (borough) params.set('borough', borough);
 
     const res = await fetch(`/api/events?${params.toString()}`, { headers: { Accept: 'application/json' } });
     if (!res.ok) return [];
@@ -47,5 +48,25 @@ export const fetchPlaces = async ({ lat, lng, location, radius, term, categories
     return Array.isArray(data?.events) ? data.events : [];
   } catch {
     return [];
+  }
+};
+
+// Verify a single venue is real & within radius (Google Places). Returns the
+// proxy's { verified, found, url, rating, priceTier, address } shape. On any
+// failure returns { verified: false } so callers keep the item rather than drop it.
+export const verifyVenue = async ({ name, lat, lng, location, radius } = {}) => {
+  try {
+    const params = new URLSearchParams({ kind: 'verify', name: name || '' });
+    if (lat != null && lng != null) {
+      params.set('lat', String(lat));
+      params.set('lng', String(lng));
+    }
+    if (location) params.set('location', location);
+    if (radius) params.set('radius', String(radius));
+    const res = await fetch(`/api/events?${params.toString()}`, { headers: { Accept: 'application/json' } });
+    if (!res.ok) return { verified: false, found: false };
+    return (await res.json().catch(() => ({ verified: false, found: false }))) || { verified: false, found: false };
+  } catch {
+    return { verified: false, found: false };
   }
 };

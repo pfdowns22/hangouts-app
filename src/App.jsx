@@ -32,7 +32,7 @@ import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { createPortal } from 'react-dom';
 
 import { auth, db, storage, appId, geminiApiKey } from './firebase.js';
-import { fetchRealEvents } from './events.js';
+import { fetchRealEvents, verifyVenue } from './events.js';
 
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_URL_FOR_KEY = (key) =>
@@ -248,6 +248,19 @@ const SOURCE_LABELS = {
   seatgeek: 'SeatGeek',
   predicthq: 'PredictHQ',
   google: 'Google',
+  nyc: 'NYC',
+};
+
+// Detect a NYC borough in a free-text address so we can query NYC Open Data
+// (NYC-only). Returns the canonical borough name or null.
+const nycBorough = (addr) => {
+  const s = (addr || '').toLowerCase();
+  if (/staten island/.test(s)) return 'Staten Island';
+  if (/manhattan|new york, ny|nyc/.test(s)) return 'Manhattan';
+  if (/brooklyn/.test(s)) return 'Brooklyn';
+  if (/queens|astoria|long island city|flushing/.test(s)) return 'Queens';
+  if (/bronx/.test(s)) return 'Bronx';
+  return null;
 };
 const SourceBadge = ({ source }) => {
   const label = SOURCE_LABELS[source];
@@ -2020,6 +2033,7 @@ WHAT TO FIND (specific & niche beats generic):
 - For EACH interest above, hunt for a CONCRETE real happening that matches it — INCLUDING small, recurring, niche things: a bar's weekly craft/knit night, a run club, a board-game or trivia night, an open mic, a maker workshop, a neighborhood pop-up. These niche interest-matches are MORE valuable than big generic events.
 - FOOD & DRINK rule: do NOT recommend a restaurant just for being good or popular. Only include a food/drink spot if EITHER (a) it newly opened and matches their tastes above, OR (b) it's hosting something special on a specific day (trivia, live music, tasting, themed night) — say what and when. Otherwise skip food.
 - Favor things that fit their preferred days/times below.
+- SOURCES: mine curated local "things to do" coverage for distinctive picks — Time Out, The New Yorker "Goings On", The Skint, Brooklyn Magazine, Eater, Curbed, the local NYT culture section, and neighborhood blogs. Avoid generic Eventbrite/Meetup/Facebook listings unless an editorial source also covers it.
 
 AVAILABILITY:
 - Recurring weekly availability (day=times-of-day): ${weeklyStr}
@@ -2074,6 +2088,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
           radius: scope.radiusMiles,
           keywords: (userProfile?.preferences || []).slice(0, 4).join(' '),
           size: 12,
+          borough: nycBorough(home) || nycBorough(current),
         });
         if (!raw.length) return [];
         const ctx = `Recommend events for someone interested in: ${prefs}. Home area: ${home}. ${kidsText}.`;
@@ -2088,6 +2103,35 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
       // same event reappearing across presses.
       const seenKeys = new Set(feedItems.map((i) => normalizeTitle(i.data?.title)).filter(Boolean));
       suggestions = suggestions.filter((s) => !seenKeys.has(normalizeTitle(s.title)));
+
+      // Verify AI food/drink picks against Google Places (real & within radius):
+      // enrich with a Maps link + rating, and DROP any Places can't place
+      // locally. Non-food items pass through untouched; fail-open on errors.
+      {
+        const useCur = locPref !== 'home' && userProfile?.currentLocation?.lat != null;
+        const vlat = useCur ? userProfile.currentLocation.lat : undefined;
+        const vlng = useCur ? userProfile.currentLocation.lng : undefined;
+        const vloc = vlat != null ? undefined : home;
+        const isFood = (t) => t === 'Food & Drink' || t === 'Nightlife';
+        suggestions = (
+          await Promise.all(
+            suggestions.map(async (s) => {
+              if (!isFood(s.type) || s.source === 'google') return s;
+              try {
+                const v = await verifyVenue({ name: s.title, lat: vlat, lng: vlng, location: vloc, radius: scope.radiusMiles });
+                if (v.found) {
+                  return { ...s, url: v.url || s.url, source: v.url ? 'google' : s.source, priceTier: s.priceTier || v.priceTier, location: v.address || s.location };
+                }
+                if (v.verified) return null; // checked and not local → drop
+                return s; // couldn't verify → keep as-is
+              } catch {
+                return s;
+              }
+            })
+          )
+        ).filter(Boolean);
+      }
+
       if (!suggestions.length) {
         throw new Error(
           aiError ? `AI search failed — ${aiError.message}` : 'No new ideas right now — try again later or widen your interests.'

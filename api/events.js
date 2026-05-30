@@ -208,7 +208,48 @@ const predicthq = {
   },
 };
 
-const PROVIDERS = [ticketmaster, seatgeek, predicthq];
+// NYC Open Data permitted events (keyless Socrata API) — street fairs,
+// festivals, plaza/park events, parades. NYC-only, so it no-ops unless the
+// client passes a NYC borough. Film/TV production permits are filtered out.
+const nycEvents = {
+  id: 'nyc',
+  get enabled() {
+    return true; // keyless; returns [] without a borough (i.e. non-NYC users)
+  },
+  async fetch({ borough, startDate, endDate, size }) {
+    if (!borough) return [];
+    const where = `start_date_time >= '${startDate}T00:00:00' AND start_date_time <= '${endDate}T23:59:59' AND event_borough = '${borough}'`;
+    const params = new URLSearchParams({ $where: where, $order: 'start_date_time', $limit: String(Math.min(size * 2, 50)) });
+    const res = await fetch(`https://data.cityofnewyork.us/resource/tvpp-9vvx.json?${params}`, { headers: { Accept: 'application/json' } });
+    if (!res.ok) throw new Error(`nyc ${res.status}`);
+    const rows = await res.json();
+    return rows
+      .filter((r) => r.event_name && r.event_type && !/production/i.test(r.event_type)) // drop film/TV permits
+      .map((r) => {
+        const start = r.start_date_time || '';
+        const [d, t] = start.includes('T') ? [start.slice(0, 10), start.slice(11, 16)] : [start, ''];
+        return {
+          source: 'nyc',
+          title: r.event_name,
+          description: [r.event_type, r.event_agency].filter(Boolean).join(' · '),
+          location: (r.event_location || '').split(',')[0].trim() || borough,
+          date: toEventDate(d, t),
+          url: null,
+          imageUrl: null,
+          imageKeywords: [r.event_type, borough].filter(Boolean).join(' '),
+          priceTier: null,
+          isTicketed: false,
+          ticketsUrl: null,
+          lat: null,
+          lng: null,
+          category: r.event_type || null,
+          type: normalizeType(r.event_type),
+        };
+      });
+  },
+};
+
+const PROVIDERS = [ticketmaster, seatgeek, predicthq, nycEvents];
 
 // Google Places (New) is the PLACES source — restaurants/bars/activities, not
 // dated events. Queried via ?kind=places and pinned to a user's free slot
@@ -275,6 +316,41 @@ const googlePlaces = {
   },
 };
 
+// Verify a single venue by name within a hard radius (Places Text Search). Used
+// to confirm an AI-suggested food/drink spot is real & nearby, and to attach a
+// real Maps link + rating. Returns { found:false } when nothing matches inside
+// the radius.
+const googleVerify = async ({ name, lat, lng, radius }) => {
+  const body = {
+    textQuery: name,
+    maxResultCount: 1,
+    locationRestriction: {
+      circle: { center: { latitude: lat, longitude: lng }, radius: Math.min(Math.round(radius * 1609), 50000) },
+    },
+  };
+  const res = await fetch('https://places.googleapis.com/v1/places:searchText', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Goog-Api-Key': process.env.GOOGLE_PLACES_KEY,
+      'X-Goog-FieldMask': 'places.displayName,places.rating,places.priceLevel,places.formattedAddress,places.googleMapsUri,places.location',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`google ${res.status}`);
+  const p = ((await res.json()).places || [])[0];
+  if (!p) return { found: false };
+  return {
+    found: true,
+    url: p.googleMapsUri || null,
+    rating: p.rating ?? null,
+    priceTier: PRICE_LEVEL_TIER[p.priceLevel] || null,
+    address: p.formattedAddress || null,
+    lat: p.location?.latitude ?? null,
+    lng: p.location?.longitude ?? null,
+  };
+};
+
 // Collapse near-duplicates that surface from more than one provider: same
 // (lowercased) title on the same calendar day.
 const dedupe = (events) => {
@@ -302,6 +378,25 @@ export default async function handler(req, res) {
       lat = c.lat;
       lng = c.lng;
     }
+  }
+
+  // Verify mode: confirm a single venue is real & within the radius (and enrich
+  // it). `verified:false` means we couldn't check (no key/location) → caller
+  // should keep the item; `verified:true, found:false` means it checked and the
+  // venue isn't local → caller should drop it.
+  if ((q.kind || '').toString() === 'verify') {
+    const canVerify = googlePlaces.enabled && lat != null && !Number.isNaN(lat) && !!q.name;
+    if (!canVerify) {
+      res.status(200).json({ verified: false, found: false });
+      return;
+    }
+    try {
+      const r = await googleVerify({ name: q.name.toString().slice(0, 120), lat, lng, radius });
+      res.status(200).json({ verified: true, ...r });
+    } catch (e) {
+      res.status(200).json({ verified: false, found: false, error: e.message });
+    }
+    return;
   }
 
   // Places mode (Google Places): restaurants/bars/activities, not dated events.
@@ -345,7 +440,8 @@ export default async function handler(req, res) {
     return;
   }
 
-  const params = { lat, lng, radius, startDate, endDate, keywords, size };
+  const borough = (q.borough || '').toString().slice(0, 20);
+  const params = { lat, lng, radius, startDate, endDate, keywords, size, borough };
   const settled = await Promise.allSettled(enabled.map((p) => p.fetch(params)));
 
   const sources = {};
@@ -363,9 +459,19 @@ export default async function handler(req, res) {
     }
   });
 
-  const events = dedupe(all)
-    .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
-    .slice(0, size);
+  // Group by source, sort each by date, then round-robin so no single source
+  // (e.g. the high-volume keyless NYC feed) dominates the slice.
+  const bySource = {};
+  for (const ev of dedupe(all)) (bySource[ev.source] ||= []).push(ev);
+  Object.values(bySource).forEach((list) => list.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()));
+  const order = Object.keys(bySource);
+  const events = [];
+  let ri = 0;
+  while (events.length < size && order.some((s) => bySource[s].length)) {
+    const list = bySource[order[ri % order.length]];
+    if (list.length) events.push(list.shift());
+    ri += 1;
+  }
 
   // Short edge cache: identical nearby queries within a few minutes reuse the
   // result, easing provider quotas under a burst of testers.
