@@ -44,6 +44,7 @@ The feed and group suggestions gather events from multiple sources in parallel, 
    - **Ticketmaster Discovery** (`TICKETMASTER_API_KEY`) — free, generous quota; concerts/sports/theater/arts.
    - **SeatGeek** (`SEATGEEK_CLIENT_ID`, optional `SEATGEEK_CLIENT_SECRET`) — ticketed events.
    - **PredictHQ** (`PREDICTHQ_TOKEN`) — broad coverage incl. non-ticketed (paid).
+3. **Places to do when you're free** — **Yelp Fusion** (`YELP_API_KEY`, free) via the proxy's `?kind=places` mode. When a user has food/drink tastes (captured as `preferenceDetails`) and marked-free dates, the feed pins a couple of highly-rated nearby spots to those free slots.
 
 Partner-API events are then ranked and given friendly blurbs by Gemini (factual fields are preserved verbatim). If no partner keys are set, the app runs on AI search alone — no breakage.
 

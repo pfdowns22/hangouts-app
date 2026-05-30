@@ -32,7 +32,7 @@ import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { createPortal } from 'react-dom';
 
 import { auth, db, storage, appId, geminiApiKey } from './firebase.js';
-import { fetchRealEvents } from './events.js';
+import { fetchRealEvents, fetchPlaces } from './events.js';
 
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_URL_FOR_KEY = (key) =>
@@ -247,6 +247,7 @@ const SOURCE_LABELS = {
   ticketmaster: 'Ticketmaster',
   seatgeek: 'SeatGeek',
   predicthq: 'PredictHQ',
+  yelp: 'Yelp',
 };
 const SourceBadge = ({ source }) => {
   const label = SOURCE_LABELS[source];
@@ -290,7 +291,7 @@ const searchUrl = (event, extra = '') => {
 // AI ('ai') and PredictHQ URLs are unreliable (homepage, fabricated, or
 // absent), so for those we send users to a search of the card's details, which
 // surfaces the actual event listing rather than a no-info landing page.
-const TRUSTED_URL_SOURCES = new Set(['ticketmaster', 'seatgeek']);
+const TRUSTED_URL_SOURCES = new Set(['ticketmaster', 'seatgeek', 'yelp']);
 
 // "More Info" target: the event's own URL only when it comes from a trusted
 // source and is valid; otherwise a rich search of the card's details.
@@ -312,6 +313,41 @@ const ticketAction = (event) => {
     if (direct) return { href: direct, label: '🎟️ Buy Tickets' };
   }
   return { href: searchUrl(event, 'tickets'), label: '🎟️ Find Tickets' };
+};
+
+// Broad interests worth drilling into specifics for, so recommendations (and
+// especially Yelp place picks) match real taste. Maps a broad label →
+// { key (where specifics are stored in profile.preferenceDetails), question,
+// options }. The `match` list lets a free-typed interest map to a bucket.
+const INTEREST_TAXONOMY = {
+  'Food & Drink': {
+    key: 'food',
+    question: 'What kinds of food are you into?',
+    options: ['Italian', 'Mexican', 'Japanese / Sushi', 'Thai', 'Indian', 'Chinese', 'BBQ', 'Vegan / Vegetarian', 'Brunch', 'Seafood', 'Pizza', 'Steakhouse', 'Mediterranean'],
+    match: ['food', 'foodie', 'dining', 'restaurant', 'restaurants', 'eat', 'cuisine'],
+  },
+  'Drinks / Nightlife': {
+    key: 'drinks',
+    question: "What's your drinks / nightlife scene?",
+    options: ['Craft cocktails', 'Wine bars', 'Breweries / Beer', 'Speakeasies', 'Rooftop bars', 'Dive bars', 'Dancing / Clubs'],
+    match: ['drinks', 'drink', 'nightlife', 'bars', 'bar', 'cocktails', 'wine', 'beer'],
+  },
+  'Live Music': {
+    key: 'music',
+    question: 'What music do you love?',
+    options: ['Indie / Rock', 'Hip-hop', 'Electronic / DJ', 'Jazz / Blues', 'Classical', 'Pop', 'Country', 'Latin', 'Metal'],
+    match: ['music', 'live music', 'concerts', 'concert', 'gigs', 'shows'],
+  },
+};
+
+// Find the taxonomy bucket a broad label/typed interest belongs to (or null).
+const taxonomyBucketFor = (label) => {
+  const l = (label || '').trim().toLowerCase();
+  if (!l) return null;
+  for (const [broad, def] of Object.entries(INTEREST_TAXONOMY)) {
+    if (broad.toLowerCase() === l || def.match.includes(l)) return { broad, ...def };
+  }
+  return null;
 };
 
 // Image fallback chain when Gemini's imageUrl is null or 404s.
@@ -855,6 +891,8 @@ const ProfileSection = ({ onClose }) => {
   const [newKidName, setNewKidName] = useState('');
   const [newKidAge, setNewKidAge] = useState('');
   const [preferences, setPreferences] = useState(userProfile?.preferences || []);
+  const [preferenceDetails, setPreferenceDetails] = useState(userProfile?.preferenceDetails || {});
+  const [refineBucket, setRefineBucket] = useState(null); // taxonomy bucket to drill into after a broad add
   const [currentPreference, setCurrentPreference] = useState('');
   const [availableDates, setAvailableDates] = useState(userProfile?.availability || []);
   // Per-date slot picker. Map of "YYYY-MM-DD" -> ["morning"|"afternoon"|"evening"].
@@ -1004,6 +1042,7 @@ const ProfileSection = ({ onClose }) => {
         address,
         kids,
         preferences,
+        preferenceDetails,
         availability: availableDates,
         availabilitySlots,
         weeklyAvailability,
@@ -1105,12 +1144,26 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with shape:
   };
   const removeKid = (i) => setKids(kids.filter((_, idx) => idx !== i));
   const addPreference = () => {
-    if (currentPreference && !preferences.includes(currentPreference)) {
-      setPreferences([...preferences, currentPreference]);
-      setCurrentPreference('');
+    const val = currentPreference.trim();
+    if (val && !preferences.includes(val)) {
+      setPreferences([...preferences, val]);
     }
+    setCurrentPreference('');
+    // If they added a broad interest (food/drinks/music), prompt for specifics.
+    const bucket = taxonomyBucketFor(val);
+    if (bucket) setRefineBucket(bucket);
   };
   const removePreference = (p) => setPreferences(preferences.filter((pref) => pref !== p));
+  // Add a specific (e.g. "Italian") to both the flat list and the structured
+  // preferenceDetails bucket so place recommendations can use it.
+  const addSpecific = (bucket, opt) => {
+    setPreferences((prev) => (prev.includes(opt) ? prev : [...prev, opt]));
+    setPreferenceDetails((prev) => {
+      const existing = prev[bucket.key] || [];
+      if (existing.includes(opt)) return prev;
+      return { ...prev, [bucket.key]: [...existing, opt] };
+    });
+  };
   const handleDateToggle = (d) => {
     setAvailableDates((prev) => (prev.includes(d) ? prev.filter((x) => x !== d) : [...prev, d].sort()));
     setAvailabilitySlots((prev) => {
@@ -1337,10 +1390,41 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with shape:
               <PlusIcon />
             </button>
           </div>
+          {refineBucket && (
+            <div className="mt-3 bg-pink-50 border border-pink-100 rounded-xl p-3">
+              <div className="flex justify-between items-center mb-2">
+                <p className="text-xs font-bold text-pink-800">{refineBucket.question}</p>
+                <button type="button" onClick={() => setRefineBucket(null)} className="text-pink-400 hover:text-pink-700" title="Done">
+                  <CloseIcon className="w-4 h-4" />
+                </button>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {refineBucket.options.map((opt) => {
+                  const on = preferences.includes(opt);
+                  return (
+                    <button
+                      key={opt}
+                      type="button"
+                      onClick={() => addSpecific(refineBucket, opt)}
+                      disabled={on}
+                      className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition ${
+                        on ? 'bg-pink-600 text-white border-pink-600' : 'bg-white text-gray-700 border-gray-200 hover:border-pink-300'
+                      }`}
+                    >
+                      {opt}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
           {showSurvey && (
             <SurveyModal
               onClose={() => setShowSurvey(false)}
-              onPreferencesUpdate={(newPrefs) => setPreferences(newPrefs)}
+              onPreferencesUpdate={(newPrefs, details) => {
+                setPreferences(newPrefs);
+                if (details) setPreferenceDetails(details);
+              }}
             />
           )}
         </div>
@@ -1925,10 +2009,46 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
         return rankAndPersonalizeEvents({ events: raw, contextText: ctx, provider, max: 6 });
       })();
 
-      // Run both sources in parallel and merge (a failure in one never blocks
-      // the other; partner events de-dupe against AI-found ones).
-      const [aEvents, bEvents] = await Promise.all([aiSearch, partnerSearch]);
-      const suggestions = mergeEvents(aEvents, bEvents);
+      // Source C — Yelp PLACES tied to the user's free slots. Only on the
+      // Upcoming full-refresh pass (not Today, not scroll) so it runs once per
+      // "Generate Ideas", and only when they have food/drink tastes + free time.
+      const placesSearch = (async () => {
+        if (forToday || fromScroll) return [];
+        const details = userProfile?.preferenceDetails || {};
+        const foodDrink = [...(details.food || []), ...(details.drinks || [])];
+        if (!foodDrink.length) return [];
+        // Upcoming dates the user marked free; fall back to the next Fri/Sat.
+        const slots = userProfile?.availabilitySlots || {};
+        const todayStr = ymdLocal(new Date());
+        let freeDates = Object.keys(slots).filter((d) => d >= todayStr).sort();
+        if (!freeDates.length) {
+          for (let i = 1; i <= 14 && freeDates.length < 2; i++) {
+            const day = new Date(Date.now() + i * 864e5);
+            if (day.getDay() === 5 || day.getDay() === 6) freeDates.push(ymdLocal(day));
+          }
+        }
+        if (!freeDates.length) return [];
+        const useCurrent = locPref !== 'home' && userProfile?.currentLocation?.lat != null;
+        const raw = await fetchPlaces({
+          lat: useCurrent ? userProfile.currentLocation.lat : undefined,
+          lng: useCurrent ? userProfile.currentLocation.lng : undefined,
+          location: useCurrent ? undefined : home,
+          radius: scope.radiusMiles,
+          term: foodDrink.slice(0, 5).join(', '),
+          categories: 'restaurants,bars',
+          size: 8,
+        });
+        // Keep a couple they haven't seen, and pin each to a free date (evening).
+        return raw
+          .filter((p) => p.title && !seenTitles.includes(p.title))
+          .slice(0, 2)
+          .map((p, i) => ({ ...p, date: `${freeDates[i % freeDates.length]} 19:00` }));
+      })();
+
+      // Run all sources in parallel and merge (a failure in one never blocks
+      // the others; partner/place items de-dupe against AI-found ones).
+      const [aEvents, bEvents, cPlaces] = await Promise.all([aiSearch, partnerSearch, placesSearch]);
+      const suggestions = mergeEvents(aEvents, bEvents, cPlaces);
       if (!suggestions.length) {
         throw new Error(
           aiError ? `AI search failed — ${aiError.message}` : 'No events found. Try again, or add a partner-events key.'
@@ -3431,7 +3551,7 @@ const INITIAL_SURVEY_QUESTIONS = [
   {
     question: 'Pick your favorite categories',
     type: 'multi',
-    options: ['Live Music', 'Sports', 'Food & Drink', 'Art / Museums', 'Theater / Comedy', 'Outdoor activities', 'Markets / Shopping', 'Festivals', 'Workshops / Classes'],
+    options: ['Live Music', 'Sports', 'Food & Drink', 'Drinks / Nightlife', 'Art / Museums', 'Theater / Comedy', 'Outdoor activities', 'Markets / Shopping', 'Festivals', 'Workshops / Classes'],
   },
   {
     question: 'How adventurous are you about trying new things?',
@@ -3494,17 +3614,28 @@ Return ONLY a JSON array (no prose, no markdown) of objects with keys: question 
     setAnswers(next);
     setCurrentSelected([]);
 
-    // After the last initial question, generate Gemini follow-ups before advancing.
+    // After the last initial question, build the follow-up questions:
+    // deterministic drill-downs for the broad buckets they picked (food, drinks,
+    // music — so we capture specific tastes), then Gemini's AI follow-ups.
     if (isInitialDone && followUps.length === 0) {
+      // The "favorite categories" question is index 1.
+      const chosenCategories = next[1] || [];
+      const drillDowns = chosenCategories
+        .map((c) => INTEREST_TAXONOMY[c])
+        .filter(Boolean)
+        .map((def) => ({ question: def.question, type: 'multi', options: def.options, _detailKey: def.key }));
+
       setLoadingFollowUps(true);
       const generated = await generateFollowUps(next);
       setLoadingFollowUps(false);
-      if (!generated || generated.length === 0) {
-        // Couldn't get follow-ups — save what we have and exit.
+
+      const combined = [...drillDowns, ...(generated || [])];
+      if (combined.length === 0) {
+        // Nothing to ask — save what we have and exit.
         await save(next);
         return;
       }
-      setFollowUps(generated);
+      setFollowUps(combined);
     }
     setStage((s) => s + 1);
   };
@@ -3519,9 +3650,23 @@ Return ONLY a JSON array (no prose, no markdown) of objects with keys: question 
     try {
       const allOptions = Object.values(finalAnswers).flat().filter(Boolean);
       const newPrefs = [...new Set([...(userProfile?.preferences || []), ...allOptions])];
-      await updateDoc(doc(db, `artifacts/${appId}/users/${userId}/profiles`, 'myProfile'), { preferences: newPrefs });
-      setUserProfile((p) => ({ ...(p || {}), preferences: newPrefs }));
-      if (onPreferencesUpdate) onPreferencesUpdate(newPrefs);
+
+      // Route drill-down answers into structured preferenceDetails (food /
+      // drinks / music specifics) so Yelp + ranking can use them precisely.
+      const questions = [...INITIAL_SURVEY_QUESTIONS, ...followUps];
+      const details = { ...(userProfile?.preferenceDetails || {}) };
+      questions.forEach((q, i) => {
+        if (!q._detailKey) return;
+        const picked = (finalAnswers[i] || []).filter(Boolean);
+        if (picked.length) details[q._detailKey] = [...new Set([...(details[q._detailKey] || []), ...picked])];
+      });
+
+      await updateDoc(doc(db, `artifacts/${appId}/users/${userId}/profiles`, 'myProfile'), {
+        preferences: newPrefs,
+        preferenceDetails: details,
+      });
+      setUserProfile((p) => ({ ...(p || {}), preferences: newPrefs, preferenceDetails: details }));
+      if (onPreferencesUpdate) onPreferencesUpdate(newPrefs, details);
       showGlobalMessage(`Added ${allOptions.length} interests to your profile.`);
       onClose();
     } catch (e) {

@@ -191,6 +191,52 @@ const predicthq = {
 
 const PROVIDERS = [ticketmaster, seatgeek, predicthq];
 
+// Yelp is a PLACES source (restaurants/bars/activities), not dated events, so
+// it's queried separately via ?kind=places and assigned to a user's free slot
+// client-side. Returns only well-reviewed spots.
+const yelp = {
+  id: 'yelp',
+  get enabled() {
+    return !!process.env.YELP_API_KEY;
+  },
+  async fetch({ lat, lng, radius, term, categories, size }) {
+    const params = new URLSearchParams({
+      latitude: String(lat),
+      longitude: String(lng),
+      radius: String(Math.min(Math.round(radius * 1609), 40000)), // miles→meters, Yelp max 40km
+      sort_by: 'rating',
+      limit: String(Math.min(size * 3, 50)), // over-fetch so the rating/review filter still leaves enough
+    });
+    if (term) params.set('term', term);
+    if (categories) params.set('categories', categories);
+    const res = await fetch(`https://api.yelp.com/v3/businesses/search?${params}`, {
+      headers: { Authorization: `Bearer ${process.env.YELP_API_KEY}`, Accept: 'application/json' },
+    });
+    if (!res.ok) throw new Error(`yelp ${res.status}`);
+    const data = await res.json();
+    return (data?.businesses || [])
+      .filter((b) => !b.is_closed && (b.rating || 0) >= 4.0 && (b.review_count || 0) >= 25)
+      .map((b) => ({
+        source: 'yelp',
+        title: b.name,
+        description: `${b.rating}★ (${b.review_count} reviews) · ${(b.categories || []).map((c) => c.title).slice(0, 3).join(', ')}`,
+        location: (b.location?.display_address || []).join(', '),
+        date: null, // not dated — the client pins it to one of the user's free slots
+        url: b.url || null, // real Yelp business page (hours/photos/reviews/map)
+        imageUrl: b.image_url || null,
+        imageKeywords: (b.categories || []).map((c) => c.title).join(' '),
+        priceTier: b.price || null, // Yelp already uses $ / $$ / $$$ / $$$$
+        isTicketed: false,
+        ticketsUrl: null,
+        lat: b.coordinates?.latitude ?? null,
+        lng: b.coordinates?.longitude ?? null,
+        category: (b.categories || [])[0]?.title || 'place',
+        rating: b.rating ?? null,
+        reviewCount: b.review_count ?? null,
+      }));
+  },
+};
+
 // Collapse near-duplicates that surface from more than one provider: same
 // (lowercased) title on the same calendar day.
 const dedupe = (events) => {
@@ -218,6 +264,30 @@ export default async function handler(req, res) {
       lat = c.lat;
       lng = c.lng;
     }
+  }
+
+  // Places mode (Yelp): restaurants/bars/activities, not dated events.
+  if ((q.kind || '').toString() === 'places') {
+    if (lat == null || Number.isNaN(lat) || !yelp.enabled) {
+      res.status(200).json({
+        events: [],
+        sources: {},
+        errors: !yelp.enabled ? ['yelp not configured'] : ['could not resolve location'],
+      });
+      return;
+    }
+    try {
+      const term = (q.term || '').toString().slice(0, 120);
+      const categories = (q.categories || '').toString().slice(0, 120);
+      const places = (await yelp.fetch({ lat, lng, radius, term, categories, size }))
+        .sort((a, b) => (b.rating || 0) - (a.rating || 0))
+        .slice(0, size);
+      res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=600');
+      res.status(200).json({ events: places, sources: { yelp: places.length }, errors: [] });
+    } catch (e) {
+      res.status(200).json({ events: [], sources: { yelp: 0 }, errors: [`yelp: ${e.message}`] });
+    }
+    return;
   }
 
   // Date window (YYYY-MM-DD). Default: today → +30 days.
