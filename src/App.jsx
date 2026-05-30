@@ -2033,7 +2033,7 @@ WHAT TO FIND (specific & niche beats generic):
 - For EACH interest above, hunt for a CONCRETE real happening that matches it — INCLUDING small, recurring, niche things: a bar's weekly craft/knit night, a run club, a board-game or trivia night, an open mic, a maker workshop, a neighborhood pop-up. These niche interest-matches are MORE valuable than big generic events.
 - FOOD & DRINK rule: do NOT recommend a restaurant just for being good or popular. Only include a food/drink spot if EITHER (a) it newly opened and matches their tastes above, OR (b) it's hosting something special on a specific day (trivia, live music, tasting, themed night) — say what and when. Otherwise skip food.
 - Favor things that fit their preferred days/times below.
-- SOURCES: mine curated local "things to do" coverage for distinctive picks — Time Out, The New Yorker "Goings On", The Skint, Brooklyn Magazine, Eater, Curbed, the local NYT culture section, and neighborhood blogs. Avoid generic Eventbrite/Meetup/Facebook listings unless an editorial source also covers it.
+- SOURCES (a help, NOT a filter): interest-fit ALWAYS comes first. For broader/curated picks, mine editorial "things to do" coverage — Time Out, The New Yorker "Goings On", The Skint, Brooklyn Magazine, Eater, Curbed, local NYT culture, neighborhood blogs. BUT a niche match to one of their interests (a venue's weekly craft night, run club, trivia, open mic) is worth surfacing even if it's only on the venue's own site or social — surface it. Only skip generic listings that don't actually match an interest.
 
 AVAILABILITY:
 - Recurring weekly availability (day=times-of-day): ${weeklyStr}

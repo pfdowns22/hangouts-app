@@ -4,6 +4,12 @@ AI-powered social planning app. Originally generated in Google Gemini Canvas, th
 refactored into a standard Vite + React project. See [README.md](README.md) for
 end-user setup, deploy, and known-issues notes.
 
+## Backlog / TODO
+- **Local open-data events beyond NYC.** The `nycEvents` provider (api/events.js)
+  is NYC-only (gated by `nycBorough()` in src/App.jsx). Add equivalent civic
+  open-data event feeds for other major cities (Chicago, LA, SF, etc.) and route
+  by the user's city/region the same way.
+
 ## Stack
 - **Vite + React 18** (plain `.jsx`, no TypeScript despite the original `.tsx` naming)
 - **Firebase** — Auth, Firestore, Storage (`src/firebase.js`)
