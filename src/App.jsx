@@ -275,28 +275,42 @@ const validHttpUrl = (str) => {
   return null;
 };
 
-// A Google search built from everything on the listing card (title, location,
-// date) so even without a direct link the user lands on accurate, specific
-// results for that exact event.
+// A Google search built from everything on the listing card (quoted title +
+// location + date) so even without a direct link the user lands on accurate,
+// specific results for that exact event.
 const searchUrl = (event, extra = '') => {
-  const q = [extra, event?.title, event?.location, event?.date ? String(event.date).slice(0, 10) : '']
+  const title = event?.title ? `"${event.title}"` : '';
+  const q = [extra, title, event?.location, event?.date ? String(event.date).slice(0, 10) : '']
     .filter(Boolean)
     .join(' ');
   return `https://www.google.com/search?q=${encodeURIComponent(q || 'local events')}`;
 };
 
-// "More Info" target: the event's own URL when it's genuinely valid, otherwise
-// a rich Google search of the card's details.
-const moreInfoUrl = (event) => validHttpUrl(event?.url) || searchUrl(event);
+// Only partner APIs give real, event-specific URLs we should link to directly.
+// AI ('ai') and PredictHQ URLs are unreliable (homepage, fabricated, or
+// absent), so for those we send users to a search of the card's details, which
+// surfaces the actual event listing rather than a no-info landing page.
+const TRUSTED_URL_SOURCES = new Set(['ticketmaster', 'seatgeek']);
+
+// "More Info" target: the event's own URL only when it comes from a trusted
+// source and is valid; otherwise a rich search of the card's details.
+const moreInfoUrl = (event) => {
+  if (TRUSTED_URL_SOURCES.has(event?.source)) {
+    const direct = validHttpUrl(event?.url);
+    if (direct) return direct;
+  }
+  return searchUrl(event);
+};
 
 // Tickets action for an event card. Returns null for non-ticketed events.
-// Uses the direct purchase URL only when it's a valid link; otherwise falls
-// back to a ticket search so ticketed events are always actionable and never
-// dead-end on a placeholder URL.
+// Direct purchase link only from a trusted source; otherwise a ticket search,
+// so ticketed events are always actionable and never dead-end on a bad URL.
 const ticketAction = (event) => {
   if (!event?.isTicketed) return null;
-  const direct = validHttpUrl(event?.ticketsUrl);
-  if (direct) return { href: direct, label: '🎟️ Buy Tickets' };
+  if (TRUSTED_URL_SOURCES.has(event?.source)) {
+    const direct = validHttpUrl(event?.ticketsUrl);
+    if (direct) return { href: direct, label: '🎟️ Buy Tickets' };
+  }
   return { href: searchUrl(event, 'tickets'), label: '🎟️ Find Tickets' };
 };
 
@@ -4007,6 +4021,7 @@ const SendToGroupModal = ({ event, anchorRect, onClose }) => {
         priceTier: event?.priceTier || null,
         isTicketed: typeof event?.isTicketed === 'boolean' ? event.isTicketed : false,
         ticketsUrl: event?.ticketsUrl || null,
+        source: event?.source || null,
       };
       const proposerName = userProfile?.name || 'User';
 
