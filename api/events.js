@@ -20,6 +20,22 @@ const tierFromPrice = (min) => {
   return '$$$$';
 };
 
+// Normalize any provider's raw category text into one filterable type from a
+// fixed set, so the client's "filter by type" control is consistent across
+// sources. Keep this list in sync with EVENT_TYPES on the client.
+const normalizeType = (raw) => {
+  const s = (raw || '').toString().toLowerCase();
+  if (/(music|concert|gig|dj|band|jazz|hip.?hop|festival.*music)/.test(s)) return 'Music';
+  if (/(restaurant|food|dining|culinary|brunch|eat|cuisine|tasting)/.test(s)) return 'Food & Drink';
+  if (/(bar|nightlife|club|cocktail|brewery|wine|pub|lounge)/.test(s)) return 'Nightlife';
+  if (/(outdoor|park|hike|nature|trail|beach|garden|bike|run)/.test(s)) return 'Outdoors';
+  if (/(art|museum|theat|performing|culture|comedy|film|gallery|dance|exhibit)/.test(s)) return 'Arts & Culture';
+  if (/(sport|game|fitness|yoga|workout|athletic|match)/.test(s)) return 'Sports';
+  if (/(market|shopping|flea|bazaar|pop.?up)/.test(s)) return 'Markets';
+  if (/(community|fair|expo|parade|festival|meetup|workshop|class)/.test(s)) return 'Community';
+  return 'Other';
+};
+
 // Combine a YYYY-MM-DD date and optional HH:MM:SS time into the app's
 // "YYYY-MM-DD HH:MM" event-date string. Falls back to noon when time is absent.
 const toEventDate = (date, time) => {
@@ -96,6 +112,7 @@ const ticketmaster = {
         lat: venue?.location ? parseFloat(venue.location.latitude) : null,
         lng: venue?.location ? parseFloat(venue.location.longitude) : null,
         category: e.classifications?.[0]?.segment?.name || null,
+        type: normalizeType(e.classifications?.[0]?.segment?.name),
       };
     });
   },
@@ -139,6 +156,7 @@ const seatgeek = {
         lat: e.venue?.location?.lat ?? null,
         lng: e.venue?.location?.lon ?? null,
         category: e.type || null,
+        type: normalizeType(e.type),
       };
     });
   },
@@ -184,6 +202,7 @@ const predicthq = {
         lat: Array.isArray(e.location) ? e.location[1] : null,
         lng: Array.isArray(e.location) ? e.location[0] : null,
         category: e.category || null,
+        type: normalizeType(e.category),
       };
     });
   },
@@ -211,7 +230,9 @@ const googlePlaces = {
     const body = {
       textQuery: `${term || 'popular'} restaurants and bars`,
       maxResultCount: Math.min(size * 3, 20),
-      locationBias: {
+      // Hard restriction (not bias) so results stay strictly within the radius —
+      // a soft bias let a Park Slope query return New Jersey.
+      locationRestriction: {
         circle: {
           center: { latitude: lat, longitude: lng },
           radius: Math.min(Math.round(radius * 1609), 50000), // miles→meters, max 50km
@@ -247,6 +268,7 @@ const googlePlaces = {
         lat: p.location?.latitude ?? null,
         lng: p.location?.longitude ?? null,
         category: p.primaryTypeDisplayName?.text || 'place',
+        type: normalizeType(p.primaryTypeDisplayName?.text || 'restaurant'),
         rating: p.rating ?? null,
         reviewCount: p.userRatingCount ?? null,
       }));

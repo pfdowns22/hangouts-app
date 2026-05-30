@@ -32,7 +32,7 @@ import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { createPortal } from 'react-dom';
 
 import { auth, db, storage, appId, geminiApiKey } from './firebase.js';
-import { fetchRealEvents, fetchPlaces } from './events.js';
+import { fetchRealEvents } from './events.js';
 
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_URL_FOR_KEY = (key) =>
@@ -259,6 +259,17 @@ const SourceBadge = ({ source }) => {
   );
 };
 
+// The activity type (Music, Food & Drink, Outdoors, …) — also what the feed's
+// "filter by type" control filters on.
+const TypeBadge = ({ type }) => {
+  if (!type || type === 'Other') return null;
+  return (
+    <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-indigo-50 text-indigo-700 text-xs font-medium">
+      {type}
+    </span>
+  );
+};
+
 // Validate a candidate event URL. A loose `^https?://` test is NOT enough —
 // AI results frequently contain placeholders like "https://[venue website]" or
 // a bare "https://", which pass that test but produce dead links that do
@@ -453,7 +464,8 @@ const ymdLocal = (d) =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 
 // YYYY-MM-DD date window for the partner-events proxy. Today = just today;
-// otherwise tomorrow → +30 days (mirrors the AI-search timeframe split).
+// otherwise tomorrow → +14 days (kept tight so Upcoming stays specific/relevant
+// rather than vague far-future picks).
 const dateWindow = (forToday) => {
   if (forToday) {
     const t = ymdLocal(new Date());
@@ -461,18 +473,52 @@ const dateWindow = (forToday) => {
   }
   return {
     startDate: ymdLocal(new Date(Date.now() + 864e5)),
-    endDate: ymdLocal(new Date(Date.now() + 30 * 864e5)),
+    endDate: ymdLocal(new Date(Date.now() + 14 * 864e5)),
   };
 };
 
-// Merge several event lists, collapsing the same (lowercased) title on the
-// same calendar day so an event surfaced by both Gemini and a partner API
-// shows once.
+// The fixed, filterable event types. Keep in sync with normalizeType in
+// api/events.js. Used for the "filter by type" control and to constrain the
+// AI's category output.
+const EVENT_TYPES = ['Music', 'Food & Drink', 'Outdoors', 'Arts & Culture', 'Sports', 'Nightlife', 'Markets', 'Community', 'Other'];
+
+const normalizeType = (raw) => {
+  const s = (raw || '').toString().toLowerCase();
+  if (EVENT_TYPES.map((t) => t.toLowerCase()).includes(s)) return EVENT_TYPES.find((t) => t.toLowerCase() === s);
+  if (/(music|concert|gig|dj|band|jazz|hip.?hop)/.test(s)) return 'Music';
+  if (/(restaurant|food|dining|culinary|brunch|eat|cuisine|tasting)/.test(s)) return 'Food & Drink';
+  if (/(bar|nightlife|club|cocktail|brewery|wine|pub|lounge)/.test(s)) return 'Nightlife';
+  if (/(outdoor|park|hike|nature|trail|beach|garden|bike|run)/.test(s)) return 'Outdoors';
+  if (/(art|museum|theat|performing|culture|comedy|film|gallery|dance|exhibit)/.test(s)) return 'Arts & Culture';
+  if (/(sport|game|fitness|yoga|workout|athletic|match)/.test(s)) return 'Sports';
+  if (/(market|shopping|flea|bazaar|pop.?up)/.test(s)) return 'Markets';
+  if (/(community|fair|expo|parade|festival|meetup|workshop|class|craft)/.test(s)) return 'Community';
+  return 'Other';
+};
+
+// Normalize a title for de-duplication: lowercase, drop a trailing date/edition
+// (e.g. "— July 4", "2026", "Night 3"), strip punctuation, collapse whitespace.
+// This collapses a multi-night series ("Celebrate Brooklyn! · Jul 5/6/7") to a
+// single key so it can't appear several times.
+const normalizeTitle = (title) =>
+  (title || '')
+    .toLowerCase()
+    .replace(/\s*[•·]\s*.*$/, '') // bullet separator + everything after (usually the date/edition)
+    .replace(/\s+[–—|]\s+.*$/, '') // en/em dash or pipe used as a separator (spaced)
+    .replace(/\s+-\s+.*$/, '') // spaced hyphen separator (NOT internal hyphens like "pop-up")
+    .replace(/\b(night|day|part|vol\.?|edition)\s*#?\d+\b/g, '')
+    .replace(/\b(19|20)\d{2}\b/g, '') // years
+    .replace(/[^a-z0-9 ]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+// Merge several event lists, collapsing duplicates by normalized title (ignoring
+// date) so the same event/series surfaces once, even across providers and dates.
 const mergeEvents = (...lists) => {
   const seen = new Map();
   for (const ev of [].concat(...lists)) {
     if (!ev?.title) continue;
-    const key = `${ev.title.trim().toLowerCase()}|${(ev.date || '').slice(0, 10) || 'na'}`;
+    const key = normalizeTitle(ev.title) || (ev.title || '').toLowerCase();
     if (!seen.has(key)) seen.set(key, ev);
   }
   return [...seen.values()];
@@ -1683,11 +1729,12 @@ const MyFeedSection = () => {
   const [patienceIdx, setPatienceIdx] = useState(0);
   const [feedTab, setFeedTab] = useState('today'); // today | upcoming
   const [filterMode, setFilterMode] = useState('all'); // all | free | cheap | expensive | ticketed
+  const [typeFilter, setTypeFilter] = useState('all'); // all | one of EVENT_TYPES
   const [sortMode, setSortMode] = useState('feed'); // feed | dateAsc | dateDesc | priceAsc | priceDesc
   const [showFilterPanel, setShowFilterPanel] = useState(false);
   const [filterAnchorRect, setFilterAnchorRect] = useState(null);
   const filterBtnRef = useRef(null);
-  const filterActive = filterMode !== 'all' || sortMode !== 'feed';
+  const filterActive = filterMode !== 'all' || sortMode !== 'feed' || typeFilter !== 'all';
 
   const openFilterPanel = () => {
     if (filterBtnRef.current) {
@@ -1763,7 +1810,8 @@ const MyFeedSection = () => {
           return true;
       }
     };
-    const arr = feedItems.filter((it) => inTab(it) && matchesFilter(it));
+    const matchesType = (item) => typeFilter === 'all' || (item.data?.type || 'Other') === typeFilter;
+    const arr = feedItems.filter((it) => inTab(it) && matchesFilter(it) && matchesType(it));
     if (sortMode === 'feed') return arr;
     const sorted = [...arr];
     const dateOf = (it) => new Date(it.data?.date || 0).getTime() || 0;
@@ -1772,7 +1820,19 @@ const MyFeedSection = () => {
     if (sortMode === 'priceAsc') sorted.sort((a, b) => priceWeight(a.data?.priceTier) - priceWeight(b.data?.priceTier));
     if (sortMode === 'priceDesc') sorted.sort((a, b) => priceWeight(b.data?.priceTier) - priceWeight(a.data?.priceTier));
     return sorted;
-  }, [feedItems, filterMode, sortMode, feedTab]);
+  }, [feedItems, filterMode, sortMode, typeFilter, feedTab]);
+
+  // Distinct event types present in the active tab — drives the type filter
+  // chips so we only offer types that actually have results.
+  const availableTypes = useMemo(() => {
+    const inTab = (item) => {
+      const b = eventDateBucket(item);
+      return feedTab === 'today' ? b === 'today' : b === 'upcoming' || b === 'undated';
+    };
+    const set = new Set();
+    feedItems.forEach((it) => { if (inTab(it)) set.add(it.data?.type || 'Other'); });
+    return EVENT_TYPES.filter((t) => set.has(t));
+  }, [feedItems, feedTab]);
 
   // Onboarding banner appears for users who haven't set an address yet.
   const needsOnboarding =
@@ -1786,6 +1846,17 @@ const MyFeedSection = () => {
     const q = query(collection(db, `artifacts/${appId}/users/${userId}/feed`), orderBy('timestamp', 'desc'), limit(200));
     return onSnapshot(q, (snapshot) => setFeedItems(snapshot.docs.map((d) => ({ id: d.id, ...d.data() }))));
   }, [userId]);
+
+  // Auto-clear events that have already happened. Runs whenever the feed
+  // changes; self-terminating (once no past items remain, it's a no-op).
+  useEffect(() => {
+    if (!userId || !feedItems.length) return;
+    const stale = feedItems.filter((it) => eventDateBucket(it) === 'past');
+    if (!stale.length) return;
+    const batch = writeBatch(db);
+    stale.slice(0, 400).forEach((it) => batch.delete(doc(db, `artifacts/${appId}/users/${userId}/feed/${it.id}`)));
+    batch.commit().catch((e) => console.warn('Past-event prune failed:', e));
+  }, [feedItems, userId]);
 
   // Cycle patience messages while a generation is in-flight so the user
   // sees forward motion instead of a static spinner.
@@ -1806,7 +1877,7 @@ const MyFeedSection = () => {
   useEffect(() => {
     if (feedRefreshTick === 0 || !userId || !userProfile) return;
     scopeRef.current = 0;
-    generateAll();
+    generateForActiveTab();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [feedRefreshTick]);
 
@@ -1896,6 +1967,11 @@ HARD RULE: of 5 returned events, at least 2 MUST be tagged locationSource="home"
         locationBlock = `User's home base is ${home}. Scope tier: ${scope.label}. Suggest events within ~${scope.radius} of home. Tag each event's "locationSource" as "home".`;
       }
       const prefs = userProfile?.preferences?.join(', ') || 'general fun';
+      const prefDetails = userProfile?.preferenceDetails || {};
+      const detailLines = Object.entries(prefDetails)
+        .filter(([, arr]) => Array.isArray(arr) && arr.length)
+        .map(([k, arr]) => `  • ${k}: ${arr.join(', ')}`)
+        .join('\n');
       // Some suggestions should reflect what the user's groups enjoy together.
       // Only computed on a full refresh (not on every scroll fetch) to keep
       // infinite scroll snappy and the Firestore reads bounded.
@@ -1920,55 +1996,50 @@ HARD RULE: of 5 returned events, at least 2 MUST be tagged locationSource="home"
       const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toDateString();
 
       const timeframePrompt = forToday
-        ? `events happening strictly TODAY, ${today}, or tonight.`
-        : `upcoming events happening BETWEEN ${tomorrow} AND 30 days from today. STRICTLY EXCLUDE anything happening today (${today}) or in the past.`;
+        ? `happening strictly TODAY (${today}) or tonight.`
+        : `happening between tomorrow and ~14 days out. STRICTLY EXCLUDE today (${today}) and the past.`;
 
-      // Pull existing titles from the visible feed so Gemini doesn't
-      // repeat what the user has already seen.
-      const seenTitles = feedItems
-        .map((i) => i.data?.title)
-        .filter(Boolean)
-        .slice(0, 80);
+      // Unique titles already in the feed (any tab), so we can tell the AI what
+      // NOT to repeat. The real guard is the client-side write-time dedupe below.
+      const seenTitles = [...new Set(feedItems.map((i) => i.data?.title).filter(Boolean))];
+      const seenList = seenTitles.slice(0, 100).join(' | ');
 
-      const prompt = `Today is ${today}. Find 5 ACTUAL, REAL-WORLD events, pop-ups, festivals, or highly-rated specific venue activities ${timeframePrompt}
+      const prompt = `Today is ${today}. Find 5 hyper-local, PERSONALLY-TAILORED things for ONE person to do, ${timeframePrompt}
 
-LOCATION CONTEXT (read carefully — this controls where events come from):
+WHO THIS IS FOR — tailor every single pick to THIS person:
+- Interests: ${prefs}
+${detailLines ? `- Specific tastes:\n${detailLines}` : ''}
+${groupInterests.length ? `- Their friend groups enjoy together: ${groupInterests.join(', ')} — make 1 pick a great fit for these shared interests.` : ''}
+- Family: ${kidsText}
+
+LOCATION — HARD CONSTRAINT:
 ${locationBlock}
+- Suggest ONLY things in this neighborhood and immediately adjacent areas within ~${scope.radius}. NEVER suggest another state, a far-away borough, or a different city. If you can't find enough truly local options, return FEWER — do not reach far.
 
-OTHER CONSTRAINTS:
-- Family situation: ${kidsText}
-- Interests/preferences: ${prefs}
-${groupInterests.length ? `- SHARED GROUP INTERESTS — things the user's friend groups enjoy together: ${groupInterests.join(', ')}. Make 1-2 of the suggestions a great fit for these shared interests (so the user finds things to do WITH their groups); the remaining suggestions should follow the personal interests above.` : ''}
+WHAT TO FIND (specific & niche beats generic):
+- For EACH interest above, hunt for a CONCRETE real happening that matches it — INCLUDING small, recurring, niche things: a bar's weekly craft/knit night, a run club, a board-game or trivia night, an open mic, a maker workshop, a neighborhood pop-up. These niche interest-matches are MORE valuable than big generic events.
+- FOOD & DRINK rule: do NOT recommend a restaurant just for being good or popular. Only include a food/drink spot if EITHER (a) it newly opened and matches their tastes above, OR (b) it's hosting something special on a specific day (trivia, live music, tasting, themed night) — say what and when. Otherwise skip food.
+- Favor things that fit their preferred days/times below.
+
+AVAILABILITY:
 - Recurring weekly availability (day=times-of-day): ${weeklyStr}
-- Preferred times of day (overall): ${todsPrefs}
-- Preferred days of week (overall): ${dowPrefs}
-- Specific dates the user is free (and the times-of-day they're free that day): ${datesWithSlots || '(none marked — fall back to the recurring weekly availability above)'}
-- HARD RULE: if the user has specific dates above, every suggested event date+time MUST fall on one of those dates AND match one of the listed times-of-day for that date (morning=before 12:00, afternoon=12:00–17:00, evening=17:00+).
+- Preferred times of day: ${todsPrefs}; preferred days: ${dowPrefs}
+- Specific free dates (date → times-of-day): ${datesWithSlots || '(none — use the weekly availability)'}
+- If specific dates exist, every pick's date+time MUST fall on one of them and match a listed time-of-day (morning<12:00, afternoon 12:00–17:00, evening 17:00+).
 
-DEDUPLICATION:
-- The user has already seen these events — do NOT return any of them again: ${seenTitles.length ? seenTitles.join(' | ') : '(none yet)'}
-- If an event is RECURRING (e.g. a weekly market like Smorgasburg, a weekly concert series, a monthly run club), return it ONCE with a description that mentions the recurrence pattern ("every Sunday 11am–6pm"), NOT a separate entry for each occurrence.
-- Each event in your response must be distinct from the others — no near-duplicates of the same venue or series.
+DO NOT REPEAT — these were already shown; return NONE of them and no near-duplicates or other nights of the same series:
+${seenList || '(none yet)'}
+- If something recurs, return it ONCE noting the pattern (e.g. "every Thursday 7pm"), never multiple nights.
 
-SOURCES (PREFER quality editorial / curated picks over generic listings):
-- Mine event coverage from publications like Time Out (timeout.com), The New Yorker (newyorker.com/goings-on, /culture), Brooklyn Magazine (bkmag.com), The Skint (theskint.com), Eater (eater.com), Brokelyn, Curbed, the local NYT culture section, and similar editorial outlets.
-- Avoid generic Eventbrite / Meetup / Facebook event listings unless the event is also covered by editorial sources.
-- Prefer events with a sense of place or a distinctive angle (rooftop concert, neighborhood-specific pop-up, artist talk, secret jam) over generic categories ("yoga class", "trivia night") unless they are exceptional.
+ACCURACY:
+- Only real, verifiable things (web search). No made-up events. Dates must fall in the timeframe above.
+- url: the OFFICIAL event/venue page only if you're confident it's correct; otherwise null (the app will search). Never guess a URL.
+- imageUrl: a real reachable public image URL, else null. imageKeywords: 3-6 visual scene words.
+- locationSource: "home" or "current" per the LOCATION CONTEXT.
+- type: classify each pick as EXACTLY ONE of: ${EVENT_TYPES.join(', ')}.
+- priceTier: one of "Free","$","$$","$$$","$$$$" or null. isTicketed: true/false. ticketsUrl: direct ticket URL if ticketed, else null.
 
-IMAGE & URL:
-- Do NOT make up events. Only suggest real events you can verify via web search.
-- Ensure event dates fall within the timeframe above (no past, no today if "Upcoming").
-- For each event, include the OFFICIAL event/venue URL (no aggregator links if avoidable).
-- For imageUrl, find a real public image URL (jpg/png/webp) from the event's official website, venue site, or a major publication — verify the URL is reachable. If you can't find one, set imageUrl to null.
-- For imageKeywords, provide 3-6 specific visual words describing what an image of this event would look like. Not the event name — actual visual scene keywords.
-- For locationSource, return either "home" or "current" matching the LOCATION CONTEXT above so the UI can label which anchor the event came from.
-
-PRICING & TICKETS:
-- For priceTier, return one of "Free", "$", "$$", "$$$", "$$$$" based on the typical entry/ticket cost ($=under $20, $$=$20-$50, $$$=$50-$100, $$$$=$100+). If you genuinely can't determine pricing, return null.
-- For isTicketed, return true if a paid ticket is required to attend (concert, show, sports), false for free/walk-in events (markets, walks, open events). Use false if unsure.
-- For ticketsUrl: if isTicketed=true, return the DIRECT ticket purchase URL — Ticketmaster, AXS, SeatGeek, Eventbrite, or the venue's official ticketing page. If isTicketed=false or you can't find a direct ticket link, return null.
-
-Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords, locationSource, priceTier, isTicketed, ticketsUrl.`;
+Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords, locationSource, type, priceTier, isTicketed, ticketsUrl.`;
 
       // Source A — existing Gemini grounded web search (behavior unchanged).
       let aiError = null;
@@ -1982,7 +2053,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
         }
         try {
           const text = await callAI({ prompt, useWebSearch: true, provider });
-          return (extractJsonArray(text) || []).map((e) => ({ ...e, source: e.source || 'ai' }));
+          return (extractJsonArray(text) || []).map((e) => ({ ...e, source: e.source || 'ai', type: normalizeType(e.type || e.category) }));
         } catch (err) {
           aiError = err;
           console.warn('AI-search source failed:', err);
@@ -2009,49 +2080,17 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
         return rankAndPersonalizeEvents({ events: raw, contextText: ctx, provider, max: 6 });
       })();
 
-      // Source C — Google Places tied to the user's free slots. Only on the
-      // Upcoming full-refresh pass (not Today, not scroll) so it runs once per
-      // "Generate Ideas", and only when they have food/drink tastes + free time.
-      const placesSearch = (async () => {
-        if (forToday || fromScroll) return [];
-        const details = userProfile?.preferenceDetails || {};
-        const foodDrink = [...(details.food || []), ...(details.drinks || [])];
-        if (!foodDrink.length) return [];
-        // Upcoming dates the user marked free; fall back to the next Fri/Sat.
-        const slots = userProfile?.availabilitySlots || {};
-        const todayStr = ymdLocal(new Date());
-        let freeDates = Object.keys(slots).filter((d) => d >= todayStr).sort();
-        if (!freeDates.length) {
-          for (let i = 1; i <= 14 && freeDates.length < 2; i++) {
-            const day = new Date(Date.now() + i * 864e5);
-            if (day.getDay() === 5 || day.getDay() === 6) freeDates.push(ymdLocal(day));
-          }
-        }
-        if (!freeDates.length) return [];
-        const useCurrent = locPref !== 'home' && userProfile?.currentLocation?.lat != null;
-        const raw = await fetchPlaces({
-          lat: useCurrent ? userProfile.currentLocation.lat : undefined,
-          lng: useCurrent ? userProfile.currentLocation.lng : undefined,
-          location: useCurrent ? undefined : home,
-          radius: scope.radiusMiles,
-          term: foodDrink.slice(0, 5).join(', '),
-          categories: 'restaurants,bars',
-          size: 8,
-        });
-        // Keep a couple they haven't seen, and pin each to a free date (evening).
-        return raw
-          .filter((p) => p.title && !seenTitles.includes(p.title))
-          .slice(0, 2)
-          .map((p, i) => ({ ...p, date: `${freeDates[i % freeDates.length]} 19:00` }));
-      })();
-
-      // Run all sources in parallel and merge (a failure in one never blocks
-      // the others; partner/place items de-dupe against AI-found ones).
-      const [aEvents, bEvents, cPlaces] = await Promise.all([aiSearch, partnerSearch, placesSearch]);
-      const suggestions = mergeEvents(aEvents, bEvents, cPlaces);
+      // Run both sources in parallel and merge + de-dupe by normalized title.
+      const [aEvents, bEvents] = await Promise.all([aiSearch, partnerSearch]);
+      let suggestions = mergeEvents(aEvents, bEvents);
+      // Hard de-dupe against what's ALREADY in the feed (both tabs) — never trust
+      // the AI to fully obey the "already shown" list. This is what stops the
+      // same event reappearing across presses.
+      const seenKeys = new Set(feedItems.map((i) => normalizeTitle(i.data?.title)).filter(Boolean));
+      suggestions = suggestions.filter((s) => !seenKeys.has(normalizeTitle(s.title)));
       if (!suggestions.length) {
         throw new Error(
-          aiError ? `AI search failed — ${aiError.message}` : 'No events found. Try again, or add a partner-events key.'
+          aiError ? `AI search failed — ${aiError.message}` : 'No new ideas right now — try again later or widen your interests.'
         );
       }
       const batch = writeBatch(db);
@@ -2083,15 +2122,14 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
     }
   };
 
-  // Single entry point for the "Generate Ideas" button (and the profile-save
-  // refresh): populate BOTH tabs — today and upcoming — in one action.
-  // Re-entrancy is guarded so it can't overlap a scroll-triggered fetch.
-  const generateAll = async () => {
+  // Generate for the ACTIVE tab only (Today vs Upcoming) — one timeframe per
+  // press, which halves AI calls vs. doing both. Re-entrancy guarded so it
+  // can't overlap a scroll-triggered fetch.
+  const generateForActiveTab = async () => {
     if (generatingRef.current) return;
     generatingRef.current = true;
     try {
-      await generatePersonalSuggestions(true); // Today
-      await generatePersonalSuggestions(false); // Upcoming
+      await generatePersonalSuggestions(feedTab === 'today');
     } finally {
       generatingRef.current = false;
     }
@@ -2123,9 +2161,9 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
           )}
         </div>
         <div className="flex gap-2 w-full md:w-auto">
-          <button onClick={generateAll} disabled={isGenerating !== false} className="flex-1 md:flex-none flex items-center justify-center gap-2 px-5 py-2 bg-gradient-to-r from-indigo-500 to-purple-600 text-white rounded-lg shadow-md hover:shadow-lg transition disabled:opacity-50 font-bold">
+          <button onClick={generateForActiveTab} disabled={isGenerating !== false} className="flex-1 md:flex-none flex items-center justify-center gap-2 px-5 py-2 bg-gradient-to-r from-indigo-500 to-purple-600 text-white rounded-lg shadow-md hover:shadow-lg transition disabled:opacity-50 font-bold">
             {isGenerating !== false ? <SearchIcon className="w-4 h-4 animate-spin" /> : <SparklesIcon className="w-4 h-4" />}
-            {isGenerating !== false ? 'Generating…' : 'Generate Ideas'}
+            {isGenerating !== false ? 'Generating…' : feedTab === 'today' ? "Find today's ideas" : 'Find upcoming ideas'}
           </button>
         </div>
       </div>
@@ -2250,6 +2288,28 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
                 </div>
               </section>
 
+              {availableTypes.length > 0 && (
+                <section>
+                  <h4 className="text-xs font-bold uppercase text-gray-500 mb-2">Type of activity</h4>
+                  <div className="flex flex-wrap gap-2">
+                    {['all', ...availableTypes].map((t) => {
+                      const on = typeFilter === t;
+                      return (
+                        <button
+                          key={t}
+                          onClick={() => setTypeFilter(t)}
+                          className={`px-3.5 py-1.5 rounded-full text-sm font-semibold border transition ${
+                            on ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-700 border-gray-200 hover:border-indigo-300'
+                          }`}
+                        >
+                          {t === 'all' ? 'All types' : t}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </section>
+              )}
+
               <section>
                 <h4 className="text-xs font-bold uppercase text-gray-500 mb-2">Sort by</h4>
                 <div className="space-y-1.5">
@@ -2283,7 +2343,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
 
               <div className="flex gap-2 pt-2 border-t border-gray-100">
                 <button
-                  onClick={() => { setFilterMode('all'); setSortMode('feed'); }}
+                  onClick={() => { setFilterMode('all'); setSortMode('feed'); setTypeFilter('all'); }}
                   disabled={!filterActive}
                   className="flex-1 py-2.5 rounded-xl text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 disabled:opacity-50 transition"
                 >
@@ -2408,8 +2468,9 @@ const FeedCard = ({ item, onDelete }) => {
             <span className="flex items-center gap-1">
               <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-4 h-4" /> {data.location}
             </span>
-            {(data.priceTier || data.isTicketed || SOURCE_LABELS[data.source]) && (
+            {(data.priceTier || data.isTicketed || SOURCE_LABELS[data.source] || (data.type && data.type !== 'Other')) && (
               <span className="flex items-center gap-2 flex-wrap">
+                <TypeBadge type={data.type} />
                 <PriceTierBadge tier={data.priceTier} />
                 <TicketedBadge isTicketed={data.isTicketed} />
                 <SourceBadge source={data.source} />
@@ -2419,7 +2480,7 @@ const FeedCard = ({ item, onDelete }) => {
         </div>
       </div>
 
-      <div className="mt-5 flex gap-3 border-t border-gray-100 pt-4 items-stretch">
+      <div className="mt-5 flex flex-wrap gap-2 border-t border-gray-100 pt-4 items-stretch">
         <a
           href={moreInfoUrl(data)}
           target="_blank"
@@ -2736,6 +2797,7 @@ const ProposalCard = ({ proposal, groupId }) => {
               <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-3 h-3" /> {proposal.location}
             </span>
           )}
+          <TypeBadge type={proposal.type} />
           <PriceTierBadge tier={proposal.priceTier} />
           <TicketedBadge isTicketed={proposal.isTicketed} />
           <SourceBadge source={proposal.source} />
@@ -3015,7 +3077,9 @@ SOURCES (PREFER quality editorial / curated picks over generic listings):
 - Avoid generic Eventbrite / Meetup / Facebook listings unless the event is also covered by editorial sources.
 - Prefer events with a distinctive angle (rooftop concert, neighborhood-specific pop-up, artist talk) over generic categories.
 
-Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords, priceTier, isTicketed, ticketsUrl.`;
+Also classify each as "type": EXACTLY ONE of ${EVENT_TYPES.join(', ')}.
+
+Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords, type, priceTier, isTicketed, ticketsUrl.`;
 
       const provider = userProfile?.aiProvider || 'gemini';
 
@@ -3031,7 +3095,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
         }
         try {
           const text = await callAI({ prompt, useWebSearch: true, provider });
-          return (extractJsonArray(text) || []).map((e) => ({ ...e, source: e.source || 'ai' }));
+          return (extractJsonArray(text) || []).map((e) => ({ ...e, source: e.source || 'ai', type: normalizeType(e.type || e.category) }));
         } catch (err) {
           aiError = err;
           console.warn('AI-search source failed:', err);
@@ -3201,8 +3265,9 @@ const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage 
         <p className="flex items-center gap-1">
           <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-3 h-3" /> {idea.location}
         </p>
-        {(idea.priceTier || idea.isTicketed || SOURCE_LABELS[idea.source]) && (
+        {(idea.priceTier || idea.isTicketed || SOURCE_LABELS[idea.source] || (idea.type && idea.type !== 'Other')) && (
           <div className="flex items-center gap-2 pt-1 flex-wrap">
+            <TypeBadge type={idea.type} />
             <PriceTierBadge tier={idea.priceTier} />
             <TicketedBadge isTicketed={idea.isTicketed} />
             <SourceBadge source={idea.source} />
@@ -4167,6 +4232,7 @@ const SendToGroupModal = ({ event, anchorRect, onClose }) => {
         isTicketed: typeof event?.isTicketed === 'boolean' ? event.isTicketed : false,
         ticketsUrl: event?.ticketsUrl || null,
         source: event?.source || null,
+        type: event?.type || null,
       };
       const proposerName = userProfile?.name || 'User';
 
@@ -4657,7 +4723,7 @@ export default function App() {
         {!userId ? (
           <AuthScreen />
         ) : (
-        <div className="min-h-screen bg-[#F3F4F6] text-gray-900 font-sans p-4 md:p-8">
+        <div className="min-h-screen bg-[#F3F4F6] text-gray-900 font-sans p-4 md:p-8 overflow-x-hidden">
           <Header />
           {msg && (
             <div className={`fixed top-6 right-6 px-6 py-3 rounded-xl shadow-2xl text-white font-bold z-[100] animate-fade-in ${msg.type === 'error' ? 'bg-red-500' : 'bg-emerald-500'}`}>
