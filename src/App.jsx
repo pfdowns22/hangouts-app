@@ -21,6 +21,7 @@ import {
   arrayRemove,
   deleteDoc,
   writeBatch,
+  runTransaction,
   serverTimestamp,
   Timestamp,
   orderBy,
@@ -179,6 +180,35 @@ const callAI = async ({ prompt, useWebSearch = false, provider = 'gemini' }) => 
   throw new Error(`Unknown AI provider: ${provider}`);
 };
 
+// --- Free-tier grounding budget ---------------------------------------
+// Google gives 1,500 free Google-Search-grounded prompts per day even with
+// billing enabled; beyond that it's $35/1,000. To keep the shared key always
+// within the free allowance, we meter grounded searches against a per-day
+// counter in Firestore and stop calling Gemini once the cap is reached — the
+// feed then leans entirely on the partner-event APIs (Ticketmaster/PredictHQ),
+// which don't consume Gemini quota.
+const GROUNDING_DAILY_CAP = 1400; // margin under Google's 1,500/day free limit
+
+// Atomically reserve one grounded search for today. Returns true if allowed
+// (and records the use), false once the daily cap is hit. Fails OPEN on any
+// metering error so a Firestore hiccup never breaks event discovery.
+const reserveGroundedSearch = async () => {
+  try {
+    const day = new Date().toISOString().slice(0, 10);
+    const ref = doc(db, `artifacts/${appId}/public/data/meta`, `grounding-${day}`);
+    return await runTransaction(db, async (tx) => {
+      const snap = await tx.get(ref);
+      const count = snap.exists() ? snap.data().count || 0 : 0;
+      if (count >= GROUNDING_DAILY_CAP) return false;
+      tx.set(ref, { count: count + 1, day }, { merge: true });
+      return true;
+    });
+  } catch (e) {
+    console.warn('Grounding budget check failed; allowing the call.', e);
+    return true;
+  }
+};
+
 // Small inline pills shown on every event card: pricing tier ($-$$$$) and
 // a ticketed indicator. Both render only when the field is populated, so
 // older feed items without these fields stay quiet.
@@ -228,27 +258,46 @@ const SourceBadge = ({ source }) => {
   );
 };
 
-// Build a More Info URL. If Gemini gave us a direct event URL, use it.
-// Otherwise fall back to a Google search for the event's title + location
-// — at least the user always lands somewhere useful.
-const moreInfoUrl = (event) => {
-  const direct = (event?.url || '').trim();
-  if (direct && /^https?:\/\//i.test(direct)) return direct;
-  const q = [event?.title, event?.location].filter(Boolean).join(' ');
-  return `https://www.google.com/search?q=${encodeURIComponent(q || 'events')}`;
+// Validate a candidate event URL. A loose `^https?://` test is NOT enough —
+// AI results frequently contain placeholders like "https://[venue website]" or
+// a bare "https://", which pass that test but produce dead links that do
+// nothing when clicked. Require a parseable URL with a real host (a dot, no
+// spaces/brackets). Returns the normalized href, or null.
+const validHttpUrl = (str) => {
+  const s = (str || '').trim();
+  if (!s || /[\s\[\]<>]/.test(s)) return null;
+  try {
+    const u = new URL(s);
+    if ((u.protocol === 'http:' || u.protocol === 'https:') && u.hostname.includes('.')) return u.href;
+  } catch {
+    /* not a valid URL */
+  }
+  return null;
 };
 
+// A Google search built from everything on the listing card (title, location,
+// date) so even without a direct link the user lands on accurate, specific
+// results for that exact event.
+const searchUrl = (event, extra = '') => {
+  const q = [extra, event?.title, event?.location, event?.date ? String(event.date).slice(0, 10) : '']
+    .filter(Boolean)
+    .join(' ');
+  return `https://www.google.com/search?q=${encodeURIComponent(q || 'local events')}`;
+};
+
+// "More Info" target: the event's own URL when it's genuinely valid, otherwise
+// a rich Google search of the card's details.
+const moreInfoUrl = (event) => validHttpUrl(event?.url) || searchUrl(event);
+
 // Tickets action for an event card. Returns null for non-ticketed events.
-// Uses the direct purchase URL when a source provides one (Ticketmaster, some
-// AI results); otherwise falls back to a ticket web search so ticketed events
-// from sources without a link (e.g. PredictHQ) are still actionable rather
-// than showing no button at all.
+// Uses the direct purchase URL only when it's a valid link; otherwise falls
+// back to a ticket search so ticketed events are always actionable and never
+// dead-end on a placeholder URL.
 const ticketAction = (event) => {
   if (!event?.isTicketed) return null;
-  const direct = (event?.ticketsUrl || '').trim();
-  if (direct && /^https?:\/\//i.test(direct)) return { href: direct, label: '🎟️ Buy Tickets' };
-  const q = ['tickets', event?.title, event?.location].filter(Boolean).join(' ');
-  return { href: `https://www.google.com/search?q=${encodeURIComponent(q)}`, label: '🎟️ Find Tickets' };
+  const direct = validHttpUrl(event?.ticketsUrl);
+  if (direct) return { href: direct, label: '🎟️ Buy Tickets' };
+  return { href: searchUrl(event, 'tickets'), label: '🎟️ Find Tickets' };
 };
 
 // Image fallback chain when Gemini's imageUrl is null or 404s.
@@ -1826,6 +1875,13 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
       // Source A — existing Gemini grounded web search (behavior unchanged).
       let aiError = null;
       const aiSearch = (async () => {
+        // Stay within the shared key's free grounding budget; once the daily
+        // cap is hit, skip AI search and let the partner APIs carry the feed.
+        // BYO providers use the user's own quota, so they aren't metered.
+        if (provider === 'gemini' && !(await reserveGroundedSearch())) {
+          console.info('Daily free grounding cap reached — using partner events only.');
+          return [];
+        }
         try {
           const text = await callAI({ prompt, useWebSearch: true, provider });
           return (extractJsonArray(text) || []).map((e) => ({ ...e, source: e.source || 'ai' }));
@@ -2832,6 +2888,13 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
       // Source A — existing Gemini grounded web search (behavior unchanged).
       let aiError = null;
       const aiSearch = (async () => {
+        // Stay within the shared key's free grounding budget; once the daily
+        // cap is hit, skip AI search and let the partner APIs carry the feed.
+        // BYO providers use the user's own quota, so they aren't metered.
+        if (provider === 'gemini' && !(await reserveGroundedSearch())) {
+          console.info('Daily free grounding cap reached — using partner events only.');
+          return [];
+        }
         try {
           const text = await callAI({ prompt, useWebSearch: true, provider });
           return (extractJsonArray(text) || []).map((e) => ({ ...e, source: e.source || 'ai' }));
