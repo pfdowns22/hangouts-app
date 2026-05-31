@@ -52,6 +52,13 @@ Partner-API events are then ranked and given friendly blurbs by Gemini (factual 
 
 **Adding a new source** (e.g. restaurants via Yelp Fusion or Google Places): add one provider object to the `PROVIDERS` array in [api/events.js](api/events.js) (map its response to the normalized shape) and one env key — nothing else in the app changes.
 
+## Monetization
+- **Affiliate / referral:** outbound partner links (tickets, etc.) are wrapped via `affiliateUrl()` in [src/App.jsx](src/App.jsx) using `VITE_AFFILIATE_*` env values. Inert until you enroll in a program (Ticketmaster via Impact/Partnerize; Viator/GetYourGuide) and set the id in Vercel. No user data is sold.
+- **Sponsored events:** add documents to the `artifacts/<appId>/public/data/sponsored` Firestore collection (via the Firebase Console). Fields: `title, description, location, url, imageUrl, type, sponsorName, activeFrom, activeTo`, optional `targetBorough`. Active, area-matched items show atop the feed labeled "Sponsored"; aggregate `impressions`/`clicks` are tracked on the doc (no personal data).
+
+## Group chat
+Real-time per-group chat (Firestore) with reactions, image sharing, edit/delete of your own messages, typing indicators, and per-group unread badges. "💡 Ideas from this chat" reads recent messages and suggests matching local things to do.
+
 ## Deploying
 The repo is set up for **Vercel** (zero-config). Push to GitHub, import the repo at [vercel.com/new](https://vercel.com/new), and add the env vars from `.env.example` in the project settings (including any partner-event keys above). Vercel auto-builds on every push, and serves `/api/events` as a serverless function automatically.
 

@@ -9,6 +9,11 @@ end-user setup, deploy, and known-issues notes.
   is NYC-only (gated by `nycBorough()` in src/App.jsx). Add equivalent civic
   open-data event feeds for other major cities (Chicago, LA, SF, etc.) and route
   by the user's city/region the same way.
+- **Live booking integrations.** Chat-aware recs surface golf courses / venues
+  but not live tee-time or table booking — add partner/paid APIs (GolfNow,
+  OpenTable/Resy) for in-app booking later.
+- **Chat push notifications.** Chat is real-time in-app; add FCM + a service
+  worker for background push.
 
 ## Stack
 - **Vite + React 18** (plain `.jsx`, no TypeScript despite the original `.tsx` naming)

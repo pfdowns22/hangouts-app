@@ -10,6 +10,7 @@ import {
 import {
   doc,
   getDoc,
+  getDocs,
   setDoc,
   updateDoc,
   onSnapshot,
@@ -22,6 +23,7 @@ import {
   deleteDoc,
   writeBatch,
   runTransaction,
+  increment,
   serverTimestamp,
   Timestamp,
   orderBy,
@@ -283,6 +285,40 @@ const TypeBadge = ({ type }) => {
   );
 };
 
+// Clear "Sponsored" label for paid placements (disclosure).
+const SponsoredBadge = () => (
+  <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-amber-100 text-amber-800 text-[11px] font-bold uppercase tracking-wide">
+    Sponsored
+  </span>
+);
+
+// A single paid placement shown atop the feed, clearly labeled. The whole card
+// is the affiliate-wrapped outbound link; clicks are counted by the caller.
+const SponsoredCard = ({ item, onClick }) => {
+  const img = useEventImage(item);
+  return (
+    <a
+      href={affiliateUrl(item.url || '#')}
+      target="_blank"
+      rel="noopener noreferrer sponsored"
+      onClick={onClick}
+      className="block bg-white rounded-2xl border border-amber-200 shadow-sm overflow-hidden hover:shadow-md transition"
+    >
+      <div className="flex gap-3 p-3 items-center">
+        {img && <img src={img} alt={item.title} className="w-20 h-20 rounded-xl object-cover flex-shrink-0" />}
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 mb-1">
+            <SponsoredBadge />
+            {item.sponsorName && <span className="text-xs text-gray-400 truncate">{item.sponsorName}</span>}
+          </div>
+          <h3 className="font-bold text-gray-800 truncate">{item.title}</h3>
+          <p className="text-sm text-gray-500 line-clamp-2">{item.description}</p>
+        </div>
+      </div>
+    </a>
+  );
+};
+
 // Validate a candidate event URL. A loose `^https?://` test is NOT enough —
 // AI results frequently contain placeholders like "https://[venue website]" or
 // a bare "https://", which pass that test but produce dead links that do
@@ -317,24 +353,56 @@ const searchUrl = (event, extra = '') => {
 // surfaces the actual event listing rather than a no-info landing page.
 const TRUSTED_URL_SOURCES = new Set(['ticketmaster', 'seatgeek', 'google']);
 
+// --- Affiliate link wrapping (monetization) ---------------------------
+// When an outbound link goes to a partner we're enrolled with, wrap it with our
+// affiliate tracking so we earn referral commission on what users already do.
+// Each env value is EITHER a deeplink template containing "{url}" (e.g.
+// Partnerize/Impact: "https://prf.hn/click/camref:XXX/destination:{url}") OR a
+// "key=value" query param to append. Empty/unset → URL returned unchanged, so
+// this is completely inert until you enroll and set the id in Vercel.
+const wrapAffiliate = (rawUrl, tmpl) => {
+  const u = (rawUrl || '').trim();
+  if (!u || !tmpl) return u;
+  if (tmpl.includes('{url}')) return tmpl.replace('{url}', encodeURIComponent(u));
+  try {
+    const url = new URL(u);
+    const eq = tmpl.indexOf('=');
+    if (eq > 0) url.searchParams.set(tmpl.slice(0, eq), tmpl.slice(eq + 1));
+    return url.toString();
+  } catch {
+    return u;
+  }
+};
+const affiliateUrl = (rawUrl) => {
+  let host = '';
+  try {
+    host = new URL(rawUrl).hostname.replace(/^www\./, '');
+  } catch {
+    return rawUrl;
+  }
+  if (/(^|\.)ticketmaster\.com$|(^|\.)livenation\.com$/.test(host)) return wrapAffiliate(rawUrl, import.meta.env.VITE_AFFILIATE_TICKETMASTER || '');
+  if (/(^|\.)viator\.com$|(^|\.)getyourguide\.com$/.test(host)) return wrapAffiliate(rawUrl, import.meta.env.VITE_AFFILIATE_VIATOR || '');
+  return rawUrl;
+};
+
 // "More Info" target: the event's own URL only when it comes from a trusted
-// source and is valid; otherwise a rich search of the card's details.
+// source and is valid (affiliate-wrapped); otherwise a rich search of the card.
 const moreInfoUrl = (event) => {
   if (TRUSTED_URL_SOURCES.has(event?.source)) {
     const direct = validHttpUrl(event?.url);
-    if (direct) return direct;
+    if (direct) return affiliateUrl(direct);
   }
   return searchUrl(event);
 };
 
 // Tickets action for an event card. Returns null for non-ticketed events.
-// Direct purchase link only from a trusted source; otherwise a ticket search,
-// so ticketed events are always actionable and never dead-end on a bad URL.
+// Direct purchase link only from a trusted source (affiliate-wrapped);
+// otherwise a ticket search, so ticketed events are always actionable.
 const ticketAction = (event) => {
   if (!event?.isTicketed) return null;
   if (TRUSTED_URL_SOURCES.has(event?.source)) {
     const direct = validHttpUrl(event?.ticketsUrl);
-    if (direct) return { href: direct, label: '🎟️ Buy Tickets' };
+    if (direct) return { href: affiliateUrl(direct), label: '🎟️ Buy Tickets' };
   }
   return { href: searchUrl(event, 'tickets'), label: '🎟️ Find Tickets' };
 };
@@ -615,6 +683,35 @@ const gatherGroupInterests = async (profile) => {
       .map(([k]) => k)
       .slice(0, 8);
   } catch {
+    return [];
+  }
+};
+
+// Read a group's recent chat and ask the AI for 2-4 concrete things the group
+// seems to want to do together (activities/places/outings) — used to seed
+// chat-aware suggestions. Returns short phrases (e.g. ["golf","sushi dinner"]).
+const extractChatTopics = async (groupId, provider = 'gemini') => {
+  try {
+    const q = query(
+      collection(db, `artifacts/${appId}/public/data/groups/${groupId}/messages`),
+      orderBy('timestamp', 'desc'),
+      limit(30)
+    );
+    const snap = await getDocs(q);
+    const transcript = snap.docs
+      .map((d) => d.data())
+      .reverse()
+      .map((m) => `${m.senderName || '?'}: ${m.text || ''}`)
+      .filter((l) => l.trim())
+      .join('\n')
+      .slice(0, 4000);
+    if (!transcript.trim()) return [];
+    const prompt = `From this group chat, list 2-4 concrete things the group seems interested in doing together (activities, places, outings). Ignore greetings and logistics. Short phrases only.\n\nCHAT:\n${transcript}\n\nReturn ONLY a JSON array of short strings.`;
+    const text = await callAI({ prompt, useWebSearch: false, provider });
+    const arr = extractJsonArray(text);
+    return Array.isArray(arr) ? arr.filter((x) => typeof x === 'string' && x.trim()).slice(0, 4) : [];
+  } catch (e) {
+    console.warn('extractChatTopics failed:', e);
     return [];
   }
 };
@@ -1743,6 +1840,8 @@ const MyFeedSection = () => {
   const [feedTab, setFeedTab] = useState('today'); // today | upcoming
   const [filterMode, setFilterMode] = useState('all'); // all | free | cheap | expensive | ticketed
   const [typeFilter, setTypeFilter] = useState('all'); // all | one of EVENT_TYPES
+  const [sponsored, setSponsored] = useState(null); // one active sponsored placement, if any
+  const sponsoredSeenRef = useRef(null); // guards one impression count per placement
   const [sortMode, setSortMode] = useState('feed'); // feed | dateAsc | dateDesc | priceAsc | priceDesc
   const [showFilterPanel, setShowFilterPanel] = useState(false);
   const [filterAnchorRect, setFilterAnchorRect] = useState(null);
@@ -1870,6 +1969,40 @@ const MyFeedSection = () => {
     stale.slice(0, 400).forEach((it) => batch.delete(doc(db, `artifacts/${appId}/users/${userId}/feed/${it.id}`)));
     batch.commit().catch((e) => console.warn('Past-event prune failed:', e));
   }, [feedItems, userId]);
+
+  // Sponsored placement: pick one active, area/type-matched paid item to show
+  // atop the feed. Counts one impression per distinct placement shown.
+  useEffect(() => {
+    if (!userId) return;
+    const borough = nycBorough(userProfile?.address) || '';
+    const unsub = onSnapshot(collection(db, `artifacts/${appId}/public/data/sponsored`), (snap) => {
+      const now = Date.now();
+      const ms = (v) => (v?.toMillis ? v.toMillis() : v ? new Date(v).getTime() : null);
+      const active = snap.docs
+        .map((d) => ({ id: d.id, ...d.data() }))
+        .filter((s) => {
+          const from = ms(s.activeFrom);
+          const to = ms(s.activeTo);
+          if (from && now < from) return false;
+          if (to && now > to) return false;
+          if (s.targetBorough && borough && s.targetBorough !== borough) return false;
+          return true;
+        });
+      const pick = active[0] || null;
+      setSponsored(pick);
+      if (pick && sponsoredSeenRef.current !== pick.id) {
+        sponsoredSeenRef.current = pick.id;
+        updateDoc(doc(db, `artifacts/${appId}/public/data/sponsored/${pick.id}`), { impressions: increment(1) }).catch(() => {});
+      }
+    });
+    return unsub;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId, userProfile?.address]);
+
+  const sponsoredClick = () => {
+    if (!sponsored) return;
+    updateDoc(doc(db, `artifacts/${appId}/public/data/sponsored/${sponsored.id}`), { clicks: increment(1) }).catch(() => {});
+  };
 
   // Cycle patience messages while a generation is in-flight so the user
   // sees forward motion instead of a static spinner.
@@ -2181,6 +2314,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
 
   return (
     <div className="space-y-6">
+      {sponsored && <SponsoredCard item={sponsored} onClick={sponsoredClick} />}
       {needsOnboarding && (
         <div className="bg-gradient-to-r from-indigo-500 to-purple-500 text-white rounded-2xl p-5 flex flex-col md:flex-row items-start md:items-center justify-between gap-3 shadow-md">
           <div>
@@ -2576,7 +2710,7 @@ const FeedCard = ({ item, onDelete }) => {
 };
 
 const GroupSection = () => {
-  const { userProfile } = useContext(AppContext);
+  const { userProfile, userId } = useContext(AppContext);
   const [groups, setGroups] = useState([]);
   const [showCreate, setShowCreate] = useState(false);
   const [viewGroup, setViewGroup] = useState(null);
@@ -2606,19 +2740,27 @@ const GroupSection = () => {
         {groups.length === 0 ? (
           <p className="text-gray-500">No groups yet.</p>
         ) : (
-          groups.map((g) => (
+          groups.map((g) => {
+            const lastMsg = g.lastMessageAt?.toMillis?.() || 0;
+            const lastRead = g.reads?.[userId]?.toMillis?.() || 0;
+            const unread = lastMsg > lastRead;
+            return (
             <div key={g.id} onClick={() => setViewGroup(g)} className="bg-white p-5 rounded-2xl border border-gray-100 shadow-sm hover:shadow-md transition cursor-pointer group">
               <div className="flex justify-between items-start">
                 <div>
-                  <h3 className="font-bold text-lg text-gray-900 group-hover:text-indigo-600 transition-colors">{g.name}</h3>
-                  <p className="text-sm text-gray-500 mt-1">{g.members?.length || 0} members</p>
+                  <h3 className="font-bold text-lg text-gray-900 group-hover:text-indigo-600 transition-colors flex items-center gap-2">
+                    {g.name}
+                    {unread && <span className="w-2.5 h-2.5 bg-indigo-500 rounded-full" title="New messages" />}
+                  </h3>
+                  <p className="text-sm text-gray-500 mt-1">{g.members?.length || 0} members{unread ? ' · new messages' : ''}</p>
                 </div>
                 <div className="w-10 h-10 bg-gray-50 rounded-full flex items-center justify-center text-gray-400 group-hover:bg-indigo-50 group-hover:text-indigo-500 transition">
                   <Icon path="M9 5l7 7-7 7" className="w-5 h-5" />
                 </div>
               </div>
             </div>
-          ))
+            );
+          })
         )}
       </div>
       {showCreate && <CreateGroupModal onClose={() => setShowCreate(false)} />}
@@ -2662,10 +2804,125 @@ const CreateGroupModal = ({ onClose }) => {
   );
 };
 
+// "Ideas from this chat": reads the group's recent conversation, derives topics,
+// and surfaces hyper-local suggestions matched to them (golf talk → nearby
+// courses, etc.) that the user can propose to the group.
+const ChatIdeasModal = ({ group, onClose }) => {
+  const { userId, userProfile, showGlobalMessage, googleAccessToken } = useContext(AppContext);
+  const [loading, setLoading] = useState(true);
+  const [topics, setTopics] = useState([]);
+  const [ideas, setIdeas] = useState([]);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const provider = userProfile?.aiProvider || 'gemini';
+      const anchor = userProfile?.address || 'New York, NY';
+      try {
+        const t = await extractChatTopics(group.id, provider);
+        if (cancelled) return;
+        setTopics(t);
+        if (!t.length) {
+          setError('Not enough in the chat yet to suggest from — keep the conversation going.');
+          setLoading(false);
+          return;
+        }
+        const { startDate, endDate } = dateWindow(false);
+        const prompt = `Today is ${new Date().toDateString()}. A group of friends has been chatting and is interested in: ${t.join(', ')}. Find 5 specific, real, HYPER-LOCAL things they could do together near ${anchor} between tomorrow and ~14 days out that match those interests (e.g. golf → a nearby course/driving range; sushi → a specific spot doing something special). Only real, verifiable places/events within ~10 miles of ${anchor} — never another city/state. For each: title, description, location, date (YYYY-MM-DD HH:MM), url (official, else null), imageUrl (or null), imageKeywords, type (EXACTLY one of ${EVENT_TYPES.join(', ')}), priceTier ("Free"/"$"/"$$"/"$$$"/"$$$$" or null), isTicketed (bool), ticketsUrl (or null). Return ONLY a JSON array.`;
+        const aiList = (async () => {
+          try {
+            const text = await callAI({ prompt, useWebSearch: true, provider });
+            return (extractJsonArray(text) || []).map((e) => ({ ...e, source: e.source || 'ai', type: normalizeType(e.type || e.category) }));
+          } catch {
+            return [];
+          }
+        })();
+        const partnerList = (async () => {
+          const raw = await fetchRealEvents({ location: anchor, startDate, endDate, radius: 10, keywords: t.join(' '), size: 10, borough: nycBorough(anchor) });
+          if (!raw.length) return [];
+          return rankAndPersonalizeEvents({ events: raw, contextText: `Group interested in: ${t.join(', ')}. Near ${anchor}.`, provider, max: 5 });
+        })();
+        const [a, b] = await Promise.all([aiList, partnerList]);
+        if (cancelled) return;
+        const merged = mergeEvents(a, b).slice(0, 6);
+        setIdeas(merged);
+        if (!merged.length) setError('Couldn\'t find local matches for those topics right now.');
+      } catch (e) {
+        if (!cancelled) setError(e?.message || 'Could not generate ideas.');
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [group.id]);
+
+  const propose = async (idea) => {
+    try {
+      const safe = {
+        title: idea.title || '', description: idea.description || '', location: idea.location || '',
+        date: idea.date || '', url: idea.url || '', imageUrl: idea.imageUrl || null,
+        imageKeywords: idea.imageKeywords || '', priceTier: idea.priceTier || null,
+        isTicketed: typeof idea.isTicketed === 'boolean' ? idea.isTicketed : false,
+        ticketsUrl: idea.ticketsUrl || null, source: idea.source || null, type: idea.type || null,
+      };
+      const proposerName = userProfile?.name || 'User';
+      const ref = await addDoc(collection(db, `artifacts/${appId}/public/data/groups/${group.id}/proposals`), {
+        ...safe, proposerId: userId, proposerName, groupId: group.id, groupName: group.name,
+        rsvps: { [userId]: 'yes' }, createdAt: serverTimestamp(),
+      });
+      const batch = writeBatch(db);
+      (group.members || []).forEach((mid) => {
+        if (mid === userId) return;
+        batch.set(doc(collection(db, `artifacts/${appId}/users/${mid}/feed`)), {
+          type: 'groupProposal',
+          data: { ...safe, proposerName, groupId: group.id, groupName: group.name, proposalId: ref.id },
+          timestamp: serverTimestamp(),
+        });
+      });
+      await batch.commit();
+      showGlobalMessage(`Proposed to ${group.name}!`);
+    } catch (e) {
+      console.error(e);
+      showGlobalMessage('Could not propose.', 'error');
+    }
+  };
+
+  return createPortal(
+    <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-[60] flex justify-center items-start p-4 overflow-y-auto" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl my-8" onClick={(e) => e.stopPropagation()}>
+        <header className="flex justify-between items-center p-4 border-b border-gray-100">
+          <h2 className="text-base font-bold text-gray-800">💡 Ideas from your chat</h2>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-700 p-1 rounded-full hover:bg-gray-100"><CloseIcon className="w-5 h-5" /></button>
+        </header>
+        <div className="p-4">
+          {topics.length > 0 && (
+            <p className="text-xs text-gray-500 mb-3">Picked up on: {topics.map((t) => <span key={t} className="inline-block bg-indigo-50 text-indigo-700 rounded-full px-2 py-0.5 mr-1 font-medium">{t}</span>)}</p>
+          )}
+          {loading ? (
+            <div className="flex justify-center py-12"><div className="w-6 h-6 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" /></div>
+          ) : error ? (
+            <p className="text-sm text-gray-500 py-6 text-center">{error}</p>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {ideas.map((idea, i) => (
+                <SuggestionCard key={i} idea={idea} onPropose={propose} googleAccessToken={googleAccessToken} showGlobalMessage={showGlobalMessage} />
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+};
+
 const GroupDetailView = ({ group, onBack }) => {
   const { userId, showGlobalMessage, getUserNameById } = useContext(AppContext);
   const [members, setMembers] = useState([]);
   const [showInvite, setShowInvite] = useState(false);
+  const [showChatIdeas, setShowChatIdeas] = useState(false);
   const [groupTab, setGroupTab] = useState('proposals');
 
   useEffect(() => {
@@ -2692,6 +2949,13 @@ const GroupDetailView = ({ group, onBack }) => {
         <h2 className="text-xl font-bold">{group.name}</h2>
         <div className="flex items-center gap-1">
           <button
+            onClick={() => setShowChatIdeas(true)}
+            className="text-amber-500 hover:text-amber-700 p-2 rounded-full hover:bg-amber-50 flex items-center gap-1"
+            title="Ideas from this chat"
+          >
+            <LightbulbIcon className="w-5 h-5" />
+          </button>
+          <button
             onClick={() => setShowInvite(true)}
             className="text-indigo-500 hover:text-indigo-700 p-2 rounded-full hover:bg-indigo-50 flex items-center gap-1"
             title="Invite people"
@@ -2704,6 +2968,7 @@ const GroupDetailView = ({ group, onBack }) => {
         </div>
       </div>
       {showInvite && <InviteModal group={group} onClose={() => setShowInvite(false)} />}
+      {showChatIdeas && <ChatIdeasModal group={group} onClose={() => setShowChatIdeas(false)} />}
       <div className="flex-1 overflow-hidden flex flex-col md:flex-row gap-4">
         <div className="flex-1 flex flex-col min-h-0 bg-white rounded-2xl border shadow-sm overflow-hidden">
           <div className="flex border-b border-gray-100 px-2">
@@ -2895,31 +3160,99 @@ const ProposalCard = ({ proposal, groupId }) => {
   );
 };
 
+const REACTION_EMOJIS = ['👍', '❤️', '😂', '🎉', '🔥'];
+
 const ChatRoom = ({ groupId }) => {
   const { userId, userProfile } = useContext(AppContext);
   const [messages, setMessages] = useState([]);
   const [text, setText] = useState('');
+  const [editingId, setEditingId] = useState(null);
+  const [editText, setEditText] = useState('');
+  const [typingNames, setTypingNames] = useState([]);
+  const [reactingId, setReactingId] = useState(null);
+  const [uploading, setUploading] = useState(false);
   const bottomRef = useRef(null);
+  const fileRef = useRef(null);
+  const lastTypingRef = useRef(0);
+
+  const groupDoc = doc(db, `artifacts/${appId}/public/data/groups`, groupId);
+  const markRead = () => updateDoc(groupDoc, { [`reads.${userId}`]: serverTimestamp() }).catch(() => {});
 
   useEffect(() => {
     const q = query(collection(db, `artifacts/${appId}/public/data/groups/${groupId}/messages`), orderBy('timestamp', 'asc'), limit(100));
     return onSnapshot(q, (snap) => {
       setMessages(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+      markRead();
       setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
     });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [groupId]);
+
+  // Live typing indicator from the group doc (entries < 6s old, excluding self).
+  useEffect(() => {
+    return onSnapshot(groupDoc, (snap) => {
+      const t = snap.data()?.typing || {};
+      const now = Date.now();
+      setTypingNames(
+        Object.entries(t)
+          .filter(([uid, v]) => uid !== userId && v?.at?.toMillis && now - v.at.toMillis() < 6000)
+          .map(([, v]) => v.name)
+      );
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groupId]);
+
+  const onType = (val) => {
+    setText(val);
+    const now = Date.now();
+    if (now - lastTypingRef.current > 3000) {
+      lastTypingRef.current = now;
+      updateDoc(groupDoc, { [`typing.${userId}`]: { name: userProfile?.name || 'Someone', at: serverTimestamp() } }).catch(() => {});
+    }
+  };
 
   const send = async (e) => {
     e.preventDefault();
     if (!text.trim()) return;
-    await addDoc(collection(db, `artifacts/${appId}/public/data/groups/${groupId}/messages`), {
-      text,
-      senderId: userId,
-      senderName: userProfile.name,
-      photoURL: userProfile.photoURL || null,
-      timestamp: serverTimestamp(),
-    });
+    const body = text;
     setText('');
+    await addDoc(collection(db, `artifacts/${appId}/public/data/groups/${groupId}/messages`), {
+      text: body, senderId: userId, senderName: userProfile.name, photoURL: userProfile.photoURL || null, timestamp: serverTimestamp(),
+    });
+    updateDoc(groupDoc, { lastMessageAt: serverTimestamp(), [`typing.${userId}`]: { name: userProfile?.name || '', at: Timestamp.fromMillis(0) } }).catch(() => {});
+  };
+
+  const sendImage = async (file) => {
+    if (!file) return;
+    setUploading(true);
+    try {
+      const storageRef = ref(storage, `users/${userId}/chat/${groupId}/${Date.now()}_${file.name}`);
+      await uploadBytes(storageRef, file);
+      const url = await getDownloadURL(storageRef);
+      await addDoc(collection(db, `artifacts/${appId}/public/data/groups/${groupId}/messages`), {
+        imageUrl: url, senderId: userId, senderName: userProfile.name, photoURL: userProfile.photoURL || null, timestamp: serverTimestamp(),
+      });
+      updateDoc(groupDoc, { lastMessageAt: serverTimestamp() }).catch(() => {});
+    } catch (e) {
+      console.error('Chat image upload failed:', e);
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const toggleReaction = async (m, emoji) => {
+    const has = (m.reactions?.[emoji] || []).includes(userId);
+    await updateDoc(doc(db, `artifacts/${appId}/public/data/groups/${groupId}/messages/${m.id}`), {
+      [`reactions.${emoji}`]: has ? arrayRemove(userId) : arrayUnion(userId),
+    }).catch(() => {});
+    setReactingId(null);
+  };
+
+  const saveEdit = async (m) => {
+    if (editText.trim() && editText !== m.text) {
+      await updateDoc(doc(db, `artifacts/${appId}/public/data/groups/${groupId}/messages/${m.id}`), { text: editText, editedAt: serverTimestamp() }).catch(() => {});
+    }
+    setEditingId(null);
   };
 
   return (
@@ -2928,20 +3261,68 @@ const ChatRoom = ({ groupId }) => {
         {messages.map((m, i) => {
           const isMe = m.senderId === userId;
           const showHeader = i === 0 || messages[i - 1].senderId !== m.senderId;
+          const reactions = Object.entries(m.reactions || {}).filter(([, arr]) => (arr || []).length);
           return (
-            <div key={m.id} className={`flex ${isMe ? 'justify-end' : 'justify-start'} ${showHeader ? 'mt-4' : 'mt-1'}`}>
+            <div key={m.id} className={`flex ${isMe ? 'justify-end' : 'justify-start'} ${showHeader ? 'mt-4' : 'mt-1'} group/msg`}>
               {!isMe && showHeader && <Avatar src={m.photoURL} alt={m.senderName} size="xs" className="w-8 h-8 mr-2 self-end mb-1" />}
-              <div className={`max-w-[75%] px-4 py-2 rounded-2xl text-sm ${isMe ? 'bg-indigo-600 text-white rounded-br-none' : 'bg-white text-gray-800 shadow-sm rounded-bl-none border border-gray-100'}`}>
-                {!isMe && showHeader && <p className="text-xs font-bold text-gray-400 mb-1">{m.senderName}</p>}
-                {m.text}
+              <div className="max-w-[78%] relative">
+                <div className={`px-4 py-2 rounded-2xl text-sm ${isMe ? 'bg-indigo-600 text-white rounded-br-none' : 'bg-white text-gray-800 shadow-sm rounded-bl-none border border-gray-100'}`}>
+                  {!isMe && showHeader && <p className="text-xs font-bold text-gray-400 mb-1">{m.senderName}</p>}
+                  {m.imageUrl && <img src={m.imageUrl} alt="shared" className="rounded-lg max-h-60 mb-1" />}
+                  {editingId === m.id ? (
+                    <input
+                      autoFocus value={editText}
+                      onChange={(e) => setEditText(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === 'Enter') saveEdit(m); if (e.key === 'Escape') setEditingId(null); }}
+                      onBlur={() => saveEdit(m)}
+                      className="bg-white/20 rounded px-2 py-0.5 text-sm w-full outline-none"
+                    />
+                  ) : (
+                    m.text && <span>{m.text}</span>
+                  )}
+                  {m.editedAt && <span className="text-[10px] opacity-60 ml-1">(edited)</span>}
+                </div>
+                {reactions.length > 0 && (
+                  <div className={`flex gap-1 mt-1 flex-wrap ${isMe ? 'justify-end' : ''}`}>
+                    {reactions.map(([emoji, arr]) => (
+                      <button key={emoji} onClick={() => toggleReaction(m, emoji)} className={`text-xs px-1.5 py-0.5 rounded-full border ${(arr || []).includes(userId) ? 'bg-indigo-50 border-indigo-300' : 'bg-white border-gray-200'}`}>
+                        {emoji} {arr.length}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {/* hover actions */}
+                <div className={`absolute top-0 ${isMe ? 'left-0 -translate-x-full pr-1' : 'right-0 translate-x-full pl-1'} opacity-0 group-hover/msg:opacity-100 transition flex items-center gap-1`}>
+                  <button onClick={() => setReactingId(reactingId === m.id ? null : m.id)} className="text-gray-400 hover:text-indigo-600 text-sm" title="React">😊</button>
+                  {isMe && !m.imageUrl && (
+                    <button onClick={() => { setEditingId(m.id); setEditText(m.text || ''); }} className="text-gray-400 hover:text-indigo-600" title="Edit"><Icon path="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" className="w-4 h-4" /></button>
+                  )}
+                  {isMe && (
+                    <button onClick={() => deleteDoc(doc(db, `artifacts/${appId}/public/data/groups/${groupId}/messages/${m.id}`)).catch(() => {})} className="text-gray-400 hover:text-red-500" title="Delete"><TrashIcon className="w-4 h-4" /></button>
+                  )}
+                </div>
+                {reactingId === m.id && (
+                  <div className={`absolute z-10 -top-9 ${isMe ? 'right-0' : 'left-0'} bg-white rounded-full shadow-lg border border-gray-100 flex px-1 py-0.5`}>
+                    {REACTION_EMOJIS.map((emoji) => (
+                      <button key={emoji} onClick={() => toggleReaction(m, emoji)} className="text-lg px-1 hover:scale-125 transition">{emoji}</button>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           );
         })}
+        {typingNames.length > 0 && (
+          <p className="text-xs text-gray-400 italic">{typingNames.join(', ')} {typingNames.length === 1 ? 'is' : 'are'} typing…</p>
+        )}
         <div ref={bottomRef} />
       </div>
-      <form onSubmit={send} className="p-3 bg-white border-t flex gap-2">
-        <input className="flex-1 bg-gray-100 border-0 rounded-full px-4 focus:ring-2 focus:ring-indigo-500" value={text} onChange={(e) => setText(e.target.value)} placeholder="Message..." />
+      <form onSubmit={send} className="p-3 bg-white border-t flex gap-2 items-center">
+        <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={(e) => { sendImage(e.target.files?.[0]); e.target.value = ''; }} />
+        <button type="button" onClick={() => fileRef.current?.click()} disabled={uploading} className="p-2 text-gray-400 hover:text-indigo-600 disabled:opacity-50" title="Send a photo">
+          {uploading ? <SearchIcon className="w-5 h-5 animate-spin" /> : <CameraIcon className="w-5 h-5" />}
+        </button>
+        <input className="flex-1 bg-gray-100 border-0 rounded-full px-4 focus:ring-2 focus:ring-indigo-500" value={text} onChange={(e) => onType(e.target.value)} placeholder="Message..." />
         <button type="submit" className="p-2 bg-indigo-600 text-white rounded-full hover:bg-indigo-700 disabled:opacity-50" disabled={!text.trim()}>
           <SendIcon className="w-5 h-5" />
         </button>
