@@ -99,6 +99,57 @@ via partner APIs (e.g., OpenTable partner reservation API, Viator booking API).
 
 ---
 
+## 1.5 FEEDBACK-DRIVEN FEATURE ADDITIONS (latest round)
+
+**A. One-tap interest picker (low-lift onboarding).** Replace/augment free-text
+interests with a tappable chip grid (Fine Dining, Live Music, Dancing, Comedy,
+Sports, Art/Museums, Outdoors, Nightlife, Coffee, Fitness, …) in profile setup —
+reuse/extend `INTEREST_TAXONOMY` + the existing survey options. Quick win; folds
+into onboarding + the UX overhaul. **Effort: S.**
+
+**B. Budget curation (free vs paid + max $/person).** Profile prefs: a free/paid
+lean + a per-person price cap; apply to feed filtering/ranking and the AI prompt
+(we already tag `priceTier`). Surface as feed filters too. **Effort: S–M.** Fits
+Phase 1.
+
+**C. Map view + social "vibe" overlay.**
+- *Map of events around you:* plot events on a **Google Maps JS** (same Maps
+  Platform credit as Places) or **Mapbox** map — partner events already carry
+  lat/lng; AI/Places events geocode. Very doable. **Effort: M.**
+- *Instagram/X posts from the event (live vibe) — honest constraint, mostly
+  blocked:* Instagram's Graph API **removed public location/hashtag post search**
+  (you can only fetch a business account's OWN media), so a live "what's
+  happening at this venue right now" IG feed is **not available** via official
+  API. **X/Twitter API v2** can do recent/geo search but is **paid (expensive
+  tiers) and geo-limited.** Realistic alternative: **deep-link out** to the
+  venue's Instagram location/hashtag page and an X search for the event, rather
+  than embedding a live feed. Treat the live-feed idea as research/limited; ship
+  the map + deep-links. **Effort: M (map) + research (social).**
+
+**D. Secondary / last-minute ticket markets.** Integrate resale marketplaces for
+last-minute deals — **SeatGeek** (open API + "Deal Score" + affiliate; a SeatGeek
+provider was already scaffolded — extend it), **StubHub**, **Vivid Seats**,
+**Gametime** (last-minute focus). Surface lowest price / deal score + an
+affiliate-wrapped buy link on event cards. **Effort: M** + partner/affiliate
+signups. Feeds the affiliate funnel (item 1a / #F below).
+
+**E. Time Out:** **no public events API** (confirmed). The AI grounded search
+already mines timeout.com (+ New Yorker "Goings On", The Skint, Eater, Brooklyn
+Mag) for curated picks — that *is* the integration. Revisit only if a
+partnership/affiliate feed opens up; nothing to "hook up" today.
+
+**F. Affiliate on every purchase (comprehensive).** Already underway via
+`affiliateUrl()` wrapping. Extend to ALL outbound purchase links — primary
+ticketing, **resale (#D)**, reservations, experiences, rides — so any event
+action earns commission. Same as item 1a; **Effort: ongoing**, gated on
+affiliate-network enrollment.
+
+> Sequencing for these: **A, B, F** are Phase-1 quick wins; **C (map)** and the
+> interest-picker UX land with the Phase-2 UX overhaul; **D (resale)** rides with
+> the Phase-1 affiliate work; the **social live-feed** is a Phase-4 research item.
+
+---
+
 ## 2. MOBILE-FIRST UX OVERHAUL (Instagram / Facebook / Reddit feel)
 
 Goal: a polished, "sells itself" social feed app, not a utility.
@@ -219,6 +270,10 @@ and treat the **iMessage extension** as a native add-on after the iOS app ships.
 - **Stripe** — Billing, Tax, (maybe Connect)
 - **Affiliate:** Impact / Partnerize / CJ / Awin + direct: OpenTable·Resy,
   Viator·GetYourGuide, GolfNow, Uber·Lyft, Booking·Expedia, Ticketmaster
+- **Resale ticketing:** SeatGeek (API + affiliate), StubHub, Vivid Seats, Gametime
+- **Maps:** Google Maps JS (same Maps Platform credit) or Mapbox
+- **Social (limited):** X/Twitter API v2 (paid, optional, geo-limited);
+  Instagram — NO viable public-post API (deep-link out instead)
 - **Resend** (email; already planned) · **Sentry** · **PostHog** (or similar)
 - **Firebase Blaze** (Cloud Functions / higher quotas)
 - **Legal counsel** — privacy policy, data products, store compliance
@@ -239,6 +294,11 @@ tokens, Sentry DSN, analytics key, APNs/FCM credentials.
 | Workstream | Effort | Gated by |
 |---|---|---|
 | Affiliate funnel (P1) | S–M | network signups |
+| One-tap interest picker | S | — |
+| Budget curation (free/paid + $/person) | S–M | — |
+| Map view of events | M | Maps key |
+| Social "live vibe" feed | research | platform APIs (mostly blocked) |
+| Resale/last-minute tickets | M | SeatGeek/StubHub signups |
 | Hangouts+ subscription | M | Stripe Billing |
 | Sponsored/venue marketplace | M–L | — |
 | Foundation refactor + router | L | — (do first) |
