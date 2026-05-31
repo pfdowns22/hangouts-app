@@ -4,6 +4,11 @@ AI-powered social planning app. Originally generated in Google Gemini Canvas, th
 refactored into a standard Vite + React project. See [README.md](README.md) for
 end-user setup, deploy, and known-issues notes.
 
+**Build-out roadmap:** [ROADMAP.md](ROADMAP.md) — the full forward plan
+(monetization incl. booking/agent + subscription + venue marketplace, mobile-first
+UX overhaul, Apple/Google app-store release, WhatsApp/iMessage integrations),
+with phased sequencing, signups, and effort. Start there for next-phase work.
+
 ## Backlog / TODO
 - **Local open-data events beyond NYC.** The `nycEvents` provider (api/events.js)
   is NYC-only (gated by `nycBorough()` in src/App.jsx). Add equivalent civic
