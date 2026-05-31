@@ -404,7 +404,11 @@ const ticketAction = (event) => {
     const direct = validHttpUrl(event?.ticketsUrl);
     if (direct) return { href: affiliateUrl(direct), label: '🎟️ Buy Tickets' };
   }
-  return { href: searchUrl(event, 'tickets'), label: '🎟️ Find Tickets' };
+  // No direct link → send them to a ticket VENDOR search (buyable listings),
+  // not a generic Google search, and affiliate-wrap it so it also earns.
+  const q = [event?.title, event?.location].filter(Boolean).join(' ');
+  const vendor = `https://www.ticketmaster.com/search?q=${encodeURIComponent(q || 'events')}`;
+  return { href: affiliateUrl(vendor), label: '🎟️ Find Tickets' };
 };
 
 // Broad interests worth drilling into specifics for, so recommendations (and
@@ -713,6 +717,42 @@ const extractChatTopics = async (groupId, provider = 'gemini') => {
   } catch (e) {
     console.warn('extractChatTopics failed:', e);
     return [];
+  }
+};
+
+// Email the other group members when an event is proposed (via /api/notify-proposal
+// → Resend). Reads member emails from their profiles (readable per rules).
+// Fire-and-forget; never blocks or fails the proposal.
+const sendProposalEmails = async (group, eventTitle, proposerName, selfId) => {
+  try {
+    const ids = (group?.members || []).filter((id) => id !== selfId).slice(0, 30);
+    if (!ids.length) return;
+    const emails = (
+      await Promise.all(
+        ids.map(async (uid) => {
+          try {
+            const s = await getDoc(doc(db, `artifacts/${appId}/users/${uid}/profiles`, 'myProfile'));
+            return s.exists() ? s.data().email || '' : '';
+          } catch {
+            return '';
+          }
+        })
+      )
+    ).filter((e) => /\S+@\S+\.\S+/.test(e));
+    if (!emails.length) return;
+    await fetch('/api/notify-proposal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        emails,
+        proposerName,
+        eventTitle,
+        groupName: group.name,
+        appUrl: typeof window !== 'undefined' ? window.location.origin : '',
+      }),
+    });
+  } catch (e) {
+    console.warn('Proposal email failed:', e);
   }
 };
 
@@ -2882,6 +2922,7 @@ const ChatIdeasModal = ({ group, onClose }) => {
         });
       });
       await batch.commit();
+      sendProposalEmails(group, safe.title, proposerName, userId);
       showGlobalMessage(`Proposed to ${group.name}!`);
     } catch (e) {
       console.error(e);
@@ -3595,6 +3636,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
         });
       });
       await batch.commit();
+      sendProposalEmails(group, suggestion.title, userProfile.name, userId);
       showGlobalMessage(`Proposed to ${group.name}!`, 'success');
     } catch (error) {
       console.error(error);
@@ -4691,6 +4733,7 @@ const SendToGroupModal = ({ event, anchorRect, onClose }) => {
         });
       });
       await batch.commit();
+      sendProposalEmails(group, safe.title, proposerName, userId);
       showGlobalMessage(`Sent "${safe.title}" to ${group.name}!`);
       onClose();
     } catch (e) {
@@ -4952,8 +4995,98 @@ const PasscodeGate = ({ children }) => {
   );
 };
 
+// --- Public self-serve sponsor page (no login) at /sponsor ---
+const SPONSOR_PACKAGES = [
+  { id: '7day', label: '7 days', price: '$29' },
+  { id: '30day', label: '30 days', price: '$79' },
+];
+const SponsorLanding = () => {
+  const [form, setForm] = useState({ title: '', description: '', url: '', imageUrl: '', location: '', borough: '', type: 'Other', sponsorName: '', package: '7day' });
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState('');
+  const status = typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('status') : null;
+  const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!form.title.trim() || !form.sponsorName.trim()) {
+      setErr('Event title and your name/business are required.');
+      return;
+    }
+    setSubmitting(true);
+    setErr('');
+    try {
+      const res = await fetch('/api/sponsor-checkout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...form, appId }) });
+      const data = await res.json().catch(() => ({}));
+      if (data.url) {
+        window.location.href = data.url;
+        return;
+      }
+      setErr(data.error || 'Could not start checkout.');
+    } catch (e2) {
+      setErr(e2.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-[#F3F4F6] p-4 md:p-8 overflow-x-hidden">
+      <div className="max-w-xl mx-auto">
+        <h1 className="text-2xl font-bold text-gray-900 mb-1">Promote your event on Hangouts</h1>
+        <p className="text-sm text-gray-500 mb-6">Feature your event at the top of local feeds. Pick a package, pay securely, and it goes live automatically.</p>
+        {status === 'success' && <div className="mb-4 p-3 rounded-xl bg-emerald-50 text-emerald-800 text-sm">Payment received — your placement will appear shortly. Thank you!</div>}
+        {status === 'cancel' && <div className="mb-4 p-3 rounded-xl bg-amber-50 text-amber-800 text-sm">Checkout canceled — no charge was made.</div>}
+        <form onSubmit={submit} className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5 space-y-3">
+          {[
+            ['sponsorName', 'Your name or business *', 'e.g. Joe\'s Bar'],
+            ['title', 'Event title *', 'e.g. Trivia Night at Joe\'s'],
+            ['description', 'Short description', 'What is it?'],
+            ['location', 'Location / address', 'e.g. 123 5th Ave, Brooklyn'],
+            ['url', 'Link (tickets or info)', 'https://…'],
+            ['imageUrl', 'Image URL (optional)', 'https://…'],
+          ].map(([k, label, ph]) => (
+            <div key={k}>
+              <label className="block text-xs font-semibold uppercase text-gray-500 mb-1">{label}</label>
+              <input value={form[k]} onChange={(e) => set(k, e.target.value)} placeholder={ph} className="w-full p-2.5 border border-gray-200 rounded-xl text-sm focus:ring-2 focus:ring-indigo-500" />
+            </div>
+          ))}
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs font-semibold uppercase text-gray-500 mb-1">Type</label>
+              <select value={form.type} onChange={(e) => set('type', e.target.value)} className="w-full p-2.5 border border-gray-200 rounded-xl text-sm bg-white">
+                {EVENT_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-semibold uppercase text-gray-500 mb-1">NYC borough (optional)</label>
+              <input value={form.borough} onChange={(e) => set('borough', e.target.value)} placeholder="Brooklyn" className="w-full p-2.5 border border-gray-200 rounded-xl text-sm" />
+            </div>
+          </div>
+          <div>
+            <label className="block text-xs font-semibold uppercase text-gray-500 mb-2">Package</label>
+            <div className="flex gap-2">
+              {SPONSOR_PACKAGES.map((p) => (
+                <button type="button" key={p.id} onClick={() => set('package', p.id)} className={`flex-1 py-3 rounded-xl border font-bold text-sm transition ${form.package === p.id ? 'border-indigo-600 bg-indigo-50 text-indigo-700' : 'border-gray-200 text-gray-600'}`}>
+                  {p.label} · {p.price}
+                </button>
+              ))}
+            </div>
+          </div>
+          {err && <p className="text-sm text-red-600">{err}</p>}
+          <button type="submit" disabled={submitting} className="w-full bg-indigo-600 text-white py-3 rounded-xl font-bold hover:bg-indigo-700 disabled:opacity-50 transition">
+            {submitting ? 'Starting checkout…' : 'Continue to secure payment'}
+          </button>
+          <p className="text-[11px] text-gray-400 text-center">Payments handled by Stripe. Placements are clearly labeled "Sponsored."</p>
+        </form>
+      </div>
+    </div>
+  );
+};
+
 // --- Main App ---
 export default function App() {
+  if (typeof window !== 'undefined' && window.location.pathname === '/sponsor') return <SponsorLanding />;
   const [userId, setUserId] = useState(null);
   const [userProfile, setUserProfile] = useState(null);
   const [loading, setLoading] = useState(true);

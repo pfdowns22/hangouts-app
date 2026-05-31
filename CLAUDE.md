@@ -13,7 +13,13 @@ end-user setup, deploy, and known-issues notes.
   but not live tee-time or table booking — add partner/paid APIs (GolfNow,
   OpenTable/Resy) for in-app booking later.
 - **Chat push notifications.** Chat is real-time in-app; add FCM + a service
-  worker for background push.
+  worker for background push (note: iOS Safari needs the app installed as a PWA).
+- **Owner revenue dashboard.** In-app view of sponsored impressions/clicks/CTR +
+  affiliate tallies (data already tracked on the sponsored docs / Stripe).
+- **Email-notification opt-out.** A profile toggle to suppress proposal emails.
+- **Sponsor ops:** /sponsor checkout requires the Stripe webhook
+  (https://<deploy>/api/stripe-webhook) registered + STRIPE_*/FIREBASE_SERVICE_ACCOUNT
+  /RESEND_* env vars set in Vercel.
 
 ## Stack
 - **Vite + React 18** (plain `.jsx`, no TypeScript despite the original `.tsx` naming)
