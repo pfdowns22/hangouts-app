@@ -101,11 +101,12 @@ via partner APIs (e.g., OpenTable partner reservation API, Viator booking API).
 
 ## 1.5 FEEDBACK-DRIVEN FEATURE ADDITIONS (latest round)
 
-**A. One-tap interest picker (low-lift onboarding).** Replace/augment free-text
-interests with a tappable chip grid (Fine Dining, Live Music, Dancing, Comedy,
-Sports, Art/Museums, Outdoors, Nightlife, Coffee, Fitness, …) in profile setup —
-reuse/extend `INTEREST_TAXONOMY` + the existing survey options. Quick win; folds
-into onboarding + the UX overhaul. **Effort: S.**
+**A. One-tap interest picker (low-lift onboarding).** A tappable chip grid (Fine
+Dining, Live Music, Dancing, Comedy, Sports, Art/Museums, Outdoors, Nightlife,
+Coffee, Fitness, …) in profile setup — **in addition to** (not replacing) the AI
+survey and free-text add; all three coexist so users pick whatever's lowest-lift.
+Reuse/extend `INTEREST_TAXONOMY`. Quick win; folds into onboarding + the UX
+overhaul. **Effort: S.**
 
 **B. Budget curation (free vs paid + max $/person).** Profile prefs: a free/paid
 lean + a per-person price cap; apply to feed filtering/ranking and the AI prompt
@@ -144,7 +145,16 @@ ticketing, **resale (#D)**, reservations, experiences, rides — so any event
 action earns commission. Same as item 1a; **Effort: ongoing**, gated on
 affiliate-network enrollment.
 
-> Sequencing for these: **A, B, F** are Phase-1 quick wins; **C (map)** and the
+**G. Directions + rideshare (with a cut).** On each event card: a **"Get
+directions"** deep-link (Google/Apple Maps, destination prefilled — free, pure
+UX) and a **"Get a ride"** deep-link to **Uber/Lyft** with the venue as
+destination, **affiliate-wrapped** so rides booked through us earn commission.
+*Honest note:* Uber/Lyft affiliate/referral payouts are real but typically
+modest and often new-rider-weighted — treat ride commission as a bonus, not a
+core revenue line; the directions piece is a pure UX win regardless. Pairs
+naturally with the **map (#C)**. **Effort: S–M** + Uber/Lyft program signup.
+
+> Sequencing for these: **A, B, F, G** are Phase-1 quick wins; **C (map)** and the
 > interest-picker UX land with the Phase-2 UX overhaul; **D (resale)** rides with
 > the Phase-1 affiliate work; the **social live-feed** is a Phase-4 research item.
 
@@ -297,6 +307,7 @@ tokens, Sentry DSN, analytics key, APNs/FCM credentials.
 | One-tap interest picker | S | — |
 | Budget curation (free/paid + $/person) | S–M | — |
 | Map view of events | M | Maps key |
+| Directions + rideshare (w/ cut) | S–M | Uber/Lyft program |
 | Social "live vibe" feed | research | platform APIs (mostly blocked) |
 | Resale/last-minute tickets | M | SeatGeek/StubHub signups |
 | Hangouts+ subscription | M | Stripe Billing |
