@@ -373,6 +373,23 @@ const wrapAffiliate = (rawUrl, tmpl) => {
     return u;
   }
 };
+// Host → affiliate-template map. Each entry tests the (www-stripped) hostname
+// and carries the env template to wrap with. tmpl uses LITERAL import.meta.env
+// access (Vite only statically inlines literal reads, not dynamic keys), read
+// once at module load. Add a partner by enrolling, dropping its host pattern
+// here, and setting the VITE_AFFILIATE_* id in Vercel — until then tmpl is ''
+// and wrapAffiliate returns the URL unchanged (completely inert).
+const AFFILIATE_PARTNERS = [
+  { test: /(^|\.)ticketmaster\.com$|(^|\.)livenation\.com$/, tmpl: import.meta.env.VITE_AFFILIATE_TICKETMASTER || '' },
+  { test: /(^|\.)seatgeek\.com$/, tmpl: import.meta.env.VITE_AFFILIATE_SEATGEEK || '' },
+  { test: /(^|\.)stubhub\.com$/, tmpl: import.meta.env.VITE_AFFILIATE_STUBHUB || '' },
+  { test: /(^|\.)vividseats\.com$/, tmpl: import.meta.env.VITE_AFFILIATE_VIVIDSEATS || '' },
+  { test: /(^|\.)viator\.com$|(^|\.)getyourguide\.com$/, tmpl: import.meta.env.VITE_AFFILIATE_VIATOR || '' },
+  { test: /(^|\.)opentable\.com$|(^|\.)resy\.com$/, tmpl: import.meta.env.VITE_AFFILIATE_OPENTABLE || '' },
+  { test: /(^|\.)uber\.com$/, tmpl: import.meta.env.VITE_AFFILIATE_UBER || '' },
+  { test: /(^|\.)lyft\.com$/, tmpl: import.meta.env.VITE_AFFILIATE_LYFT || '' },
+  { test: /(^|\.)booking\.com$|(^|\.)expedia\.com$/, tmpl: import.meta.env.VITE_AFFILIATE_BOOKING || '' },
+];
 const affiliateUrl = (rawUrl) => {
   let host = '';
   try {
@@ -380,9 +397,8 @@ const affiliateUrl = (rawUrl) => {
   } catch {
     return rawUrl;
   }
-  if (/(^|\.)ticketmaster\.com$|(^|\.)livenation\.com$/.test(host)) return wrapAffiliate(rawUrl, import.meta.env.VITE_AFFILIATE_TICKETMASTER || '');
-  if (/(^|\.)viator\.com$|(^|\.)getyourguide\.com$/.test(host)) return wrapAffiliate(rawUrl, import.meta.env.VITE_AFFILIATE_VIATOR || '');
-  return rawUrl;
+  const partner = AFFILIATE_PARTNERS.find((p) => p.test.test(host));
+  return partner ? wrapAffiliate(rawUrl, partner.tmpl) : rawUrl;
 };
 
 // "More Info" target: the event's own URL only when it comes from a trusted
@@ -409,6 +425,37 @@ const ticketAction = (event) => {
   const q = [event?.title, event?.location].filter(Boolean).join(' ');
   const vendor = `https://www.ticketmaster.com/search?q=${encodeURIComponent(q || 'events')}`;
   return { href: affiliateUrl(vendor), label: '🎟️ Find Tickets' };
+};
+
+// A best-effort destination string for maps/ride deep-links. Events only persist
+// a free-text `location` (lat/lng are transient during verification), so we
+// combine the venue title + location for an unambiguous place query, dropping
+// the title when it's already contained in the location to avoid duplication.
+const eventDestination = (event) => {
+  const loc = (event?.location || '').trim();
+  const title = (event?.title || '').trim();
+  if (loc && title && !loc.toLowerCase().includes(title.toLowerCase())) return `${title}, ${loc}`;
+  return loc || title;
+};
+
+// "Get directions" target — a Google Maps directions universal link with the
+// venue prefilled. Opens the Maps app on mobile, maps.google.com on desktop.
+// Pure UX win (no affiliate); returns null when we have no destination.
+const directionsUrl = (event) => {
+  const dest = eventDestination(event);
+  if (!dest) return null;
+  return `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(dest)}`;
+};
+
+// "Get a ride" target — an Uber universal deep-link with the venue as dropoff
+// (pickup left to the user's current location). Affiliate-wrapped so rides
+// booked through us earn commission once VITE_AFFILIATE_UBER is set; otherwise
+// it's just a convenient deep-link. Returns null when we have no destination.
+const rideUrl = (event) => {
+  const dest = eventDestination(event);
+  if (!dest) return null;
+  const url = `https://m.uber.com/ul/?action=setPickup&pickup=my_location&dropoff[formatted_address]=${encodeURIComponent(dest)}`;
+  return affiliateUrl(url);
 };
 
 // Broad interests worth drilling into specifics for, so recommendations (and
@@ -445,6 +492,16 @@ const taxonomyBucketFor = (label) => {
   }
   return null;
 };
+
+// One-tap interest chips for low-lift onboarding — a fast alternative to (and
+// coexisting with) the AI survey and free-text add. Labels that line up with
+// INTEREST_TAXONOMY broad buckets (Food & Drink, Drinks / Nightlife, Live Music)
+// open the same specifics drill-down when tapped.
+const QUICK_INTEREST_CHIPS = [
+  'Live Music', 'Food & Drink', 'Drinks / Nightlife', 'Fine Dining', 'Dancing',
+  'Comedy', 'Sports', 'Art / Museums', 'Theater', 'Outdoors', 'Coffee',
+  'Fitness', 'Festivals', 'Markets / Shopping',
+];
 
 // Image fallback chain when Gemini's imageUrl is null or 404s.
 // Priority order:
@@ -1088,6 +1145,9 @@ const ProfileSection = ({ onClose }) => {
   const [newKidAge, setNewKidAge] = useState('');
   const [preferences, setPreferences] = useState(userProfile?.preferences || []);
   const [preferenceDetails, setPreferenceDetails] = useState(userProfile?.preferenceDetails || {});
+  // Budget preferences: a free/paid lean + an optional per-person price cap.
+  const [budgetLean, setBudgetLean] = useState(userProfile?.budgetLean || 'any'); // any | free | paid
+  const [maxPricePerPerson, setMaxPricePerPerson] = useState(userProfile?.maxPricePerPerson || '');
   const [refineBucket, setRefineBucket] = useState(null); // taxonomy bucket to drill into after a broad add
   const [currentPreference, setCurrentPreference] = useState('');
   const [availableDates, setAvailableDates] = useState(userProfile?.availability || []);
@@ -1239,6 +1299,10 @@ const ProfileSection = ({ onClose }) => {
         kids,
         preferences,
         preferenceDetails,
+        budgetLean,
+        // Store the cap as a number (or null when cleared) so the feed prompt
+        // and any filtering can use it numerically.
+        maxPricePerPerson: maxPricePerPerson === '' ? null : Number(maxPricePerPerson) || null,
         availability: availableDates,
         availabilitySlots,
         weeklyAvailability,
@@ -1350,6 +1414,18 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with shape:
     if (bucket) setRefineBucket(bucket);
   };
   const removePreference = (p) => setPreferences(preferences.filter((pref) => pref !== p));
+  // One-tap chip: toggle a broad interest in/out of preferences. Adding a chip
+  // that maps to a taxonomy bucket opens the specifics drill-down, mirroring
+  // the free-text add path.
+  const toggleQuickInterest = (label) => {
+    if (preferences.includes(label)) {
+      removePreference(label);
+      return;
+    }
+    setPreferences((prev) => [...prev, label]);
+    const bucket = taxonomyBucketFor(label);
+    if (bucket) setRefineBucket(bucket);
+  };
   // Add a specific (e.g. "Italian") to both the flat list and the structured
   // preferenceDetails bucket so place recommendations can use it.
   const addSpecific = (bucket, opt) => {
@@ -1563,6 +1639,24 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with shape:
               <SparklesIcon className="w-4 h-4" /> Take Survey
             </button>
           </div>
+          <p className="text-xs text-gray-400 mb-2">Tap to add — or use the survey / type your own below.</p>
+          <div className="flex flex-wrap gap-2 mb-3">
+            {QUICK_INTEREST_CHIPS.map((chip) => {
+              const on = preferences.includes(chip);
+              return (
+                <button
+                  key={chip}
+                  type="button"
+                  onClick={() => toggleQuickInterest(chip)}
+                  className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition ${
+                    on ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-700 border-gray-200 hover:border-indigo-300'
+                  }`}
+                >
+                  {chip}
+                </button>
+              );
+            })}
+          </div>
           <div className="flex flex-wrap gap-2 mb-3">
             {preferences.map((pref) => (
               <span key={pref} className="flex items-center bg-indigo-50 text-indigo-700 px-3 py-1 rounded-full text-sm font-medium border border-indigo-100">
@@ -1647,6 +1741,54 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with shape:
               <PlusIcon />
             </button>
           </div>
+        </div>
+      </div>
+
+      <div className="space-y-3">
+        <h3 className="font-bold text-gray-800 flex items-center gap-2">
+          <Icon path="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1" className="w-5 h-5 text-emerald-500" />
+          Budget
+        </h3>
+        <p className="text-xs text-gray-500">Used to tailor and filter your feed. Leave as “Any” for no preference.</p>
+        <div className="flex flex-wrap gap-2">
+          {[
+            { id: 'any', label: 'Any' },
+            { id: 'free', label: 'Free / cheap' },
+            { id: 'paid', label: 'Happy to pay' },
+          ].map((opt) => {
+            const on = budgetLean === opt.id;
+            return (
+              <button
+                key={opt.id}
+                type="button"
+                onClick={() => setBudgetLean(opt.id)}
+                className={`px-4 py-2 rounded-full text-sm font-semibold border transition ${
+                  on ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-white text-gray-700 border-gray-200 hover:border-emerald-300'
+                }`}
+              >
+                {opt.label}
+              </button>
+            );
+          })}
+        </div>
+        <div className="flex items-center gap-2">
+          <label className="text-sm text-gray-600">Max per person</label>
+          <div className="flex items-center bg-gray-50 border border-gray-200 rounded-lg px-2">
+            <span className="text-gray-400 text-sm">$</span>
+            <input
+              type="number"
+              min="0"
+              value={maxPricePerPerson}
+              onChange={(e) => setMaxPricePerPerson(e.target.value)}
+              className="w-20 p-2 bg-transparent text-sm focus:outline-none"
+              placeholder="No cap"
+            />
+          </div>
+          {maxPricePerPerson !== '' && (
+            <button type="button" onClick={() => setMaxPricePerPerson('')} className="text-xs text-gray-400 hover:text-gray-600">
+              Clear
+            </button>
+          )}
         </div>
       </div>
 
@@ -2163,6 +2305,17 @@ HARD RULE: of 5 returned events, at least 2 MUST be tagged locationSource="home"
       // infinite scroll snappy and the Firestore reads bounded.
       const groupInterests = fromScroll ? [] : await gatherGroupInterests(userProfile);
       const kidsText = userProfile?.kids?.length ? `Kids ages: ${userProfile.kids.map((k) => k.age).join(',')}` : 'No kids';
+      // Budget preference → a guidance line for the model. priceTier dollar guide:
+      // $≈<$20, $$≈$20-50, $$$≈$50-100, $$$$≈$100+ per person.
+      const budgetLean = userProfile?.budgetLean || 'any';
+      const maxPP = Number(userProfile?.maxPricePerPerson) || 0;
+      const budgetParts = [];
+      if (budgetLean === 'free') budgetParts.push('strongly prefers FREE or cheap activities (priceTier "Free" or "$")');
+      else if (budgetLean === 'paid') budgetParts.push('is happy to pay for premium experiences');
+      if (maxPP > 0) budgetParts.push(`will not spend more than about $${maxPP} per person`);
+      const budgetLine = budgetParts.length
+        ? `${budgetParts.join('; ')} (guide: $≈under $20, $$≈$20-50, $$$≈$50-100, $$$$≈$100+ per person)`
+        : '';
       const todsPrefs = userProfile?.timeOfDayPrefs?.length ? userProfile.timeOfDayPrefs.join(', ') : 'any time';
       const dowPrefs = userProfile?.dayOfWeekPrefs?.length ? userProfile.dayOfWeekPrefs.join(', ') : 'any day';
       const weekly = userProfile?.weeklyAvailability || {};
@@ -2197,6 +2350,7 @@ WHO THIS IS FOR — tailor every single pick to THIS person:
 ${detailLines ? `- Specific tastes:\n${detailLines}` : ''}
 ${groupInterests.length ? `- Their friend groups enjoy together: ${groupInterests.join(', ')} — make 1 pick a great fit for these shared interests.` : ''}
 - Family: ${kidsText}
+${budgetLine ? `- Budget: ${budgetLine}. Respect this — set each pick's priceTier accordingly and skip options that clearly exceed it.` : ''}
 
 LOCATION — HARD CONSTRAINT:
 ${locationBlock}
@@ -2723,6 +2877,29 @@ const FeedCard = ({ item, onDelete }) => {
             </a>
           ) : null;
         })()}
+        {isEvent && directionsUrl(data) && (
+          <a
+            href={directionsUrl(data)}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex-1 text-center text-sm font-bold text-gray-700 bg-gray-100 hover:bg-gray-200 py-2.5 rounded-lg transition flex items-center justify-center gap-1"
+            title="Get directions to the venue"
+          >
+            <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-4 h-4" />
+            Directions
+          </a>
+        )}
+        {isEvent && rideUrl(data) && (
+          <a
+            href={rideUrl(data)}
+            target="_blank"
+            rel="noopener noreferrer sponsored"
+            className="flex-1 text-center text-sm font-bold text-gray-900 bg-gray-900/5 hover:bg-gray-900/10 py-2.5 rounded-lg transition flex items-center justify-center gap-1"
+            title="Get a ride to the venue"
+          >
+            🚗 Get a ride
+          </a>
+        )}
         <button onClick={handleCalendarClick} className="flex-1 text-sm font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 py-2.5 rounded-lg transition flex items-center justify-center gap-1">
           <PlusIcon className="w-4 h-4" /> Add to my calendar
         </button>
@@ -3764,6 +3941,33 @@ const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage 
             </a>
           ) : null;
         })()}
+        {(directionsUrl(idea) || rideUrl(idea)) && (
+          <div className="flex gap-2">
+            {directionsUrl(idea) && (
+              <a
+                href={directionsUrl(idea)}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex-1 text-center bg-gray-100 text-gray-700 text-sm font-bold py-2.5 rounded-lg hover:bg-gray-200 transition flex items-center justify-center gap-1"
+                title="Get directions to the venue"
+              >
+                <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-4 h-4" />
+                Directions
+              </a>
+            )}
+            {rideUrl(idea) && (
+              <a
+                href={rideUrl(idea)}
+                target="_blank"
+                rel="noopener noreferrer sponsored"
+                className="flex-1 text-center bg-gray-900/5 text-gray-900 text-sm font-bold py-2.5 rounded-lg hover:bg-gray-900/10 transition flex items-center justify-center gap-1"
+                title="Get a ride to the venue"
+              >
+                🚗 Get a ride
+              </a>
+            )}
+          </div>
+        )}
         <div className="flex gap-2">
           <button onClick={() => onPropose(idea)} className="flex-1 bg-indigo-50 text-indigo-600 text-sm font-bold py-2.5 rounded-lg hover:bg-indigo-100 transition">
             Propose
