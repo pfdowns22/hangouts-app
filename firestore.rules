@@ -118,6 +118,38 @@ service cloud.firestore {
           || get(/databases/$(database)/documents/artifacts/$(appId)/public/data/groups/$(groupId)).data.adminId == request.auth.uid
         );
       }
+
+      // Shared "Plan" conversations inside a group (the Plan tab). Any member
+      // can read, start (createdBy must be self), and update (e.g. title /
+      // lastMessageAt). Only the creator or the group admin can delete.
+      // Personal plans live under users/{userId}/plans and are already covered
+      // by the per-user catch-all rule above — no entry needed here.
+      match /plans/{planId} {
+        function isPlanMember() {
+          return request.auth != null
+            && request.auth.uid in get(/databases/$(database)/documents/artifacts/$(appId)/public/data/groups/$(groupId)).data.members;
+        }
+        allow read: if isPlanMember();
+        allow create: if isPlanMember() && request.resource.data.createdBy == request.auth.uid;
+        allow update: if isPlanMember();
+        allow delete: if isPlanMember() && (
+          resource.data.createdBy == request.auth.uid
+          || get(/databases/$(database)/documents/artifacts/$(appId)/public/data/groups/$(groupId)).data.adminId == request.auth.uid
+        );
+
+        // Messages within a group plan: members read; a member may create
+        // their own message (senderId == uid) OR an assistant message
+        // (role == 'assistant', written by the member's client after the AI
+        // turn). Members may edit/delete within their shared plan.
+        match /messages/{messageId} {
+          allow read: if isPlanMember();
+          allow create: if isPlanMember() && (
+            request.resource.data.senderId == request.auth.uid
+            || request.resource.data.role == 'assistant'
+          );
+          allow update, delete: if isPlanMember();
+        }
+      }
     }
   }
 }

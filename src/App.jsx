@@ -593,6 +593,24 @@ const extractJsonArray = (text) => {
   }
 };
 
+// Defensive parse of a single JSON OBJECT from model output (the Plan tab's
+// planning turn returns `{reply, needInfo, suggestions}`, not an array). Same
+// approach as extractJsonArray: strip ``` fences, isolate first '{'…last '}',
+// try/catch → null so a malformed reply never throws.
+const extractJsonObject = (text) => {
+  if (!text) return null;
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const candidate = fenced ? fenced[1] : text;
+  const start = candidate.indexOf('{');
+  const end = candidate.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) return null;
+  try {
+    return JSON.parse(candidate.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+};
+
 // --- Multi-source event helpers ---------------------------------------
 // The feed and group suggestions gather events from two kinds of source in
 // parallel: (A) the existing Gemini grounded web search, and (B) structured
@@ -1033,12 +1051,14 @@ const MainContent = () => {
           <TabButton label="My Feed" tabName="myFeed" activeTab={activeTab} setActiveTab={setActiveTab} badge={unreadFeedCount} />
           <TabButton label="My Groups" tabName="groups" activeTab={activeTab} setActiveTab={setActiveTab} />
           <TabButton label="Suggestions" tabName="suggestions" activeTab={activeTab} setActiveTab={setActiveTab} />
+          <TabButton label="Plan" tabName="plan" activeTab={activeTab} setActiveTab={setActiveTab} />
         </div>
       </nav>
       <div className="bg-white/60 backdrop-blur-xl rounded-3xl shadow-xl border border-white/40 p-4 md:p-6 min-h-[60vh]">
         {activeTab === 'myFeed' && <MyFeedSection />}
         {activeTab === 'groups' && <GroupSection />}
         {activeTab === 'suggestions' && <SuggestionSection />}
+        {activeTab === 'plan' && <PlanSection />}
       </div>
     </div>
   );
@@ -3875,7 +3895,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
   );
 };
 
-const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage }) => {
+const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage, proposeLabel = 'Propose' }) => {
   const imageSrc = useEventImage(idea);
   return (
     <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 flex flex-col hover:-translate-y-1 transition duration-300">
@@ -3970,7 +3990,7 @@ const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage 
         )}
         <div className="flex gap-2">
           <button onClick={() => onPropose(idea)} className="flex-1 bg-indigo-50 text-indigo-600 text-sm font-bold py-2.5 rounded-lg hover:bg-indigo-100 transition">
-            Propose
+            {proposeLabel}
           </button>
           <button
             onClick={async () => {
@@ -3983,6 +4003,442 @@ const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage 
           </button>
         </div>
       </div>
+    </div>
+  );
+};
+
+// --- Plan tab: conversational outing planner -------------------------------
+// A chat surface where the user describes an outing in plain language and the
+// AI replies with tailored, real, verifiable suggestions — asking a follow-up
+// when the destination/date/companions are unclear. Reuses the AI layer,
+// grounding budget, verifyVenue, SuggestionCard, and chat/Firestore patterns.
+
+// Coerce one AI-returned suggestion into the canonical event shape with safe
+// fallbacks (Firestore rejects undefined; JSON gives null which is fine).
+const sanitizePlanEvent = (s) => ({
+  title: s.title || 'Idea',
+  description: s.description || '',
+  location: s.location || '',
+  date: s.date || '',
+  url: s.url || null,
+  imageUrl: s.imageUrl || null,
+  imageKeywords: s.imageKeywords || '',
+  type: normalizeType(s.type || s.category),
+  priceTier: s.priceTier || null,
+  isTicketed: !!s.isTicketed,
+  ticketsUrl: s.ticketsUrl || null,
+  source: s.source || 'ai',
+});
+
+// Build the single planning prompt from the conversation + the user's profile
+// (interests, specific tastes, kids, budget) + recent activity + today's date.
+const buildPlanningPrompt = ({ history, userProfile, recentTitles }) => {
+  const prefs = userProfile?.preferences?.join(', ') || 'general fun';
+  const prefDetails = userProfile?.preferenceDetails || {};
+  const detailLines = Object.entries(prefDetails)
+    .filter(([, a]) => Array.isArray(a) && a.length)
+    .map(([k, a]) => `  • ${k}: ${a.join(', ')}`)
+    .join('\n');
+  const kidsText = userProfile?.kids?.length ? `Kids ages: ${userProfile.kids.map((k) => k.age).join(', ')}` : 'No kids';
+  // Budget line — mirrors the Phase-1 feed logic so picks respect the cap.
+  const budgetLean = userProfile?.budgetLean || 'any';
+  const maxPP = Number(userProfile?.maxPricePerPerson) || 0;
+  const bp = [];
+  if (budgetLean === 'free') bp.push('strongly prefers FREE or cheap options (priceTier "Free" or "$")');
+  else if (budgetLean === 'paid') bp.push('is happy to pay for premium experiences');
+  if (maxPP > 0) bp.push(`will not spend more than about $${maxPP} per person`);
+  const budgetLine = bp.length
+    ? `${bp.join('; ')} (guide: $≈under $20, $$≈$20-50, $$$≈$50-100, $$$$≈$100+ per person)`
+    : 'no specific budget';
+  const recent = recentTitles?.length ? recentTitles.join(' | ') : '(none yet)';
+  const today = new Date().toDateString();
+  const convo = history.map((m) => `${m.role === 'user' ? 'USER' : 'PLANNER'}: ${m.text}`).join('\n');
+
+  return `You are a concise local outing planner inside a social-planning app. Today is ${today}. Help the user plan a specific outing through a short back-and-forth.
+
+CONVERSATION SO FAR:
+${convo}
+
+WHO THE USER IS (personalize every suggestion):
+- Interests: ${prefs}
+${detailLines ? `- Specific tastes:\n${detailLines}` : ''}
+- Family: ${kidsText}
+- Budget: ${budgetLine}
+- Recently shown interest in: ${recent}
+
+YOUR JOB:
+- If you do NOT yet know the DESTINATION (where), the DATE/timeframe (when), or WHO is going, ask ONE short clarifying question for the single most important missing piece — set "needInfo": true and return an empty "suggestions" array. Ask only one thing at a time, and never re-ask something the user already told you.
+- Once you know enough, return 3-5 SPECIFIC, REAL, verifiable suggestions for that destination & date: places to eat, things to do, activities — tailored to the interests, family, and budget above. Use web search; never invent places. Favor concrete named spots/events over generic advice. Resolve relative dates ("today", "tomorrow", "June 24th") against today's date.
+
+For EACH suggestion use these keys: title, description (1-2 sentences saying why it fits THEM), location (specific venue + area), date ("YYYY-MM-DD HH:MM", or the outing date if no set time), url (official page if confident, else null), imageUrl (real public image URL or null), imageKeywords (3-6 visual words), type (EXACTLY one of ${EVENT_TYPES.join(', ')}), priceTier ("Free"/"$"/"$$"/"$$$"/"$$$$" or null), isTicketed (bool), ticketsUrl (direct ticket URL or null).
+
+Return ONLY a JSON object (no prose, no markdown fences) of shape:
+{ "reply": string (your short conversational message to the user), "needInfo": boolean, "suggestions": [ ...objects as above ] }`;
+};
+
+// Run one planning turn: meter the shared key, call the grounded model, parse
+// the object, then verify food/nightlife venues are real & nearby (drop the
+// ones Google Places can't place). Returns { reply, needInfo, suggestions }.
+const runPlanningTurn = async ({ history, userProfile, recentTitles }) => {
+  const provider = userProfile?.aiProvider || 'gemini';
+  if (provider === 'gemini') {
+    const ok = await reserveGroundedSearch();
+    if (!ok) {
+      return { reply: "I've hit today's shared AI-search limit. Try again tomorrow, or add your own AI key in Settings to keep going.", needInfo: false, suggestions: [] };
+    }
+  }
+  const prompt = buildPlanningPrompt({ history, userProfile, recentTitles });
+  const text = await callAI({ prompt, useWebSearch: true, provider });
+  const parsed = extractJsonObject(text) || {};
+  let suggestions = Array.isArray(parsed.suggestions) ? parsed.suggestions.map(sanitizePlanEvent) : [];
+  suggestions = (
+    await Promise.all(
+      suggestions.map(async (s) => {
+        if (s.type !== 'Food & Drink' && s.type !== 'Nightlife') return s;
+        if (s.source === 'google') return s;
+        try {
+          const v = await verifyVenue({ name: s.title, location: s.location, radius: 15 });
+          if (v.found) return { ...s, url: v.url || s.url, source: v.url ? 'google' : s.source, priceTier: s.priceTier || v.priceTier, location: v.address || s.location };
+          if (v.verified) return null; // checked and not real/local → drop
+          return s; // couldn't verify → keep
+        } catch {
+          return s;
+        }
+      })
+    )
+  ).filter(Boolean);
+  return { reply: parsed.reply || '', needInfo: !!parsed.needInfo, suggestions };
+};
+
+// A single plan's conversation. Real-time message stream + the AI turn loop.
+const PlanChat = ({ plan, groupName, onBack }) => {
+  const { userId, userProfile, showGlobalMessage, googleAccessToken } = useContext(AppContext);
+  const [messages, setMessages] = useState([]);
+  const [text, setText] = useState('');
+  const [thinking, setThinking] = useState(false);
+  const [recentTitles, setRecentTitles] = useState([]);
+  const [groupData, setGroupData] = useState(null);
+  const [sendEvent, setSendEvent] = useState(null);
+  const bottomRef = useRef(null);
+
+  const planDocPath = plan.scope === 'group'
+    ? `artifacts/${appId}/public/data/groups/${plan.groupId}/plans/${plan.id}`
+    : `artifacts/${appId}/users/${userId}/plans/${plan.id}`;
+
+  const scrollSoon = () => setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
+
+  // Live message stream for this plan.
+  useEffect(() => {
+    const qy = query(collection(db, `${planDocPath}/messages`), orderBy('timestamp', 'asc'), limit(200));
+    return onSnapshot(qy, (snap) => {
+      setMessages(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+      scrollSoon();
+    }, () => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [planDocPath]);
+
+  // Recent feed titles as a taste signal (fetched once).
+  useEffect(() => {
+    if (!userId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const snap = await getDocs(query(collection(db, `artifacts/${appId}/users/${userId}/feed`), orderBy('timestamp', 'desc'), limit(20)));
+        const titles = [...new Set(snap.docs.map((d) => d.data()?.data?.title).filter(Boolean))].slice(0, 15);
+        if (!cancelled) setRecentTitles(titles);
+      } catch {
+        /* taste signal is optional */
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [userId]);
+
+  // Group members/name for the Propose action (group plans only).
+  useEffect(() => {
+    if (plan.scope !== 'group') return;
+    getDoc(doc(db, `artifacts/${appId}/public/data/groups`, plan.groupId))
+      .then((s) => { if (s.exists()) setGroupData({ id: s.id, ...s.data() }); })
+      .catch(() => {});
+  }, [plan.scope, plan.groupId]);
+
+  const send = async (e) => {
+    e.preventDefault();
+    const body = text.trim();
+    if (!body || thinking) return;
+    setText('');
+    const isFirst = messages.length === 0;
+    const planRef = doc(db, planDocPath);
+    const msgsCol = collection(db, `${planDocPath}/messages`);
+    try {
+      await addDoc(msgsCol, { role: 'user', text: body, senderId: userId, senderName: userProfile?.name || 'You', suggestions: null, timestamp: serverTimestamp() });
+      const planUpdate = { lastMessageAt: serverTimestamp(), updatedAt: serverTimestamp() };
+      if (isFirst) planUpdate.title = body.slice(0, 60);
+      await updateDoc(planRef, planUpdate).catch(() => {});
+    } catch (err) {
+      console.error('Failed to send plan message:', err);
+      showGlobalMessage('Could not send. Check your connection.', 'error');
+      return;
+    }
+    setThinking(true);
+    scrollSoon();
+    try {
+      const history = [...messages.map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', text: m.text })), { role: 'user', text: body }];
+      const { reply, suggestions } = await runPlanningTurn({ history, userProfile, recentTitles });
+      const fallback = suggestions.length ? 'Here are a few ideas:' : "Tell me a bit more and I'll find some options.";
+      await addDoc(msgsCol, {
+        role: 'assistant',
+        text: reply || fallback,
+        senderId: 'assistant',
+        senderName: 'Planner',
+        suggestions: suggestions.length ? suggestions : null,
+        timestamp: serverTimestamp(),
+      });
+      await updateDoc(planRef, { lastMessageAt: serverTimestamp(), updatedAt: serverTimestamp() }).catch(() => {});
+    } catch (err) {
+      console.error('Planning turn failed:', err);
+      await addDoc(msgsCol, { role: 'assistant', text: 'Something went wrong reaching the planner — try again in a moment.', senderId: 'assistant', senderName: 'Planner', suggestions: null, timestamp: serverTimestamp() }).catch(() => {});
+    } finally {
+      setThinking(false);
+      scrollSoon();
+    }
+  };
+
+  const proposeToGroup = async (idea) => {
+    if (!groupData) { showGlobalMessage('Group still loading — try again.', 'error'); return; }
+    try {
+      const ref = await addDoc(collection(db, `artifacts/${appId}/public/data/groups/${plan.groupId}/proposals`), {
+        ...idea, proposerId: userId, proposerName: userProfile.name, groupId: plan.groupId, groupName: groupData.name, rsvps: { [userId]: 'yes' }, createdAt: serverTimestamp(),
+      });
+      const batch = writeBatch(db);
+      (groupData.members || []).forEach((mid) => {
+        if (mid === userId) return;
+        batch.set(doc(collection(db, `artifacts/${appId}/users/${mid}/feed`)), { type: 'groupProposal', data: { ...idea, proposerName: userProfile.name, groupId: plan.groupId, groupName: groupData.name, proposalId: ref.id }, timestamp: serverTimestamp() });
+      });
+      await batch.commit();
+      showGlobalMessage(`Proposed to ${groupData.name}!`);
+    } catch (err) {
+      console.error(err);
+      showGlobalMessage('Failed to propose.', 'error');
+    }
+  };
+
+  const onPropose = (idea) => { if (plan.scope === 'group') proposeToGroup(idea); else setSendEvent(idea); };
+
+  return (
+    <div className="flex flex-col h-[70vh] -m-4 md:-m-6">
+      <header className="flex items-center gap-3 p-4 border-b border-gray-100 bg-white/70">
+        <button onClick={onBack} className="p-2 rounded-full hover:bg-gray-100 text-gray-500" title="Back to plans" aria-label="Back to plans">
+          <Icon path="M15 19l-7-7 7-7" className="w-5 h-5" />
+        </button>
+        <div className="min-w-0">
+          <p className="font-bold text-gray-900 truncate">{plan.title || 'New plan'}</p>
+          <p className="text-xs text-gray-400">{plan.scope === 'group' ? `👥 ${groupName || 'Group'}` : '🧍 Just you'}</p>
+        </div>
+      </header>
+
+      <div className="flex-1 overflow-y-auto p-4 space-y-3 bg-slate-50">
+        {messages.length === 0 && !thinking && (
+          <div className="text-center text-gray-400 py-10">
+            <p className="font-medium">Where are you headed?</p>
+            <p className="text-sm">Try “I'm going to Soho with my two kids tomorrow” or “Bear Mountain on June 24th.”</p>
+          </div>
+        )}
+        {messages.map((m) => {
+          const isAssistant = m.role === 'assistant';
+          const isMine = !isAssistant && m.senderId === userId;
+          const sugg = Array.isArray(m.suggestions) ? m.suggestions : [];
+          return (
+            <div key={m.id} className={`flex ${isMine ? 'justify-end' : 'justify-start'}`}>
+              <div className={sugg.length ? 'max-w-[92%] w-full' : 'max-w-[85%]'}>
+                <div className={`px-4 py-2 rounded-2xl text-sm ${isMine ? 'bg-indigo-600 text-white rounded-br-none' : 'bg-white text-gray-800 shadow-sm border border-gray-100 rounded-bl-none'}`}>
+                  {!isMine && <p className="text-xs font-bold text-gray-400 mb-1">{isAssistant ? '✨ Planner' : m.senderName || 'Member'}</p>}
+                  {m.text && <span className="whitespace-pre-wrap">{m.text}</span>}
+                </div>
+                {sugg.length > 0 && (
+                  <div className="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {sugg.map((idea, i) => (
+                      <SuggestionCard
+                        key={i}
+                        idea={idea}
+                        onPropose={onPropose}
+                        googleAccessToken={googleAccessToken}
+                        showGlobalMessage={showGlobalMessage}
+                        proposeLabel={plan.scope === 'group' ? 'Propose' : 'Send to group'}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+        {thinking && (
+          <div className="flex justify-start">
+            <div className="px-4 py-2 rounded-2xl bg-white border border-gray-100 shadow-sm rounded-bl-none flex items-center gap-2 text-sm text-gray-500">
+              <div className="w-4 h-4 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" /> Planner is thinking…
+            </div>
+          </div>
+        )}
+        <div ref={bottomRef} />
+      </div>
+
+      <form onSubmit={send} className="p-3 bg-white border-t flex gap-2 items-center">
+        <input className="flex-1 bg-gray-100 border-0 rounded-full px-4 py-2.5 focus:ring-2 focus:ring-indigo-500" value={text} onChange={(e) => setText(e.target.value)} placeholder="Describe your outing…" disabled={thinking} />
+        <button type="submit" className="p-2.5 bg-indigo-600 text-white rounded-full hover:bg-indigo-700 disabled:opacity-50" disabled={!text.trim() || thinking}>
+          <SendIcon className="w-5 h-5" />
+        </button>
+      </form>
+
+      {sendEvent && <SendToGroupModal event={sendEvent} onClose={() => setSendEvent(null)} />}
+    </div>
+  );
+};
+
+// The Plan tab body: a history list of saved plans (personal + group) plus the
+// New-plan flow; selecting a plan opens its PlanChat conversation.
+const PlanSection = () => {
+  const { userId, userProfile, showGlobalMessage } = useContext(AppContext);
+  const [personalPlans, setPersonalPlans] = useState([]);
+  const [groupPlansMap, setGroupPlansMap] = useState({});
+  const [myGroups, setMyGroups] = useState([]);
+  const [selectedPlan, setSelectedPlan] = useState(null);
+  const [showNew, setShowNew] = useState(false);
+  const [newScope, setNewScope] = useState('personal');
+  const [newGroupId, setNewGroupId] = useState('');
+  const groupIdsKey = userProfile?.groupIds?.join(',') || '';
+
+  // Personal plans (live).
+  useEffect(() => {
+    if (!userId) return;
+    const qy = query(collection(db, `artifacts/${appId}/users/${userId}/plans`), orderBy('lastMessageAt', 'desc'));
+    return onSnapshot(qy, (snap) => setPersonalPlans(snap.docs.map((d) => ({ id: d.id, scope: 'personal', ...d.data() }))), () => {});
+  }, [userId]);
+
+  // Group plans (one live listener per group; errors ignored so an
+  // unpublished rule doesn't spam the console).
+  useEffect(() => {
+    const gids = userProfile?.groupIds || [];
+    if (!gids.length) { setGroupPlansMap({}); return; }
+    const unsubs = gids.map((gid) =>
+      onSnapshot(
+        query(collection(db, `artifacts/${appId}/public/data/groups/${gid}/plans`), orderBy('lastMessageAt', 'desc')),
+        (snap) => setGroupPlansMap((prev) => ({ ...prev, [gid]: snap.docs.map((d) => ({ id: d.id, scope: 'group', groupId: gid, ...d.data() })) })),
+        () => {}
+      )
+    );
+    return () => unsubs.forEach((u) => u());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groupIdsKey]);
+
+  // Group names for the picker + list labels.
+  useEffect(() => {
+    const gids = userProfile?.groupIds || [];
+    if (!gids.length) { setMyGroups([]); return; }
+    let cancelled = false;
+    Promise.all(
+      gids.map(async (gid) => {
+        try { const s = await getDoc(doc(db, `artifacts/${appId}/public/data/groups`, gid)); return s.exists() ? { id: s.id, name: s.data().name } : null; } catch { return null; }
+      })
+    ).then((arr) => { if (!cancelled) setMyGroups(arr.filter(Boolean)); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groupIdsKey]);
+
+  const groupNameById = (gid) => myGroups.find((g) => g.id === gid)?.name || 'Group';
+
+  const allPlans = useMemo(() => {
+    const merged = [...personalPlans, ...Object.values(groupPlansMap).flat()];
+    return merged.sort((a, b) => (b.lastMessageAt?.toMillis?.() || 0) - (a.lastMessageAt?.toMillis?.() || 0));
+  }, [personalPlans, groupPlansMap]);
+
+  const createPlan = async () => {
+    if (newScope === 'group' && !newGroupId) { showGlobalMessage('Pick a group first.', 'error'); return; }
+    const base = {
+      title: 'New plan', destination: '', dateText: '', companions: '',
+      scope: newScope, createdBy: userId, createdByName: userProfile?.name || 'Someone',
+      createdAt: serverTimestamp(), updatedAt: serverTimestamp(), lastMessageAt: serverTimestamp(),
+    };
+    try {
+      let ref;
+      if (newScope === 'group') {
+        base.groupId = newGroupId;
+        ref = await addDoc(collection(db, `artifacts/${appId}/public/data/groups/${newGroupId}/plans`), base);
+      } else {
+        ref = await addDoc(collection(db, `artifacts/${appId}/users/${userId}/plans`), base);
+      }
+      setShowNew(false); setNewScope('personal'); setNewGroupId('');
+      setSelectedPlan({ id: ref.id, ...base });
+    } catch (err) {
+      console.error(err);
+      showGlobalMessage('Could not start a plan.', 'error');
+    }
+  };
+
+  if (selectedPlan) {
+    return (
+      <PlanChat
+        plan={selectedPlan}
+        groupName={selectedPlan.scope === 'group' ? groupNameById(selectedPlan.groupId) : ''}
+        onBack={() => setSelectedPlan(null)}
+      />
+    );
+  }
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-5 gap-3">
+        <div className="min-w-0">
+          <h2 className="text-2xl font-bold text-gray-900">Plan an outing</h2>
+          <p className="text-sm text-gray-500">Tell me where you're headed and I'll suggest places to eat &amp; things to do.</p>
+        </div>
+        <button onClick={() => setShowNew((v) => !v)} className="bg-indigo-600 text-white px-4 py-2.5 rounded-xl font-bold shadow hover:bg-indigo-700 transition flex items-center gap-1 flex-shrink-0">
+          <PlusIcon className="w-5 h-5" /> New plan
+        </button>
+      </div>
+
+      {showNew && (
+        <div className="mb-6 bg-indigo-50 border border-indigo-100 rounded-2xl p-4">
+          <p className="text-sm font-bold text-indigo-900 mb-3">Who's this plan for?</p>
+          <div className="flex flex-wrap gap-2 mb-3">
+            <button onClick={() => setNewScope('personal')} className={`px-4 py-2 rounded-full text-sm font-semibold border transition ${newScope === 'personal' ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-700 border-gray-200'}`}>Just me</button>
+            <button onClick={() => setNewScope('group')} disabled={!myGroups.length} className={`px-4 py-2 rounded-full text-sm font-semibold border transition disabled:opacity-40 ${newScope === 'group' ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-700 border-gray-200'}`}>A group</button>
+          </div>
+          {newScope === 'group' && (
+            <select value={newGroupId} onChange={(e) => setNewGroupId(e.target.value)} className="w-full p-2.5 rounded-xl border border-indigo-200 bg-white text-sm mb-3">
+              <option value="">Choose a group…</option>
+              {myGroups.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
+            </select>
+          )}
+          <div className="flex gap-2">
+            <button onClick={createPlan} className="bg-indigo-600 text-white px-5 py-2 rounded-xl font-bold hover:bg-indigo-700 transition">Start planning</button>
+            <button onClick={() => setShowNew(false)} className="px-4 py-2 rounded-xl font-medium text-gray-500 hover:bg-gray-100 transition">Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {allPlans.length === 0 ? (
+        <div className="text-center py-16 text-gray-400">
+          <SparklesIcon className="w-10 h-10 mx-auto mb-3 text-indigo-200" />
+          <p className="font-medium">No plans yet.</p>
+          <p className="text-sm">Tap “New plan” and describe an outing — like “I'm going to Soho with my two kids.”</p>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {allPlans.map((p) => (
+            <button key={`${p.scope}-${p.id}`} onClick={() => setSelectedPlan(p)} className="w-full text-left bg-white border border-gray-100 rounded-2xl p-4 shadow-sm hover:shadow-md transition flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <p className="font-bold text-gray-900 truncate">{p.title || 'New plan'}</p>
+                <p className="text-xs text-gray-400 truncate">
+                  {p.scope === 'group' ? `👥 ${groupNameById(p.groupId)}` : '🧍 Just you'}
+                  {p.destination ? ` · ${p.destination}` : ''}
+                  {p.dateText ? ` · ${p.dateText}` : ''}
+                </p>
+              </div>
+              <Icon path="M9 5l7 7-7 7" className="w-5 h-5 text-gray-300 flex-shrink-0" />
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 };

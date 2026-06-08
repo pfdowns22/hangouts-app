@@ -53,10 +53,16 @@ component name rather than scrolling.
 - **Images**: `useEventImage`, `pollinationsImage`, Unsplash cache, text placeholders.
 - **State**: `AppContext` (React context) holds user/profile/tab state app-wide.
 - **Icons**: a large block of inline SVG `Icon` components (`MenuIcon`, `FunnelIcon`, …).
-- **Three main tabs** rendered by `MainContent`, switched via `activeTab`:
+- **Four main tabs** rendered by `MainContent`, switched via `activeTab`:
   - `myFeed` → `MyFeedSection` (+ `FeedCard`, filter/sort funnel popover)
   - `groups` → `GroupSection` (+ `GroupDetailView`, `GroupProposals`, `ProposalCard`, `ChatRoom`)
   - `suggestions` → `SuggestionSection` (AI event generation)
+  - `plan` → `PlanSection` (+ `PlanChat`): conversational outing planner. Free-text trip
+    → `runPlanningTurn`/`buildPlanningPrompt` (grounded AI + `verifyVenue`) → suggestion
+    cards inline. Plans persist at `users/{uid}/plans` (personal) or
+    `groups/{gid}/plans` (shared); each has a `messages` subcollection. Group plans need
+    the `plans` rules block in `firestore.rules` published; personal plans use the
+    per-user catch-all rule.
 - **Auth/onboarding**: `AuthScreen`, `SurveyModal`, `LegalAcceptanceModal`, `NameSettingModal`
 - **Profile/settings**: `ProfileSection`, `SettingsSection`, `CalendarPicker` (availability)
 - **Sharing**: `InviteModal`, `JoinGroupModal`, `SendToGroupModal`
