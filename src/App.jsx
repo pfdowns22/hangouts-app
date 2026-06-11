@@ -456,10 +456,10 @@ const AFFILIATE_STATUS = [
   ['Booking / Expedia', import.meta.env.VITE_AFFILIATE_BOOKING],
 ].map(([label, v]) => ({ label, on: !!v }));
 
-// Owner gate: emails allowed to view the /owner dashboard, from VITE_OWNER_EMAIL
-// (comma-separated, set in Vercel). Unset → nobody qualifies (safe default).
-const OWNER_EMAILS = (import.meta.env.VITE_OWNER_EMAIL || '')
-  .split(',')
+// Owner gate: emails allowed to view the /owner dashboard. Includes a hardcoded
+// owner so the dashboard works without any Vercel config; VITE_OWNER_EMAIL
+// (comma-separated, set in Vercel) adds more allowed emails on top.
+const OWNER_EMAILS = ['paulfitzgeralddowns@gmail.com', ...(import.meta.env.VITE_OWNER_EMAIL || '').split(',')]
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
 const isOwnerEmail = (email) => !!email && OWNER_EMAILS.includes(email.toLowerCase());
