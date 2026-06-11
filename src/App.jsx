@@ -412,19 +412,35 @@ const moreInfoUrl = (event) => {
 };
 
 // Tickets action for an event card. Returns null for non-ticketed events.
-// Direct purchase link only from a trusted source (affiliate-wrapped);
-// otherwise a ticket search, so ticketed events are always actionable.
+// Resolution order — designed to land on a REAL ticket page, never a wrong
+// vendor (the old code always sent unmatched events to a Ticketmaster search,
+// which is wrong for e.g. a Colosseum tour that's sold on GetYourGuide):
+//   1. A valid, event-specific ticket/official URL — from a trusted partner OR
+//      provided by the AI (validHttpUrl strips placeholders/junk). This is the
+//      actual page; affiliateUrl() wraps it only when it's a partner we earn on.
+//   2. No usable URL → pick the ticket VENDOR that actually sells THIS kind of
+//      event: concerts/sports/nightlife → Ticketmaster; tours/attractions/arts/
+//      outdoors/markets → GetYourGuide (affiliate-covered via the Viator/GYG id).
+//   3. Anything ambiguous → a targeted "<title> … tickets" web search, which
+//      reliably surfaces the real ticket page instead of guessing a vendor.
 const ticketAction = (event) => {
   if (!event?.isTicketed) return null;
-  if (TRUSTED_URL_SOURCES.has(event?.source)) {
-    const direct = validHttpUrl(event?.ticketsUrl);
-    if (direct) return { href: affiliateUrl(direct), label: '🎟️ Buy Tickets' };
-  }
-  // No direct link → send them to a ticket VENDOR search (buyable listings),
-  // not a generic Google search, and affiliate-wrap it so it also earns.
+  // 1. Prefer a real, specific link (ticket URL first, else the official page).
+  const direct = validHttpUrl(event?.ticketsUrl) || validHttpUrl(event?.url);
+  if (direct) return { href: affiliateUrl(direct), label: '🎟️ Buy Tickets' };
+
+  // 2/3. No usable link → vendor by event type, else a targeted ticket search.
   const q = [event?.title, event?.location].filter(Boolean).join(' ');
-  const vendor = `https://www.ticketmaster.com/search?q=${encodeURIComponent(q || 'events')}`;
-  return { href: affiliateUrl(vendor), label: '🎟️ Find Tickets' };
+  const enc = encodeURIComponent(q || 'tickets');
+  const type = event?.type;
+  if (type === 'Music' || type === 'Sports' || type === 'Nightlife') {
+    return { href: affiliateUrl(`https://www.ticketmaster.com/search?q=${enc}`), label: '🎟️ Find Tickets' };
+  }
+  if (type === 'Arts & Culture' || type === 'Outdoors' || type === 'Community' || type === 'Markets') {
+    return { href: affiliateUrl(`https://www.getyourguide.com/s/?q=${enc}`), label: '🎟️ Find Tickets' };
+  }
+  // Ambiguous ('Other', 'Food & Drink', or missing) → real-page web search.
+  return { href: searchUrl(event, 'tickets'), label: '🎟️ Find Tickets' };
 };
 
 // A best-effort destination string for maps/ride deep-links. Events only persist
