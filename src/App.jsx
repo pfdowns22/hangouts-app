@@ -2284,7 +2284,10 @@ const MyFeedSection = () => {
           const to = ms(s.activeTo);
           if (from && now < from) return false;
           if (to && now > to) return false;
-          if (s.targetBorough && borough && s.targetBorough !== borough) return false;
+          // Optional borough targeting — the sponsor's chosen borough is stored
+          // as `borough` (matches the checkout/webhook field). When set, only
+          // show the placement to users in that borough; otherwise show to all.
+          if (s.borough && borough && s.borough !== borough) return false;
           return true;
         });
       const pick = active[0] || null;

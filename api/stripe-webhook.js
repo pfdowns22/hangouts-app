@@ -37,7 +37,11 @@ export default async function handler(req, res) {
       const db = admin.firestore();
       const days = parseInt(m.days, 10) || 7;
       const appId = m.appId || 'hangouts-app';
-      await db.collection(`artifacts/${appId}/public/data/sponsored`).add({
+      // Idempotency: Stripe may deliver checkout.session.completed more than
+      // once. Key the placement by the session id and CREATE it (fails if it
+      // already exists) so a retry never makes a duplicate placement or resets
+      // the impression/click counters on the existing one.
+      await db.collection(`artifacts/${appId}/public/data/sponsored`).doc(s.id).create({
         title: m.title || '',
         description: m.description || '',
         url: m.url || '',
@@ -56,6 +60,11 @@ export default async function handler(req, res) {
         createdAt: admin.firestore.Timestamp.now(),
       });
     } catch (e) {
+      // Already activated by an earlier delivery → ack so Stripe stops retrying.
+      if (e?.code === 6 || /already exists/i.test(e?.message || '')) {
+        res.status(200).json({ received: true, duplicate: true });
+        return;
+      }
       console.error('webhook activate error:', e);
       res.status(500).json({ error: 'activation failed' });
       return;

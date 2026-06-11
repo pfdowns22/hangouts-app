@@ -51,6 +51,25 @@ export const fetchPlaces = async ({ lat, lng, location, radius, term, categories
   }
 };
 
+// Fetch a live ride quote from the partner scaffold (/api/ride-quote → Uber
+// Guest Rides / Lyft partner). Returns null unless a partner is configured AND
+// returns a usable quote, so callers fall back to the affiliate deep-link.
+// Never throws.
+export const fetchRideQuote = async ({ address, lat, lng } = {}) => {
+  try {
+    const res = await fetch('/api/ride-quote', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dropoff: { address, lat, lng } }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => null);
+    return data && data.available ? data : null;
+  } catch {
+    return null;
+  }
+};
+
 // Verify a single venue is real & within radius (Google Places). Returns the
 // proxy's { verified, found, url, rating, priceTier, address } shape. On any
 // failure returns { verified: false } so callers keep the item rather than drop it.
