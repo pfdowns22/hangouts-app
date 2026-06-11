@@ -242,6 +242,47 @@ const TicketedBadge = ({ isTicketed }) => {
   );
 };
 
+// Resale signal for SeatGeek-sourced events: a "from $NN" lowest price, the live
+// listing count, and a deal tier we DERIVE from the price stats (SeatGeek's API
+// exposes lowest/average price, not their consumer-facing "Deal Score", so we
+// compute our own: how far the cheapest listing sits below the average).
+// Returns null for events without usable SeatGeek pricing.
+const resaleInfo = (event) => {
+  if (event?.source !== 'seatgeek') return null;
+  const low = Number(event.lowestPrice);
+  if (!Number.isFinite(low) || low <= 0) return null;
+  const listingsRaw = Number(event.listingCount);
+  const listings = Number.isFinite(listingsRaw) && listingsRaw > 0 ? listingsRaw : 0;
+  // Deal baseline: prefer the MEDIAN (the average is skewed up by premium
+  // seats). Only call it a deal with enough listings that the comparison means
+  // something — a lone listing isn't a "deal".
+  const baseline = Number(event.medianPrice) || Number(event.avgPrice) || 0;
+  let deal = null;
+  if (baseline > 0 && listings >= 3) {
+    const ratio = low / baseline;
+    if (ratio <= 0.5) deal = 'Great deal';
+    else if (ratio <= 0.7) deal = 'Good deal';
+  }
+  // Last-minute scarcity cue (only meaningful when we're not already touting a deal).
+  const scarce = listings > 0 && listings <= 6;
+  return { from: Math.round(low), listings, deal, scarce };
+};
+
+const ResaleBadge = ({ event }) => {
+  const info = resaleInfo(event);
+  if (!info) return null;
+  return (
+    <span
+      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-rose-50 text-rose-700 text-xs font-bold"
+      title={`Resale tickets from $${info.from}${info.listings ? ` · ${info.listings} live listings` : ''} on SeatGeek`}
+    >
+      from ${info.from}
+      {info.deal && <span className="ml-1 px-1.5 rounded bg-rose-600 text-white text-[10px] font-bold uppercase tracking-wide">{info.deal}</span>}
+      {!info.deal && info.scarce && <span className="ml-1 text-[10px] font-semibold text-rose-500">{info.listings} left</span>}
+    </span>
+  );
+};
+
 // Badge shown for events sourced from a named partner API. The AI ('ai')
 // source is intentionally omitted so users never see "suggested by AI" — those
 // events simply show no source badge.
@@ -399,6 +440,46 @@ const affiliateUrl = (rawUrl) => {
   }
   const partner = AFFILIATE_PARTNERS.find((p) => p.test.test(host));
   return partner ? wrapAffiliate(rawUrl, partner.tmpl) : rawUrl;
+};
+
+// Affiliate enrollment status (label + whether its id is set) — literal env
+// reads so Vite inlines them; powers the owner dashboard's "N of M enrolled".
+const AFFILIATE_STATUS = [
+  ['Ticketmaster / Live Nation', import.meta.env.VITE_AFFILIATE_TICKETMASTER],
+  ['SeatGeek', import.meta.env.VITE_AFFILIATE_SEATGEEK],
+  ['StubHub', import.meta.env.VITE_AFFILIATE_STUBHUB],
+  ['Vivid Seats', import.meta.env.VITE_AFFILIATE_VIVIDSEATS],
+  ['Viator / GetYourGuide', import.meta.env.VITE_AFFILIATE_VIATOR],
+  ['OpenTable / Resy', import.meta.env.VITE_AFFILIATE_OPENTABLE],
+  ['Uber', import.meta.env.VITE_AFFILIATE_UBER],
+  ['Lyft', import.meta.env.VITE_AFFILIATE_LYFT],
+  ['Booking / Expedia', import.meta.env.VITE_AFFILIATE_BOOKING],
+].map(([label, v]) => ({ label, on: !!v }));
+
+// Owner gate: emails allowed to view the /owner dashboard, from VITE_OWNER_EMAIL
+// (comma-separated, set in Vercel). Unset → nobody qualifies (safe default).
+const OWNER_EMAILS = (import.meta.env.VITE_OWNER_EMAIL || '')
+  .split(',')
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+const isOwnerEmail = (email) => !!email && OWNER_EMAILS.includes(email.toLowerCase());
+
+// Best-effort tally of monetizable outbound clicks (ticket / ride / affiliate
+// links) into a single counter doc, so the owner dashboard can show affiliate
+// engagement. Counts by kind and by destination host; never blocks navigation.
+const trackAffiliateClick = (kind, href) => {
+  try {
+    const payload = { total: increment(1), kinds: { [kind]: increment(1) } };
+    try {
+      const host = new URL(href).hostname.replace(/^www\./, '').replace(/\./g, '_');
+      if (host) payload.hosts = { [host]: increment(1) };
+    } catch {
+      /* unparseable href → just count the kind */
+    }
+    setDoc(doc(db, `artifacts/${appId}/public/data/meta`, 'affiliate-clicks'), payload, { merge: true }).catch(() => {});
+  } catch {
+    /* tracking is best-effort */
+  }
 };
 
 // "More Info" target: the event's own URL only when it comes from a trusted
@@ -2882,6 +2963,7 @@ const FeedCard = ({ item, onDelete }) => {
                 <PriceTierBadge tier={data.priceTier} />
                 <TicketedBadge isTicketed={data.isTicketed} />
                 <SourceBadge source={data.source} />
+                <ResaleBadge event={data} />
               </span>
             )}
           </div>
@@ -2904,6 +2986,7 @@ const FeedCard = ({ item, onDelete }) => {
           return t ? (
             <a
               href={t.href}
+              onClick={() => trackAffiliateClick('tickets', t.href)}
               target="_blank"
               rel="noopener noreferrer"
               className="flex-1 text-center text-sm font-bold text-white bg-emerald-600 hover:bg-emerald-700 py-2.5 rounded-lg transition flex items-center justify-center gap-1"
@@ -2928,6 +3011,7 @@ const FeedCard = ({ item, onDelete }) => {
         {isEvent && rideUrl(data) && (
           <a
             href={rideUrl(data)}
+            onClick={() => trackAffiliateClick('ride', rideUrl(data))}
             target="_blank"
             rel="noopener noreferrer sponsored"
             className="flex-1 text-center text-sm font-bold text-gray-900 bg-gray-900/5 hover:bg-gray-900/10 py-2.5 rounded-lg transition flex items-center justify-center gap-1"
@@ -3364,6 +3448,7 @@ const ProposalCard = ({ proposal, groupId }) => {
           <PriceTierBadge tier={proposal.priceTier} />
           <TicketedBadge isTicketed={proposal.isTicketed} />
           <SourceBadge source={proposal.source} />
+          <ResaleBadge event={proposal} />
         </div>
 
         <div className="mt-4 flex flex-col gap-2">
@@ -3951,6 +4036,7 @@ const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage,
             <PriceTierBadge tier={idea.priceTier} />
             <TicketedBadge isTicketed={idea.isTicketed} />
             <SourceBadge source={idea.source} />
+            <ResaleBadge event={idea} />
           </div>
         )}
       </div>
@@ -3969,6 +4055,7 @@ const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage,
           return t ? (
             <a
               href={t.href}
+              onClick={() => trackAffiliateClick('tickets', t.href)}
               target="_blank"
               rel="noopener noreferrer"
               className="flex items-center justify-center bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold p-2.5 rounded-lg transition"
@@ -3994,6 +4081,7 @@ const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage,
             {rideUrl(idea) && (
               <a
                 href={rideUrl(idea)}
+                onClick={() => trackAffiliateClick('ride', rideUrl(idea))}
                 target="_blank"
                 rel="noopener noreferrer sponsored"
                 className="flex-1 text-center bg-gray-900/5 text-gray-900 text-sm font-bold py-2.5 rounded-lg hover:bg-gray-900/10 transition flex items-center justify-center gap-1"
@@ -5760,6 +5848,189 @@ const SponsorLanding = () => {
   );
 };
 
+// --- Owner revenue/cost dashboard (gated /owner route) ---
+// Read-only view of data the app already records: sponsored marketplace
+// (revenue/impressions/clicks/CTR), AI grounding spend vs the daily cap,
+// affiliate enrollment + outbound affiliate-click tallies. No new backend.
+const OwnerDashboard = ({ userProfile, onClose }) => {
+  const [sponsored, setSponsored] = useState([]);
+  const [grounding, setGrounding] = useState([]); // [{ day, count }], newest first
+  const [clicks, setClicks] = useState({});
+
+  useEffect(
+    () => onSnapshot(collection(db, `artifacts/${appId}/public/data/sponsored`), (snap) => setSponsored(snap.docs.map((d) => ({ id: d.id, ...d.data() }))), () => {}),
+    []
+  );
+  useEffect(
+    () => onSnapshot(doc(db, `artifacts/${appId}/public/data/meta`, 'affiliate-clicks'), (s) => setClicks(s.exists() ? s.data() : {}), () => {}),
+    []
+  );
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const days = Array.from({ length: 7 }, (_, i) => new Date(Date.now() - i * 86400000).toISOString().slice(0, 10));
+      const rows = await Promise.all(
+        days.map(async (day) => {
+          try {
+            const s = await getDoc(doc(db, `artifacts/${appId}/public/data/meta`, `grounding-${day}`));
+            return { day, count: s.exists() ? s.data().count || 0 : 0 };
+          } catch {
+            return { day, count: 0 };
+          }
+        })
+      );
+      if (!cancelled) setGrounding(rows);
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const now = Date.now();
+  const money = (cents) => `$${Math.round((Number(cents) || 0) / 100).toLocaleString()}`;
+  const totalRev = sponsored.reduce((a, s) => a + (Number(s.amountPaid) || 0), 0);
+  const totalImpr = sponsored.reduce((a, s) => a + (Number(s.impressions) || 0), 0);
+  const totalClicks = sponsored.reduce((a, s) => a + (Number(s.clicks) || 0), 0);
+  const ctr = totalImpr ? (totalClicks / totalImpr) * 100 : 0;
+  const activeCount = sponsored.filter((s) => (s.activeTo?.toMillis?.() || 0) > now).length;
+
+  const todayG = grounding[0]?.count || 0;
+  const gPct = Math.min(100, Math.round((todayG / GROUNDING_DAILY_CAP) * 100));
+  const gNearCap = todayG >= GROUNDING_DAILY_CAP * 0.8;
+
+  const affKinds = clicks.kinds || {};
+  const affTotal = clicks.total || 0;
+  const enrolled = AFFILIATE_STATUS.filter((p) => p.on).length;
+
+  const Stat = ({ label, value, sub }) => (
+    <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4">
+      <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide">{label}</p>
+      <p className="text-2xl font-bold text-gray-900 mt-1">{value}</p>
+      {sub && <p className="text-xs text-gray-400 mt-0.5">{sub}</p>}
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen bg-slate-50 text-gray-900">
+      <header className="bg-white border-b border-gray-100 sticky top-0 z-10">
+        <div className="max-w-5xl mx-auto flex items-center gap-3 p-4">
+          <button onClick={onClose} className="p-2 rounded-full hover:bg-gray-100 text-gray-500" title="Back to Hangouts" aria-label="Back to Hangouts">
+            <Icon path="M15 19l-7-7 7-7" className="w-5 h-5" />
+          </button>
+          <div>
+            <h1 className="text-xl font-bold">Owner dashboard</h1>
+            <p className="text-xs text-gray-400">Signed in as {userProfile?.email || 'owner'}</p>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-5xl mx-auto p-4 md:p-6 space-y-6">
+        {/* Sponsored marketplace KPIs */}
+        <section>
+          <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-3">Sponsored marketplace</h2>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <Stat label="Revenue" value={money(totalRev)} sub={`${sponsored.length} placement${sponsored.length === 1 ? '' : 's'} all-time`} />
+            <Stat label="Active now" value={activeCount} sub="currently running" />
+            <Stat label="Impressions" value={totalImpr.toLocaleString()} sub={`${totalClicks.toLocaleString()} clicks`} />
+            <Stat label="CTR" value={`${ctr.toFixed(1)}%`} sub="blended" />
+          </div>
+        </section>
+
+        {/* AI grounding spend */}
+        <section className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4">
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide">AI search spend (today)</h2>
+            {gNearCap && <span className="text-xs font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-md">Near daily cap</span>}
+          </div>
+          <p className="text-2xl font-bold">{todayG.toLocaleString()} <span className="text-sm font-medium text-gray-400">/ {GROUNDING_DAILY_CAP.toLocaleString()} grounded searches</span></p>
+          <div className="mt-2 h-2 bg-gray-100 rounded-full overflow-hidden">
+            <div className={`h-full ${gNearCap ? 'bg-amber-500' : 'bg-indigo-500'}`} style={{ width: `${gPct}%` }} />
+          </div>
+          <div className="mt-3 flex flex-wrap gap-2 text-xs text-gray-500">
+            {grounding.map((g) => (
+              <span key={g.day} className="bg-gray-50 border border-gray-100 rounded px-2 py-0.5">{g.day.slice(5)}: {g.count}</span>
+            ))}
+          </div>
+          <p className="text-xs text-gray-400 mt-2">Free up to {GROUNDING_DAILY_CAP.toLocaleString()}/day; beyond Google's 1,500 it's ~$35/1,000.</p>
+        </section>
+
+        {/* Affiliate engagement + enrollment */}
+        <section className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4">
+            <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-2">Affiliate clicks</h2>
+            <p className="text-2xl font-bold">{Number(affTotal).toLocaleString()} <span className="text-sm font-medium text-gray-400">outbound</span></p>
+            <div className="mt-3 space-y-1 text-sm">
+              {Object.keys(affKinds).length === 0 ? (
+                <p className="text-gray-400 text-xs">No clicks tracked yet.</p>
+              ) : (
+                Object.entries(affKinds).map(([k, v]) => (
+                  <div key={k} className="flex justify-between"><span className="capitalize text-gray-600">{k}</span><span className="font-semibold">{Number(v).toLocaleString()}</span></div>
+                ))
+              )}
+            </div>
+          </div>
+          <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4">
+            <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-2">Affiliate enrollment</h2>
+            <p className="text-2xl font-bold">{enrolled} <span className="text-sm font-medium text-gray-400">of {AFFILIATE_STATUS.length} partners live</span></p>
+            <div className="mt-3 flex flex-wrap gap-1.5">
+              {AFFILIATE_STATUS.map((p) => (
+                <span key={p.label} className={`text-xs px-2 py-0.5 rounded-md border ${p.on ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-gray-50 text-gray-400 border-gray-200'}`}>
+                  {p.on ? '✓ ' : ''}{p.label}
+                </span>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        {/* Per-placement table */}
+        <section className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4 overflow-x-auto">
+          <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-3">Placements</h2>
+          {sponsored.length === 0 ? (
+            <p className="text-sm text-gray-400">No sponsored placements yet.</p>
+          ) : (
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-gray-400 text-xs uppercase">
+                  <th className="py-1 pr-3 font-semibold">Sponsor / Title</th>
+                  <th className="py-1 px-3 font-semibold text-right">Impr.</th>
+                  <th className="py-1 px-3 font-semibold text-right">Clicks</th>
+                  <th className="py-1 px-3 font-semibold text-right">CTR</th>
+                  <th className="py-1 px-3 font-semibold text-right">Paid</th>
+                  <th className="py-1 pl-3 font-semibold">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sponsored
+                  .slice()
+                  .sort((a, b) => (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0))
+                  .map((s) => {
+                    const impr = Number(s.impressions) || 0;
+                    const clk = Number(s.clicks) || 0;
+                    const rowCtr = impr ? ((clk / impr) * 100).toFixed(1) : '0.0';
+                    const active = (s.activeTo?.toMillis?.() || 0) > now;
+                    return (
+                      <tr key={s.id} className="border-t border-gray-50">
+                        <td className="py-2 pr-3">
+                          <p className="font-semibold text-gray-800 truncate max-w-[16rem]">{s.title || '(untitled)'}</p>
+                          <p className="text-xs text-gray-400 truncate max-w-[16rem]">{s.sponsorName || '—'}</p>
+                        </td>
+                        <td className="py-2 px-3 text-right">{impr.toLocaleString()}</td>
+                        <td className="py-2 px-3 text-right">{clk.toLocaleString()}</td>
+                        <td className="py-2 px-3 text-right">{rowCtr}%</td>
+                        <td className="py-2 px-3 text-right">{money(s.amountPaid)}</td>
+                        <td className="py-2 pl-3">
+                          <span className={`text-xs px-2 py-0.5 rounded-md ${active ? 'bg-emerald-50 text-emerald-700' : 'bg-gray-100 text-gray-500'}`}>{active ? 'Active' : 'Ended'}</span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+              </tbody>
+            </table>
+          )}
+        </section>
+      </main>
+    </div>
+  );
+};
+
 // --- Main App ---
 export default function App() {
   if (typeof window !== 'undefined' && window.location.pathname === '/sponsor') return <SponsorLanding />;
@@ -5956,6 +6227,18 @@ export default function App() {
       >
         {!userId ? (
           <AuthScreen />
+        ) : typeof window !== 'undefined' && window.location.pathname === '/owner' ? (
+          isOwnerEmail(userProfile?.email) ? (
+            <OwnerDashboard userProfile={userProfile} onClose={() => { window.location.href = '/'; }} />
+          ) : (
+            <div className="min-h-screen flex items-center justify-center bg-slate-50 text-gray-500 p-6">
+              <div className="text-center">
+                <p className="font-bold text-lg text-gray-700">Not available</p>
+                <p className="text-sm mt-1">This page is for the app owner.</p>
+                <a href="/" className="inline-block mt-4 text-indigo-600 font-semibold">← Back to Hangouts</a>
+              </div>
+            </div>
+          )
         ) : (
         <div className="min-h-screen bg-[#F3F4F6] text-gray-900 font-sans p-4 md:p-8 overflow-x-hidden">
           <Header />

@@ -153,6 +153,7 @@ const seatgeek = {
     const data = await res.json();
     return (data?.events || []).map((e) => {
       const [d, t] = (e.datetime_local || '').split('T');
+      const st = e.stats || {};
       return {
         source: 'seatgeek',
         title: e.title,
@@ -162,9 +163,16 @@ const seatgeek = {
         url: e.url || null,
         imageUrl: e.performers?.[0]?.image || null,
         imageKeywords: [e.type, e.performers?.[0]?.name].filter(Boolean).join(' '),
-        priceTier: tierFromPrice(e.stats?.lowest_price),
+        priceTier: tierFromPrice(st.lowest_price),
         isTicketed: true,
         ticketsUrl: e.url || null,
+        // Resale price stats — the client shows "from $NN" + a derived deal
+        // badge from these. SeatGeek exposes these aggregates (not their
+        // consumer "Deal Score"), so the deal tier is computed client-side.
+        lowestPrice: st.lowest_price ?? null,
+        avgPrice: st.average_price ?? null,
+        medianPrice: st.median_price ?? null,
+        listingCount: st.visible_listing_count ?? st.listing_count ?? null,
         lat: e.venue?.location?.lat ?? null,
         lng: e.venue?.location?.lon ?? null,
         category: e.type || null,
