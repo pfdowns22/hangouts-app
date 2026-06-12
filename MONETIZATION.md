@@ -14,8 +14,7 @@ client (not secret); the rest are server-only.
 |---|---|---|---|
 | **Sponsored marketplace (Stripe)** | ✅ Real money once Stripe keys + webhook are set | §1 below | ~30 min |
 | **Affiliate % (tickets/experiences/reservations/rides)** | ⚙️ Code-ready, $0 until enrolled | Enroll per program, paste IDs (§2) | per-program signups |
-| **Ride deep-link affiliate** | ✅ Live (opens Uber w/ destination) | Uber/Lyft affiliate id (§2, §3) | small |
-| **Ride live quotes + in-app booking** | ⛔ Partner-gated; scaffold ready | Uber/Lyft *partner* approval (§3) | large + approval |
+| **Rides** | ⏸️ Button removed until a partner deal exists; "Directions" covers the UX | Uber/Lyft *partner* approval (§3) | large + approval |
 
 ---
 
@@ -111,11 +110,14 @@ marketplace. Best-known homes below:
 
 ---
 
-## 3. Rides (Uber / Lyft) — deep-link now, live quotes/booking after approval
+## 3. Rides (Uber / Lyft) — removed until a partner deal exists
 
-**Today (live):** the **Get a ride** button deep-links to Uber with the venue as
-the destination, affiliate-wrapped (`VITE_AFFILIATE_UBER`). Real but modest,
-often new-rider-weighted — treat as a bonus.
+**Today:** there is **no ride button**. The "Get a ride" Uber deep-link was
+removed (no agreement in place, no commission, and it just dumped users on
+Uber). The **Directions** button covers the UX — Google Maps routes from the
+user's current location to the venue. The Uber/Lyft entries in
+`AFFILIATE_PARTNERS` and the `VITE_AFFILIATE_UBER/LYFT` env slots remain (inert)
+so a ride button can return the moment an agreement exists.
 
 **Live fares + in-app booking (partner-gated):** Uber and Lyft **closed their
 public ride/estimate APIs** to general developers. To show real quotes and book
@@ -152,5 +154,5 @@ in-app you must be approved into a partner program:
 2. **`VITE_OWNER_EMAIL`** — so you can see `/owner`.
 3. **Affiliate networks** — Impact, CJ, Partnerize, AWIN accounts, then apply to
    the brands you care about; paste each id into the matching `VITE_AFFILIATE_*`. *(§2)*
-4. **Uber/Lyft affiliate** ids for the ride deep-link. *(§2)*
-5. *(Later)* **Uber Guest Rides / Lyft partner** approval for live quotes+booking. *(§3)*
+4. *(Later)* **Uber Guest Rides / Lyft partner** approval — unlocks restoring a
+   ride button with live quotes+booking. *(§3)*

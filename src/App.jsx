@@ -493,24 +493,45 @@ const moreInfoUrl = (event) => {
 };
 
 // Tickets action for an event card. Returns null for non-ticketed events.
-// Resolution order — designed to land on a REAL ticket page, never a wrong
-// vendor (the old code always sent unmatched events to a Ticketmaster search,
-// which is wrong for e.g. a Colosseum tour that's sold on GetYourGuide):
-//   1. A valid, event-specific ticket/official URL — from a trusted partner OR
-//      provided by the AI (validHttpUrl strips placeholders/junk). This is the
-//      actual page; affiliateUrl() wraps it only when it's a partner we earn on.
-//   2. No usable URL → pick the ticket VENDOR that actually sells THIS kind of
-//      event: concerts/sports/nightlife → Ticketmaster; tours/attractions/arts/
-//      outdoors/markets → GetYourGuide (affiliate-covered via the Viator/GYG id).
-//   3. Anything ambiguous → a targeted "<title> … tickets" web search, which
-//      reliably surfaces the real ticket page instead of guessing a vendor.
+// Hosts that are actual ticketing/booking vendors. A direct event URL is only
+// followed when it points at one of these (or came from a partner API). This is
+// the middle ground between two failure modes we've hit: never trusting AI URLs
+// sent a Colosseum tour to a Ticketmaster search (wrong vendor), while always
+// trusting them sent users to AI-fabricated dead links (a syntactically-valid
+// URL is NOT a real page). A known vendor host means a real ticket page.
+const TICKET_VENDOR_HOSTS = [
+  'ticketmaster.com', 'livenation.com', 'seatgeek.com', 'stubhub.com',
+  'vividseats.com', 'eventbrite.com', 'axs.com', 'ticketweb.com', 'dice.fm',
+  'gametime.co', 'tickpick.com', 'getyourguide.com', 'viator.com',
+  'todaytix.com', 'telecharge.com', 'fandango.com', 'feverup.com',
+];
+const isTicketVendorUrl = (href) => {
+  try {
+    const h = new URL(href).hostname.replace(/^www\./, '');
+    return TICKET_VENDOR_HOSTS.some((v) => h === v || h.endsWith(`.${v}`));
+  } catch {
+    return false;
+  }
+};
+
+// Tickets action for an event card. Returns null for non-ticketed events.
+// Resolution order — designed to ALWAYS land on a real, buyable page:
+//   1. The event's own ticket/official URL, but only when it's verifiably a
+//      ticket page: it came from a partner API (real listings) or points at a
+//      known ticketing vendor. Affiliate-wrapped when it's a partner we earn on.
+//   2. Otherwise → the ticket VENDOR that actually sells THIS kind of event:
+//      concerts/sports/nightlife → Ticketmaster search; tours/attractions/arts/
+//      outdoors/markets → GetYourGuide search (both always show live listings).
+//   3. Anything ambiguous → a targeted "<title> … tickets" web search.
 const ticketAction = (event) => {
   if (!event?.isTicketed) return null;
-  // 1. Prefer a real, specific link (ticket URL first, else the official page).
-  const direct = validHttpUrl(event?.ticketsUrl) || validHttpUrl(event?.url);
-  if (direct) return { href: affiliateUrl(direct), label: '🎟️ Buy Tickets' };
+  // 1. The event's own link, gated on being verifiably a ticket page.
+  const candidate = validHttpUrl(event?.ticketsUrl) || validHttpUrl(event?.url);
+  if (candidate && (TRUSTED_URL_SOURCES.has(event?.source) || isTicketVendorUrl(candidate))) {
+    return { href: affiliateUrl(candidate), label: '🎟️ Buy Tickets' };
+  }
 
-  // 2/3. No usable link → vendor by event type, else a targeted ticket search.
+  // 2/3. No verifiable link → vendor by event type, else a targeted ticket search.
   const q = [event?.title, event?.location].filter(Boolean).join(' ');
   const enc = encodeURIComponent(q || 'tickets');
   const type = event?.type;
@@ -542,17 +563,6 @@ const directionsUrl = (event) => {
   const dest = eventDestination(event);
   if (!dest) return null;
   return `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(dest)}`;
-};
-
-// "Get a ride" target — an Uber universal deep-link with the venue as dropoff
-// (pickup left to the user's current location). Affiliate-wrapped so rides
-// booked through us earn commission once VITE_AFFILIATE_UBER is set; otherwise
-// it's just a convenient deep-link. Returns null when we have no destination.
-const rideUrl = (event) => {
-  const dest = eventDestination(event);
-  if (!dest) return null;
-  const url = `https://m.uber.com/ul/?action=setPickup&pickup=my_location&dropoff[formatted_address]=${encodeURIComponent(dest)}`;
-  return affiliateUrl(url);
 };
 
 // Broad interests worth drilling into specifics for, so recommendations (and
@@ -2139,7 +2149,7 @@ const MyFeedSection = () => {
   const [feedTab, setFeedTab] = useState('today'); // today | upcoming
   const [filterMode, setFilterMode] = useState('all'); // all | free | cheap | expensive | ticketed
   const [typeFilter, setTypeFilter] = useState('all'); // all | one of EVENT_TYPES
-  const [sponsored, setSponsored] = useState(null); // one active sponsored placement, if any
+  const [activePlacements, setActivePlacements] = useState([]); // active-by-date sponsored docs
   const sponsoredSeenRef = useRef(null); // guards one impression count per placement
   const [sortMode, setSortMode] = useState('feed'); // feed | dateAsc | dateDesc | priceAsc | priceDesc
   const [showFilterPanel, setShowFilterPanel] = useState(false);
@@ -2269,37 +2279,68 @@ const MyFeedSection = () => {
     batch.commit().catch((e) => console.warn('Past-event prune failed:', e));
   }, [feedItems, userId]);
 
-  // Sponsored placement: pick one active, area/type-matched paid item to show
-  // atop the feed. Counts one impression per distinct placement shown.
+  // Sponsored placements: keep the list of currently-active (by date window)
+  // paid items. The actual pick is interest + area matched below, so a
+  // placement only surfaces for users it's actually relevant to.
   useEffect(() => {
     if (!userId) return;
-    const borough = nycBorough(userProfile?.address) || '';
-    const unsub = onSnapshot(collection(db, `artifacts/${appId}/public/data/sponsored`), (snap) => {
+    return onSnapshot(collection(db, `artifacts/${appId}/public/data/sponsored`), (snap) => {
       const now = Date.now();
       const ms = (v) => (v?.toMillis ? v.toMillis() : v ? new Date(v).getTime() : null);
-      const active = snap.docs
-        .map((d) => ({ id: d.id, ...d.data() }))
-        .filter((s) => {
-          const from = ms(s.activeFrom);
-          const to = ms(s.activeTo);
-          if (from && now < from) return false;
-          if (to && now > to) return false;
-          // Optional borough targeting — the sponsor's chosen borough is stored
-          // as `borough` (matches the checkout/webhook field). When set, only
-          // show the placement to users in that borough; otherwise show to all.
-          if (s.borough && borough && s.borough !== borough) return false;
-          return true;
-        });
-      const pick = active[0] || null;
-      setSponsored(pick);
-      if (pick && sponsoredSeenRef.current !== pick.id) {
-        sponsoredSeenRef.current = pick.id;
-        updateDoc(doc(db, `artifacts/${appId}/public/data/sponsored/${pick.id}`), { impressions: increment(1) }).catch(() => {});
-      }
+      setActivePlacements(
+        snap.docs
+          .map((d) => ({ id: d.id, ...d.data() }))
+          .filter((s) => {
+            const from = ms(s.activeFrom);
+            const to = ms(s.activeTo);
+            if (from && now < from) return false;
+            if (to && now > to) return false;
+            return true;
+          })
+      );
     });
-    return unsub;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [userId, userProfile?.address]);
+  }, [userId]);
+
+  // The viewer's interest signal = the event types already in their tailored
+  // feed (the feed is generated from their profile, so this adapts to them).
+  const userInterestTypes = useMemo(() => {
+    const s = new Set();
+    feedItems.forEach((it) => {
+      const t = it.data?.type;
+      if (t && t !== 'Other') s.add(t);
+    });
+    return s;
+  }, [feedItems]);
+
+  // Pick the single best placement for THIS viewer: a placement targeting a
+  // borough only shows to users in it; one targeting an interest/type only shows
+  // to users who've shown that interest. Among qualifying placements prefer the
+  // most specifically targeted (best fit) over a generic one. Untargeted
+  // placements (no borough, no/Other type) act as fallback house ads for all.
+  const viewerBorough = nycBorough(userProfile?.address) || '';
+  const sponsored = useMemo(() => {
+    const matches = activePlacements.filter((s) => {
+      if (s.borough && s.borough !== viewerBorough) return false;
+      if (s.type && s.type !== 'Other' && userInterestTypes.size > 0 && !userInterestTypes.has(s.type)) return false;
+      return true;
+    });
+    const specificity = (s) => (s.borough ? 1 : 0) + (s.type && s.type !== 'Other' ? 1 : 0);
+    matches.sort((a, b) => specificity(b) - specificity(a));
+    return matches[0] || null;
+  }, [activePlacements, viewerBorough, userInterestTypes]);
+  // Where in the feed the sponsored card is inserted (after the Nth item) — woven
+  // into the feed rather than pinned to the very top.
+  const sponsoredSlot = 2;
+
+  // Count one impression per distinct placement actually shown to this viewer.
+  // Gated on the feed having items — an empty feed renders no SponsoredCard,
+  // so counting there would bill sponsors for impressions nobody saw.
+  useEffect(() => {
+    if (!sponsored || displayItems.length === 0) return;
+    if (sponsoredSeenRef.current === sponsored.id) return;
+    sponsoredSeenRef.current = sponsored.id;
+    updateDoc(doc(db, `artifacts/${appId}/public/data/sponsored/${sponsored.id}`), { impressions: increment(1) }).catch(() => {});
+  }, [sponsored, displayItems.length]);
 
   const sponsoredClick = () => {
     if (!sponsored) return;
@@ -2628,7 +2669,6 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
 
   return (
     <div className="space-y-6">
-      {sponsored && <SponsoredCard item={sponsored} onClick={sponsoredClick} />}
       {needsOnboarding && (
         <div className="bg-gradient-to-r from-indigo-500 to-purple-500 text-white rounded-2xl p-5 flex flex-col md:flex-row items-start md:items-center justify-between gap-3 shadow-md">
           <div>
@@ -2719,9 +2759,16 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
                 : 'No events match this filter. Clear it to see your full feed.'}
             </div>
           ) : (
-            displayItems.map((item) => (
-              <FeedCard key={item.id} item={item} onDelete={() => deleteFeedItem(item.id)} />
+            displayItems.map((item, i) => (
+              <React.Fragment key={item.id}>
+                {sponsored && i === sponsoredSlot && <SponsoredCard item={sponsored} onClick={sponsoredClick} />}
+                <FeedCard item={item} onDelete={() => deleteFeedItem(item.id)} />
+              </React.Fragment>
             ))
+          )}
+          {/* Short feed (fewer items than the slot): still show the placement once, after the list. */}
+          {sponsored && displayItems.length > 0 && displayItems.length <= sponsoredSlot && (
+            <SponsoredCard item={sponsored} onClick={sponsoredClick} />
           )}
           {/* Infinite scroll sentinel (both tabs): when visible, fetch more
               events for the active tab — more of today on Today, more future
@@ -2999,30 +3046,21 @@ const FeedCard = ({ item, onDelete }) => {
             </a>
           ) : null;
         })()}
-        {isEvent && directionsUrl(data) && (
-          <a
-            href={directionsUrl(data)}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex-1 text-center text-sm font-bold text-gray-700 bg-gray-100 hover:bg-gray-200 py-2.5 rounded-lg transition flex items-center justify-center gap-1"
-            title="Get directions to the venue"
-          >
-            <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-4 h-4" />
-            Directions
-          </a>
-        )}
-        {isEvent && rideUrl(data) && (
-          <a
-            href={rideUrl(data)}
-            onClick={() => trackAffiliateClick('ride', rideUrl(data))}
-            target="_blank"
-            rel="noopener noreferrer sponsored"
-            className="flex-1 text-center text-sm font-bold text-gray-900 bg-gray-900/5 hover:bg-gray-900/10 py-2.5 rounded-lg transition flex items-center justify-center gap-1"
-            title="Get a ride to the venue"
-          >
-            🚗 Get a ride
-          </a>
-        )}
+        {isEvent && (() => {
+          const dir = directionsUrl(data);
+          return dir ? (
+            <a
+              href={dir}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex-1 text-center text-sm font-bold text-gray-700 bg-gray-100 hover:bg-gray-200 py-2.5 rounded-lg transition flex items-center justify-center gap-1"
+              title="Directions from your current location to the venue"
+            >
+              <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-4 h-4" />
+              Directions
+            </a>
+          ) : null;
+        })()}
         <button onClick={handleCalendarClick} className="flex-1 text-sm font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 py-2.5 rounded-lg transition flex items-center justify-center gap-1">
           <PlusIcon className="w-4 h-4" /> Add to my calendar
         </button>
@@ -4067,34 +4105,21 @@ const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage,
             </a>
           ) : null;
         })()}
-        {(directionsUrl(idea) || rideUrl(idea)) && (
-          <div className="flex gap-2">
-            {directionsUrl(idea) && (
-              <a
-                href={directionsUrl(idea)}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex-1 text-center bg-gray-100 text-gray-700 text-sm font-bold py-2.5 rounded-lg hover:bg-gray-200 transition flex items-center justify-center gap-1"
-                title="Get directions to the venue"
-              >
-                <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-4 h-4" />
-                Directions
-              </a>
-            )}
-            {rideUrl(idea) && (
-              <a
-                href={rideUrl(idea)}
-                onClick={() => trackAffiliateClick('ride', rideUrl(idea))}
-                target="_blank"
-                rel="noopener noreferrer sponsored"
-                className="flex-1 text-center bg-gray-900/5 text-gray-900 text-sm font-bold py-2.5 rounded-lg hover:bg-gray-900/10 transition flex items-center justify-center gap-1"
-                title="Get a ride to the venue"
-              >
-                🚗 Get a ride
-              </a>
-            )}
-          </div>
-        )}
+        {(() => {
+          const dir = directionsUrl(idea);
+          return dir ? (
+            <a
+              href={dir}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center justify-center bg-gray-100 text-gray-700 text-sm font-bold py-2.5 rounded-lg hover:bg-gray-200 transition gap-1"
+              title="Directions from your current location to the venue"
+            >
+              <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-4 h-4" />
+              Directions
+            </a>
+          ) : null;
+        })()}
         <div className="flex gap-2">
           <button onClick={() => onPropose(idea)} className="flex-1 bg-indigo-50 text-indigo-600 text-sm font-bold py-2.5 rounded-lg hover:bg-indigo-100 transition">
             {proposeLabel}
@@ -5818,15 +5843,18 @@ const SponsorLanding = () => {
               <input value={form[k]} onChange={(e) => set(k, e.target.value)} placeholder={ph} className="w-full p-2.5 border border-gray-200 rounded-xl text-sm focus:ring-2 focus:ring-indigo-500" />
             </div>
           ))}
+          <p className="text-xs text-gray-500 -mb-1">
+            <span className="font-semibold text-gray-700">Who should see this?</span> We show your placement to people interested in this category{form.borough ? ' in this area' : ''} — leave the borough blank to reach everyone.
+          </p>
           <div className="grid grid-cols-2 gap-3">
             <div>
-              <label className="block text-xs font-semibold uppercase text-gray-500 mb-1">Type</label>
+              <label className="block text-xs font-semibold uppercase text-gray-500 mb-1">Target category</label>
               <select value={form.type} onChange={(e) => set('type', e.target.value)} className="w-full p-2.5 border border-gray-200 rounded-xl text-sm bg-white">
                 {EVENT_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
               </select>
             </div>
             <div>
-              <label className="block text-xs font-semibold uppercase text-gray-500 mb-1">NYC borough (optional)</label>
+              <label className="block text-xs font-semibold uppercase text-gray-500 mb-1">Target borough (optional)</label>
               <input value={form.borough} onChange={(e) => set('borough', e.target.value)} placeholder="Brooklyn" className="w-full p-2.5 border border-gray-200 rounded-xl text-sm" />
             </div>
           </div>
