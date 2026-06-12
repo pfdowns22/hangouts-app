@@ -269,7 +269,11 @@ const nycEvents = {
   },
 };
 
-const PROVIDERS = [ticketmaster, seatgeek, predicthq, nycEvents];
+// PredictHQ is intentionally excluded: the trial expired (no free tier) and its
+// events carry no ticket/buy links — Ticketmaster + SeatGeek + AI search + NYC
+// Open Data cover discovery. The `predicthq` provider def is kept below for easy
+// re-enable if a paid plan is ever added (drop it back into this array).
+const PROVIDERS = [ticketmaster, seatgeek, nycEvents];
 
 // Google Places (New) is the PLACES source — restaurants/bars/activities, not
 // dated events. Queried via ?kind=places and pinned to a user's free slot
