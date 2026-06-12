@@ -500,10 +500,17 @@ const moreInfoUrl = (event) => {
 // trusting them sent users to AI-fabricated dead links (a syntactically-valid
 // URL is NOT a real page). A known vendor host means a real ticket page.
 const TICKET_VENDOR_HOSTS = [
+  // Majors
   'ticketmaster.com', 'livenation.com', 'seatgeek.com', 'stubhub.com',
   'vividseats.com', 'eventbrite.com', 'axs.com', 'ticketweb.com', 'dice.fm',
   'gametime.co', 'tickpick.com', 'getyourguide.com', 'viator.com',
   'todaytix.com', 'telecharge.com', 'fandango.com', 'feverup.com',
+  // Indie/local event platforms (where non-arena events actually sell —
+  // e.g. Jazz Age Lawn Party sells on posh.vip, not Ticketmaster)
+  'posh.vip', 'lu.ma', 'partiful.com', 'ra.co', 'shotgun.live', 'tixr.com',
+  'etix.com', 'universe.com', 'ticketleap.com', 'ticketspice.com',
+  'brownpapertickets.com', 'seetickets.us', 'showclix.com',
+  'frontgatetickets.com', 'withfriends.co', 'ticketfairy.com', 'zeffy.com',
 ];
 const isTicketVendorUrl = (href) => {
   try {
@@ -515,14 +522,15 @@ const isTicketVendorUrl = (href) => {
 };
 
 // Tickets action for an event card. Returns null for non-ticketed events.
-// Resolution order — designed to ALWAYS land on a real, buyable page:
+// Resolution order — designed to ALWAYS land somewhere with real tickets:
 //   1. The event's own ticket/official URL, but only when it's verifiably a
 //      ticket page: it came from a partner API (real listings) or points at a
 //      known ticketing vendor. Affiliate-wrapped when it's a partner we earn on.
-//   2. Otherwise → the ticket VENDOR that actually sells THIS kind of event:
-//      concerts/sports/nightlife → Ticketmaster search; tours/attractions/arts/
-//      outdoors/markets → GetYourGuide search (both always show live listings).
-//   3. Anything ambiguous → a targeted "<title> … tickets" web search.
+//   2. Otherwise → a targeted "<title> <location> tickets" web search. We do
+//      NOT guess a vendor: routing "Music" to a Ticketmaster search produced
+//      0-result dead ends for events sold elsewhere (Jazz Age Lawn Party sells
+//      on posh.vip). The targeted search reliably surfaces the actual seller as
+//      the top result, whoever it is.
 const ticketAction = (event) => {
   if (!event?.isTicketed) return null;
   // 1. The event's own link, gated on being verifiably a ticket page.
@@ -530,18 +538,7 @@ const ticketAction = (event) => {
   if (candidate && (TRUSTED_URL_SOURCES.has(event?.source) || isTicketVendorUrl(candidate))) {
     return { href: affiliateUrl(candidate), label: '🎟️ Buy Tickets' };
   }
-
-  // 2/3. No verifiable link → vendor by event type, else a targeted ticket search.
-  const q = [event?.title, event?.location].filter(Boolean).join(' ');
-  const enc = encodeURIComponent(q || 'tickets');
-  const type = event?.type;
-  if (type === 'Music' || type === 'Sports' || type === 'Nightlife') {
-    return { href: affiliateUrl(`https://www.ticketmaster.com/search?q=${enc}`), label: '🎟️ Find Tickets' };
-  }
-  if (type === 'Arts & Culture' || type === 'Outdoors' || type === 'Community' || type === 'Markets') {
-    return { href: affiliateUrl(`https://www.getyourguide.com/s/?q=${enc}`), label: '🎟️ Find Tickets' };
-  }
-  // Ambiguous ('Other', 'Food & Drink', or missing) → real-page web search.
+  // 2. No verifiable link → targeted ticket search (never an empty vendor page).
   return { href: searchUrl(event, 'tickets'), label: '🎟️ Find Tickets' };
 };
 
@@ -2539,7 +2536,8 @@ ACCURACY:
 - imageUrl: a real reachable public image URL, else null. imageKeywords: 3-6 visual scene words.
 - locationSource: "home" or "current" per the LOCATION CONTEXT.
 - type: classify each pick as EXACTLY ONE of: ${EVENT_TYPES.join(', ')}.
-- priceTier: one of "Free","$","$$","$$$","$$$$" or null. isTicketed: true/false. ticketsUrl: direct ticket URL if ticketed, else null.
+- priceTier: one of "Free","$","$$","$$$","$$$$" or null. isTicketed: true/false.
+- ticketsUrl: ONLY the exact page where tickets for THIS event are purchased, as found in your search results (Ticketmaster, Eventbrite, Posh, Dice, Lu.ma, SeatGeek, venue box-office page, etc.). NEVER a homepage, NEVER constructed/guessed — if you did not see the actual ticket page, return null.
 
 Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: title, description, location, date (YYYY-MM-DD HH:MM), url, imageUrl, imageKeywords, locationSource, type, priceTier, isTicketed, ticketsUrl.`;
 
@@ -3207,7 +3205,7 @@ const ChatIdeasModal = ({ group, onClose }) => {
           return;
         }
         const { startDate, endDate } = dateWindow(false);
-        const prompt = `Today is ${new Date().toDateString()}. A group of friends has been chatting and is interested in: ${t.join(', ')}. Find 5 specific, real, HYPER-LOCAL things they could do together near ${anchor} between tomorrow and ~14 days out that match those interests (e.g. golf → a nearby course/driving range; sushi → a specific spot doing something special). Only real, verifiable places/events within ~10 miles of ${anchor} — never another city/state. For each: title, description, location, date (YYYY-MM-DD HH:MM), url (official, else null), imageUrl (or null), imageKeywords, type (EXACTLY one of ${EVENT_TYPES.join(', ')}), priceTier ("Free"/"$"/"$$"/"$$$"/"$$$$" or null), isTicketed (bool), ticketsUrl (or null). Return ONLY a JSON array.`;
+        const prompt = `Today is ${new Date().toDateString()}. A group of friends has been chatting and is interested in: ${t.join(', ')}. Find 5 specific, real, HYPER-LOCAL things they could do together near ${anchor} between tomorrow and ~14 days out that match those interests (e.g. golf → a nearby course/driving range; sushi → a specific spot doing something special). Only real, verifiable places/events within ~10 miles of ${anchor} — never another city/state. For each: title, description, location, date (YYYY-MM-DD HH:MM), url (official, else null), imageUrl (or null), imageKeywords, type (EXACTLY one of ${EVENT_TYPES.join(', ')}), priceTier ("Free"/"$"/"$$"/"$$$"/"$$$$" or null), isTicketed (bool), ticketsUrl (ONLY the exact purchase page seen in search results — Eventbrite/Posh/Dice/Ticketmaster/etc.; never guessed, else null). Return ONLY a JSON array.`;
         const aiList = (async () => {
           try {
             const text = await callAI({ prompt, useWebSearch: true, provider });
@@ -3875,7 +3873,7 @@ IMPORTANT:
 PRICING & TICKETS:
 - For priceTier, return one of "Free", "$", "$$", "$$$", "$$$$" ($=under $20, $$=$20-$50, $$$=$50-$100, $$$$=$100+). If pricing isn't determinable, return null.
 - For isTicketed, return true if attendance requires buying a ticket, false for free/walk-in events.
-- For ticketsUrl, if isTicketed=true return the DIRECT ticket purchase URL (Ticketmaster/AXS/SeatGeek/Eventbrite/venue site). Otherwise null.
+- For ticketsUrl, if isTicketed=true return ONLY the exact ticket purchase page you saw in search results (Ticketmaster/AXS/SeatGeek/Eventbrite/Posh/Dice/Lu.ma/venue box office). NEVER a homepage, NEVER constructed/guessed — null if you didn't see the actual page.
 
 SOURCES (PREFER quality editorial / curated picks over generic listings):
 - Mine event coverage from publications like Time Out (timeout.com), The New Yorker (newyorker.com/goings-on, /culture), Brooklyn Magazine (bkmag.com), The Skint (theskint.com), Eater (eater.com), Brokelyn, Curbed, the local NYT culture section, and similar editorial outlets.
@@ -4202,7 +4200,7 @@ YOUR JOB:
 - If you do NOT yet know the DESTINATION (where), the DATE/timeframe (when), or WHO is going, ask ONE short clarifying question for the single most important missing piece — set "needInfo": true and return an empty "suggestions" array. Ask only one thing at a time, and never re-ask something the user already told you.
 - Once you know enough, return 3-5 SPECIFIC, REAL, verifiable suggestions for that destination & date: places to eat, things to do, activities — tailored to the interests, family, and budget above. Use web search; never invent places. Favor concrete named spots/events over generic advice. Resolve relative dates ("today", "tomorrow", "June 24th") against today's date.
 
-For EACH suggestion use these keys: title, description (1-2 sentences saying why it fits THEM), location (specific venue + area), date ("YYYY-MM-DD HH:MM", or the outing date if no set time), url (official page if confident, else null), imageUrl (real public image URL or null), imageKeywords (3-6 visual words), type (EXACTLY one of ${EVENT_TYPES.join(', ')}), priceTier ("Free"/"$"/"$$"/"$$$"/"$$$$" or null), isTicketed (bool), ticketsUrl (direct ticket URL or null).
+For EACH suggestion use these keys: title, description (1-2 sentences saying why it fits THEM), location (specific venue + area), date ("YYYY-MM-DD HH:MM", or the outing date if no set time), url (official page if confident, else null), imageUrl (real public image URL or null), imageKeywords (3-6 visual words), type (EXACTLY one of ${EVENT_TYPES.join(', ')}), priceTier ("Free"/"$"/"$$"/"$$$"/"$$$$" or null), isTicketed (bool), ticketsUrl (ONLY the exact purchase page seen in search results — Eventbrite/Posh/Dice/Ticketmaster/etc.; never a homepage, never guessed, else null).
 
 Return ONLY a JSON object (no prose, no markdown fences) of shape:
 { "reply": string (your short conversational message to the user), "needInfo": boolean, "suggestions": [ ...objects as above ] }`;
