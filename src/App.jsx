@@ -34,7 +34,7 @@ import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { createPortal } from 'react-dom';
 
 import { auth, db, storage, appId, geminiApiKey } from './firebase.js';
-import { fetchRealEvents, verifyVenue } from './events.js';
+import { fetchRealEvents, verifyVenue, resolveTicketLink } from './events.js';
 
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_URL_FOR_KEY = (key) =>
@@ -515,6 +515,35 @@ const ticketAction = (event) => {
     if (direct) return { href: affiliateUrl(direct), label: '🎟️ Buy Tickets' };
   }
   return { href: searchUrl(event, 'tickets'), label: '🎟️ Find Tickets' };
+};
+
+// Session cache so the same event isn't resolved twice (per title+date).
+const ticketLinkCache = new Map();
+
+// Ticket action with live upgrade: starts at the safe ticketAction() result
+// (verified-direct or web search), and for AI events asynchronously asks the
+// ticketing APIs for the REAL purchase URL — upgrading to a one-click Buy
+// Tickets link when one is confidently found. Fail-open: any miss/error keeps
+// the search, so the button always works.
+const useTicketAction = (event) => {
+  const base = ticketAction(event);
+  const [resolved, setResolved] = useState(null);
+  // Only worth resolving when ticketed and we don't already trust a direct link.
+  const needsResolve = !!event?.isTicketed && !TRUSTED_URL_SOURCES.has(event?.source);
+  const key = needsResolve ? `${(event.title || '').toLowerCase()}|${String(event.date || '').slice(0, 10)}` : '';
+  useEffect(() => {
+    if (!needsResolve) return;
+    if (ticketLinkCache.has(key)) { setResolved(ticketLinkCache.get(key)); return; }
+    let cancelled = false;
+    resolveTicketLink({ title: event.title, location: event.location, date: event.date }).then((r) => {
+      ticketLinkCache.set(key, r);
+      if (!cancelled) setResolved(r);
+    });
+    return () => { cancelled = true; };
+  }, [needsResolve, key]);
+  if (!base) return null;
+  if (resolved?.url) return { href: affiliateUrl(resolved.url), label: '🎟️ Buy Tickets' };
+  return base;
 };
 
 // A best-effort destination string for maps/ride deep-links. Events only persist
@@ -2890,6 +2919,7 @@ const FeedCard = ({ item, onDelete }) => {
   const isInvite = type === 'groupProposal';
   const bgColor = isInvite ? 'bg-amber-50 border-amber-100' : 'bg-white border-gray-100';
   const imageSrc = useEventImage(data);
+  const ticket = useTicketAction(data);
   const [showSend, setShowSend] = useState(false);
   const [sendAnchorRect, setSendAnchorRect] = useState(null);
   const sendBtnRef = useRef(null);
@@ -3004,21 +3034,18 @@ const FeedCard = ({ item, onDelete }) => {
           <Icon path="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" className="w-4 h-4" />
           More Info
         </a>
-        {(() => {
-          const t = ticketAction(data);
-          return t ? (
-            <a
-              href={t.href}
-              onClick={() => trackAffiliateClick('tickets', t.href)}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="flex-1 text-center text-sm font-bold text-white bg-emerald-600 hover:bg-emerald-700 py-2.5 rounded-lg transition flex items-center justify-center gap-1"
-              title={t.label}
-            >
-              {t.label}
-            </a>
-          ) : null;
-        })()}
+        {ticket && (
+          <a
+            href={ticket.href}
+            onClick={() => trackAffiliateClick('tickets', ticket.href)}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex-1 text-center text-sm font-bold text-white bg-emerald-600 hover:bg-emerald-700 py-2.5 rounded-lg transition flex items-center justify-center gap-1"
+            title={ticket.label}
+          >
+            {ticket.label}
+          </a>
+        )}
         {isEvent && (() => {
           const dir = directionsUrl(data);
           return dir ? (
@@ -4012,6 +4039,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
 
 const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage, proposeLabel = 'Propose' }) => {
   const imageSrc = useEventImage(idea);
+  const ticket = useTicketAction(idea);
   return (
     <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 flex flex-col hover:-translate-y-1 transition duration-300">
       <div className="w-full h-32 mb-4 rounded-xl overflow-hidden bg-gray-100 -mt-2">
@@ -4064,20 +4092,17 @@ const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage,
         >
           <Icon path="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" className="w-4 h-4 mr-1" /> More Info
         </a>
-        {(() => {
-          const t = ticketAction(idea);
-          return t ? (
-            <a
-              href={t.href}
-              onClick={() => trackAffiliateClick('tickets', t.href)}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="flex items-center justify-center bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold p-2.5 rounded-lg transition"
-            >
-              {t.label}
-            </a>
-          ) : null;
-        })()}
+        {ticket && (
+          <a
+            href={ticket.href}
+            onClick={() => trackAffiliateClick('tickets', ticket.href)}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center justify-center bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold p-2.5 rounded-lg transition"
+          >
+            {ticket.label}
+          </a>
+        )}
         {(() => {
           const dir = directionsUrl(idea);
           return dir ? (

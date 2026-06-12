@@ -51,6 +51,25 @@ export const fetchPlaces = async ({ lat, lng, location, radius, term, categories
   }
 };
 
+// Resolve an event's REAL ticket-purchase URL via the ticketing APIs
+// (Ticketmaster Discovery + SeatGeek). Returns { url, source } only on a
+// confident match, else null so the caller keeps its web-search fallback.
+// Never throws.
+export const resolveTicketLink = async ({ title, location, date } = {}) => {
+  try {
+    if (!title) return null;
+    const params = new URLSearchParams({ kind: 'ticketlink', title });
+    if (location) params.set('location', location);
+    if (date) params.set('date', String(date).slice(0, 10));
+    const res = await fetch(`/api/events?${params.toString()}`, { headers: { Accept: 'application/json' } });
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => null);
+    return data && data.url ? data : null;
+  } catch {
+    return null;
+  }
+};
+
 // Fetch a live ride quote from the partner scaffold (/api/ride-quote → Uber
 // Guest Rides / Lyft partner). Returns null unless a partner is configured AND
 // returns a usable quote, so callers fall back to the affiliate deep-link.

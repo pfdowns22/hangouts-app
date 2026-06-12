@@ -377,6 +377,68 @@ const dedupe = (events) => {
   return [...seen.values()];
 };
 
+// --- Ticket-link resolver -------------------------------------------------
+// Match an AI-found event against the ticketing APIs to recover its REAL
+// purchase URL. Only returns a link on a CONFIDENT match (strong title overlap
+// + near date) so we never swap in a wrong direct link — a miss returns
+// { url: null } and the client uses its web-search fallback instead.
+const TL_STOP = new Set(['the', 'and', 'for', 'with', 'party', 'event', 'festival', 'live', 'show', 'tour', 'nyc', 'new', 'york', 'presents', 'feat', 'featuring', 'at', 'of', 'in', 'on']);
+const tlTokens = (s) => (s || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter((w) => w.length > 2 && !TL_STOP.has(w));
+const tlOverlap = (query, cand) => {
+  const A = new Set(tlTokens(query));
+  const B = tlTokens(cand);
+  if (!A.size || !B.length) return 0;
+  return B.filter((w) => A.has(w)).length / A.size;
+};
+const tlDayDiff = (a, b) => {
+  try { return Math.abs((new Date(a) - new Date(b)) / 86400000); } catch { return 999; }
+};
+const findTicketLink = async ({ title, lat, lng, date }) => {
+  if (!title) return { url: null };
+  const targetDate = date ? String(date).slice(0, 10) : null;
+  // Ticketmaster Discovery
+  if (process.env.TICKETMASTER_API_KEY) {
+    try {
+      const p = new URLSearchParams({ apikey: process.env.TICKETMASTER_API_KEY, keyword: title.slice(0, 90), size: '20', sort: 'relevance,desc' });
+      if (lat != null && lng != null && !Number.isNaN(lat)) { p.set('latlong', `${lat},${lng}`); p.set('radius', '75'); p.set('unit', 'miles'); }
+      const r = await fetch(`https://app.ticketmaster.com/discovery/v2/events.json?${p}`);
+      if (r.ok) {
+        const evs = (await r.json())?._embedded?.events || [];
+        let best = null, bestScore = 0;
+        for (const e of evs) {
+          const ov = tlOverlap(title, e.name);
+          const ed = e.dates?.start?.localDate;
+          if (ov < 0.6 || !e.url) continue;
+          if (targetDate && ed && tlDayDiff(targetDate, ed) > 3) continue;
+          const score = ov - (targetDate && ed ? tlDayDiff(targetDate, ed) * 0.05 : 0);
+          if (score > bestScore) { best = e; bestScore = score; }
+        }
+        if (best) return { url: best.url, source: 'ticketmaster' };
+      }
+    } catch { /* fall through to SeatGeek / null */ }
+  }
+  // SeatGeek (only if a client id is configured)
+  if (process.env.SEATGEEK_CLIENT_ID) {
+    try {
+      const p = new URLSearchParams({ client_id: process.env.SEATGEEK_CLIENT_ID, q: title.slice(0, 90), per_page: '20' });
+      if (process.env.SEATGEEK_CLIENT_SECRET) p.set('client_secret', process.env.SEATGEEK_CLIENT_SECRET);
+      const r = await fetch(`https://api.seatgeek.com/2/events?${p}`);
+      if (r.ok) {
+        let best = null, bestScore = 0;
+        for (const e of ((await r.json())?.events || [])) {
+          const ov = tlOverlap(title, e.title);
+          const ed = (e.datetime_local || '').slice(0, 10);
+          if (ov < 0.6 || !e.url) continue;
+          if (targetDate && ed && tlDayDiff(targetDate, ed) > 3) continue;
+          if (ov > bestScore) { best = e; bestScore = ov; }
+        }
+        if (best) return { url: best.url, source: 'seatgeek' };
+      }
+    } catch { /* fall through to null */ }
+  }
+  return { url: null };
+};
+
 export default async function handler(req, res) {
   const q = req.query || {};
   const size = Math.min(parseInt(q.size, 10) || 12, 50);
@@ -409,6 +471,19 @@ export default async function handler(req, res) {
       res.status(200).json({ verified: true, ...r });
     } catch (e) {
       res.status(200).json({ verified: false, found: false, error: e.message });
+    }
+    return;
+  }
+
+  // Ticket-link mode: resolve an AI event's real purchase URL via the ticketing
+  // APIs. Returns { url, source } on a confident match, else { url: null } so the
+  // client uses its web-search fallback. Never throws.
+  if ((q.kind || '').toString() === 'ticketlink') {
+    try {
+      const r = await findTicketLink({ title: (q.title || q.name || '').toString().slice(0, 120), lat, lng, date: q.date });
+      res.status(200).json(r);
+    } catch (e) {
+      res.status(200).json({ url: null, error: e.message });
     }
     return;
   }
