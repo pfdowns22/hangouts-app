@@ -493,52 +493,27 @@ const moreInfoUrl = (event) => {
 };
 
 // Tickets action for an event card. Returns null for non-ticketed events.
-// Hosts that are actual ticketing/booking vendors. A direct event URL is only
-// followed when it points at one of these (or came from a partner API). This is
-// the middle ground between two failure modes we've hit: never trusting AI URLs
-// sent a Colosseum tour to a Ticketmaster search (wrong vendor), while always
-// trusting them sent users to AI-fabricated dead links (a syntactically-valid
-// URL is NOT a real page). A known vendor host means a real ticket page.
-const TICKET_VENDOR_HOSTS = [
-  // Majors
-  'ticketmaster.com', 'livenation.com', 'seatgeek.com', 'stubhub.com',
-  'vividseats.com', 'eventbrite.com', 'axs.com', 'ticketweb.com', 'dice.fm',
-  'gametime.co', 'tickpick.com', 'getyourguide.com', 'viator.com',
-  'todaytix.com', 'telecharge.com', 'fandango.com', 'feverup.com',
-  // Indie/local event platforms (where non-arena events actually sell —
-  // e.g. Jazz Age Lawn Party sells on posh.vip, not Ticketmaster)
-  'posh.vip', 'lu.ma', 'partiful.com', 'ra.co', 'shotgun.live', 'tixr.com',
-  'etix.com', 'universe.com', 'ticketleap.com', 'ticketspice.com',
-  'brownpapertickets.com', 'seetickets.us', 'showclix.com',
-  'frontgatetickets.com', 'withfriends.co', 'ticketfairy.com', 'zeffy.com',
-];
-const isTicketVendorUrl = (href) => {
-  try {
-    const h = new URL(href).hostname.replace(/^www\./, '');
-    return TICKET_VENDOR_HOSTS.some((v) => h === v || h.endsWith(`.${v}`));
-  } catch {
-    return false;
-  }
-};
-
 // Tickets action for an event card. Returns null for non-ticketed events.
-// Resolution order — designed to ALWAYS land somewhere with real tickets:
-//   1. The event's own ticket/official URL, but only when it's verifiably a
-//      ticket page: it came from a partner API (real listings) or points at a
-//      known ticketing vendor. Affiliate-wrapped when it's a partner we earn on.
-//   2. Otherwise → a targeted "<title> <location> tickets" web search. We do
-//      NOT guess a vendor: routing "Music" to a Ticketmaster search produced
-//      0-result dead ends for events sold elsewhere (Jazz Age Lawn Party sells
-//      on posh.vip). The targeted search reliably surfaces the actual seller as
-//      the top result, whoever it is.
+//
+// The hard lesson: we must NOT follow an AI-provided URL, even one whose host
+// looks like a real vendor. The model routinely FABRICATES plausible
+// ticketmaster.com / eventbrite.com links that 404 or show 0 results (the
+// Botanic Gardens & Jazz Age Lawn Party events both did this). A
+// syntactically-valid vendor URL is NOT proof of a real ticket page.
+//
+// So we only follow the event's own URL when it came from a real ticketing
+// PARTNER API (Ticketmaster/SeatGeek/Google-Places feeds, in TRUSTED_URL_SOURCES)
+// — those are verified, buyable links we also earn affiliate on. For everything
+// else (all AI events) we run a targeted "<title> <location> tickets" web
+// search, which reliably surfaces the actual seller (Posh, the venue box
+// office, NYBG, StubHub resale, etc.) as the top result. This mirrors what the
+// "More Info" button already does successfully.
 const ticketAction = (event) => {
   if (!event?.isTicketed) return null;
-  // 1. The event's own link, gated on being verifiably a ticket page.
-  const candidate = validHttpUrl(event?.ticketsUrl) || validHttpUrl(event?.url);
-  if (candidate && (TRUSTED_URL_SOURCES.has(event?.source) || isTicketVendorUrl(candidate))) {
-    return { href: affiliateUrl(candidate), label: '🎟️ Buy Tickets' };
+  if (TRUSTED_URL_SOURCES.has(event?.source)) {
+    const direct = validHttpUrl(event?.ticketsUrl) || validHttpUrl(event?.url);
+    if (direct) return { href: affiliateUrl(direct), label: '🎟️ Buy Tickets' };
   }
-  // 2. No verifiable link → targeted ticket search (never an empty vendor page).
   return { href: searchUrl(event, 'tickets'), label: '🎟️ Find Tickets' };
 };
 
