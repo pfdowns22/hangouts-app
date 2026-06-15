@@ -1458,7 +1458,14 @@ const ProfileSection = ({ onClose }) => {
       }
       const loc = { lat, lng, label, capturedAt: new Date().toISOString() };
       setCurrentLocation(loc);
-      showGlobalMessage(`Current location set: ${label}`);
+      // Capturing a location is an explicit signal to USE it — otherwise the
+      // preference stays on 'home' and the captured coords sit inert (feed,
+      // venue verification, and ticket geo all keep using home). Only auto-flip
+      // when still on the default 'home' so we never override an explicit
+      // 'both'/'current' choice the user already made.
+      const enabled = locationPreference === 'home';
+      if (enabled) setLocationPreference('current');
+      showGlobalMessage(enabled ? `Now using current location: ${label}` : `Current location set: ${label}`);
     } catch (e) {
       console.error(e);
       const msg =
