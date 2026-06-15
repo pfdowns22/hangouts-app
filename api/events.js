@@ -397,50 +397,82 @@ const tlOverlap = (query, cand) => {
 const tlDayDiff = (a, b) => {
   try { return Math.abs((new Date(a) - new Date(b)) / 86400000); } catch { return 999; }
 };
+// Minimum title overlap to even consider a candidate. Date is NOT a hard gate
+// (recurring acts and AI's approximate dates routinely miss an exact window) —
+// it's a scoring boost below, so a confident title match still resolves even
+// when the date is off. Geographic proximity is likewise a boost, not a filter.
+const TL_OVERLAP_FLOOR = 0.5;
+// Haversine miles between two lat/lng pairs (NaN-safe → null).
+const tlMiles = (aLat, aLng, bLat, bLng) => {
+  const ok = [aLat, aLng, bLat, bLng].every((n) => typeof n === 'number' && !Number.isNaN(n));
+  if (!ok) return null;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(bLat - aLat), dLng = toRad(bLng - aLng);
+  const s = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(aLat)) * Math.cos(toRad(bLat)) * Math.sin(dLng / 2) ** 2;
+  return 3959 * 2 * Math.asin(Math.min(1, Math.sqrt(s)));
+};
+// Combined confidence: title overlap, minus a capped date penalty, plus a geo
+// bonus when the candidate is near the target (and a penalty when it's clearly
+// in another region). Higher = better; used to pick the single best candidate.
+const tlScore = ({ overlap, dayDiff, miles }) => {
+  let s = overlap;
+  if (dayDiff != null) s -= Math.min(dayDiff, 60) * 0.004; // ≤0.24 over 60d
+  if (miles != null) s += miles <= 75 ? 0.25 : miles >= 250 ? -0.4 : 0;
+  return s;
+};
+
 const findTicketLink = async ({ title, lat, lng, date }) => {
   if (!title) return { url: null };
   const targetDate = date ? String(date).slice(0, 10) : null;
+  const hasGeo = lat != null && lng != null && !Number.isNaN(lat) && !Number.isNaN(lng);
+  const candidates = [];
+
   // Ticketmaster Discovery
   if (process.env.TICKETMASTER_API_KEY) {
     try {
       const p = new URLSearchParams({ apikey: process.env.TICKETMASTER_API_KEY, keyword: title.slice(0, 90), size: '20', sort: 'relevance,desc' });
-      if (lat != null && lng != null && !Number.isNaN(lat)) { p.set('latlong', `${lat},${lng}`); p.set('radius', '75'); p.set('unit', 'miles'); }
+      if (hasGeo) { p.set('latlong', `${lat},${lng}`); p.set('radius', '75'); p.set('unit', 'miles'); }
       const r = await fetch(`https://app.ticketmaster.com/discovery/v2/events.json?${p}`);
       if (r.ok) {
-        const evs = (await r.json())?._embedded?.events || [];
-        let best = null, bestScore = 0;
-        for (const e of evs) {
+        for (const e of ((await r.json())?._embedded?.events || [])) {
           const ov = tlOverlap(title, e.name);
+          if (ov < TL_OVERLAP_FLOOR || !e.url) continue;
           const ed = e.dates?.start?.localDate;
-          if (ov < 0.6 || !e.url) continue;
-          if (targetDate && ed && tlDayDiff(targetDate, ed) > 3) continue;
-          const score = ov - (targetDate && ed ? tlDayDiff(targetDate, ed) * 0.05 : 0);
-          if (score > bestScore) { best = e; bestScore = score; }
+          const v = e._embedded?.venues?.[0]?.location;
+          const miles = hasGeo && v ? tlMiles(lat, lng, parseFloat(v.latitude), parseFloat(v.longitude)) : null;
+          candidates.push({ url: e.url, source: 'ticketmaster', overlap: ov, dayDiff: targetDate && ed ? tlDayDiff(targetDate, ed) : null, miles });
         }
-        if (best) return { url: best.url, source: 'ticketmaster' };
       }
-    } catch { /* fall through to SeatGeek / null */ }
+    } catch { /* fall through to SeatGeek */ }
   }
+
   // SeatGeek (only if a client id is configured)
   if (process.env.SEATGEEK_CLIENT_ID) {
     try {
       const p = new URLSearchParams({ client_id: process.env.SEATGEEK_CLIENT_ID, q: title.slice(0, 90), per_page: '20' });
       if (process.env.SEATGEEK_CLIENT_SECRET) p.set('client_secret', process.env.SEATGEEK_CLIENT_SECRET);
+      if (hasGeo) { p.set('lat', String(lat)); p.set('lon', String(lng)); p.set('range', '75mi'); }
       const r = await fetch(`https://api.seatgeek.com/2/events?${p}`);
       if (r.ok) {
-        let best = null, bestScore = 0;
         for (const e of ((await r.json())?.events || [])) {
           const ov = tlOverlap(title, e.title);
+          if (ov < TL_OVERLAP_FLOOR || !e.url) continue;
           const ed = (e.datetime_local || '').slice(0, 10);
-          if (ov < 0.6 || !e.url) continue;
-          if (targetDate && ed && tlDayDiff(targetDate, ed) > 3) continue;
-          if (ov > bestScore) { best = e; bestScore = ov; }
+          const v = e.venue?.location;
+          const miles = hasGeo && v ? tlMiles(lat, lng, v.lat, v.lon) : null;
+          candidates.push({ url: e.url, source: 'seatgeek', overlap: ov, dayDiff: targetDate && ed ? tlDayDiff(targetDate, ed) : null, miles });
         }
-        if (best) return { url: best.url, source: 'seatgeek' };
       }
     } catch { /* fall through to null */ }
   }
-  return { url: null };
+
+  if (!candidates.length) return { url: null };
+  let best = null, bestScore = -Infinity;
+  for (const c of candidates) {
+    const s = tlScore(c);
+    if (s > bestScore) { best = c; bestScore = s; }
+  }
+  return best ? { url: best.url, source: best.source } : { url: null };
 };
 
 export default async function handler(req, res) {

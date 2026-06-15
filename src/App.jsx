@@ -520,6 +520,53 @@ const ticketAction = (event) => {
 // Session cache so the same event isn't resolved twice (per title+date).
 const ticketLinkCache = new Map();
 
+// Hosts that are never a real per-event purchase page, so the agent must not
+// "find" one of these (the model otherwise loves to hand back a search engine
+// or a social/wiki page as the "ticket link").
+const NON_SELLER_HOSTS = /(^|\.)(google|bing|duckduckgo|yahoo|facebook|instagram|twitter|x|tiktok|youtube|wikipedia|reddit|yelp)\.[a-z.]+$/i;
+// A URL only counts as a real ticket page if it parses, isn't a known
+// non-seller, and points at an actual listing (a path beyond the homepage) —
+// the lesson from the fabricated-Ticketmaster-homepage failures.
+const isRealTicketPage = (url) => {
+  const valid = validHttpUrl(url);
+  if (!valid) return null;
+  try {
+    const u = new URL(valid);
+    if (NON_SELLER_HOSTS.test(u.hostname.replace(/^www\./, ''))) return null;
+    if (u.pathname.replace(/\/+$/, '').length <= 1) return null; // bare homepage
+    return valid;
+  } catch {
+    return null;
+  }
+};
+
+// Layer 2 — the ticket-finding agent. When the partner APIs can't match an
+// event (off-partner one-offs: Posh, Dice, Eventbrite, venue box office), run a
+// Gemini grounded search that actively locates the EXACT purchase page and
+// returns a verified URL — a concierge that does the legwork, not a bare Google
+// search. Gated by the shared free-grounding budget; fail-open (null → caller
+// keeps its search fallback). Cached per title+date by the caller.
+const agentFindTicketUrl = async ({ title, location, date }) => {
+  if (!title) return null;
+  // BYO-key users aren't metered; the shared Gemini key is. Reserve a slot;
+  // if the daily free cap is spent, skip the agent and let the search stand.
+  if (!(await reserveGroundedSearch())) return null;
+  const when = date ? ` on ${String(date).slice(0, 10)}` : '';
+  const where = location ? ` at ${location}` : '';
+  const prompt = `Find the EXACT online ticket purchase page for this specific event using web search:
+Event: "${title}"${where}${when}.
+Return ONLY a JSON object: {"url": "<the direct ticket purchase page you actually saw in search results>", "vendor": "<seller name>"}.
+Rules: the URL must be the real listing page where a buyer completes purchase for THIS exact event (Eventbrite, Posh, Dice, Lu.ma, Ticketmaster, AXS, SeatGeek, or the venue's own box-office page). NEVER a homepage, NEVER a search results page, NEVER a guessed or constructed URL. If you did not see the actual purchase page in your search results, return {"url": null}.`;
+  try {
+    const text = await callAI({ prompt, useWebSearch: true });
+    const obj = extractJsonObject(text);
+    const url = isRealTicketPage(obj?.url);
+    return url ? { url, source: 'agent', vendor: obj?.vendor || null } : null;
+  } catch {
+    return null;
+  }
+};
+
 // Ticket action with live upgrade: starts at the safe ticketAction() result
 // (verified-direct or web search), and for AI events asynchronously asks the
 // ticketing APIs for the REAL purchase URL — upgrading to a one-click Buy
@@ -528,9 +575,13 @@ const ticketLinkCache = new Map();
 const useTicketAction = (event) => {
   const base = ticketAction(event);
   const [resolved, setResolved] = useState(null);
+  const [pending, setPending] = useState(false);
   // Only worth resolving when ticketed and we don't already trust a direct link.
   const needsResolve = !!event?.isTicketed && !TRUSTED_URL_SOURCES.has(event?.source);
   const key = needsResolve ? `${(event.title || '').toLowerCase()}|${String(event.date || '').slice(0, 10)}` : '';
+  // Layer 1 (render): partner APIs are free, so resolve a direct Buy Tickets
+  // link up front. Layer 2 (the grounded agent) is metered, so it runs only on
+  // click — see onClick below.
   useEffect(() => {
     if (!needsResolve) return;
     if (ticketLinkCache.has(key)) { setResolved(ticketLinkCache.get(key)); return; }
@@ -542,8 +593,39 @@ const useTicketAction = (event) => {
     return () => { cancelled = true; };
   }, [needsResolve, key]);
   if (!base) return null;
+
+  // Confident direct link (partner-resolved or trusted source) → plain anchor.
   if (resolved?.url) return { href: affiliateUrl(resolved.url), label: '🎟️ Buy Tickets' };
-  return base;
+
+  // No direct link yet. The button still navigates to the search fallback
+  // (base.href) for no-JS / failure, but on click we first let the agent try to
+  // find the real purchase page. A tab is opened synchronously (so the browser
+  // doesn't treat the post-await navigation as a blocked popup) and pointed at
+  // the agent's result, or the search fallback if the agent comes up empty.
+  if (!needsResolve) return base;
+  const onClick = (e) => {
+    trackAffiliateClick('tickets', base.href);
+    if (pending) { e.preventDefault(); return; }
+    // Agent already run this session → use whatever it found (cached).
+    if (ticketLinkCache.has(`agent:${key}`)) {
+      const hit = ticketLinkCache.get(`agent:${key}`);
+      if (hit?.url) { e.preventDefault(); window.open(affiliateUrl(hit.url), '_blank', 'noopener'); }
+      return; // null hit → let the anchor open the search fallback
+    }
+    e.preventDefault();
+    const tab = window.open('about:blank', '_blank');
+    setPending(true);
+    agentFindTicketUrl({ title: event.title, location: event.location, date: event.date })
+      .then((r) => {
+        ticketLinkCache.set(`agent:${key}`, r);
+        const dest = r?.url ? affiliateUrl(r.url) : base.href;
+        if (r?.url) setResolved(r); // upgrade the button to Buy Tickets for next time
+        if (tab) tab.location = dest; else window.open(dest, '_blank', 'noopener');
+      })
+      .catch(() => { if (tab) tab.location = base.href; })
+      .finally(() => setPending(false));
+  };
+  return { href: base.href, label: pending ? '🎟️ Finding…' : '🎟️ Find Tickets', onClick };
 };
 
 // A best-effort destination string for maps/ride deep-links. Events only persist
@@ -3037,7 +3119,7 @@ const FeedCard = ({ item, onDelete }) => {
         {ticket && (
           <a
             href={ticket.href}
-            onClick={() => trackAffiliateClick('tickets', ticket.href)}
+            onClick={ticket.onClick || (() => trackAffiliateClick('tickets', ticket.href))}
             target="_blank"
             rel="noopener noreferrer"
             className="flex-1 text-center text-sm font-bold text-white bg-emerald-600 hover:bg-emerald-700 py-2.5 rounded-lg transition flex items-center justify-center gap-1"
@@ -4095,7 +4177,7 @@ const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage,
         {ticket && (
           <a
             href={ticket.href}
-            onClick={() => trackAffiliateClick('tickets', ticket.href)}
+            onClick={ticket.onClick || (() => trackAffiliateClick('tickets', ticket.href))}
             target="_blank"
             rel="noopener noreferrer"
             className="flex items-center justify-center bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold p-2.5 rounded-lg transition"
