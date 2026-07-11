@@ -6,6 +6,11 @@ import {
   signInWithPopup,
   OAuthProvider,
   signOut,
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  sendSignInLinkToEmail,
+  isSignInWithEmailLink,
+  signInWithEmailLink,
 } from 'firebase/auth';
 import {
   doc,
@@ -1061,6 +1066,7 @@ const CameraIcon = ({ className = 'w-6 h-6' }) => <Icon path="M3 9a2 2 0 012-2h.
 const LeaveIcon = () => <Icon path="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />;
 const SyncIcon = ({ className = 'w-6 h-6' }) => <Icon path="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" className={className} />;
 const SearchIcon = ({ className = 'w-6 h-6' }) => <Icon path="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" className={className} />;
+const HomeIcon = ({ className = 'w-6 h-6' }) => <Icon path="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" className={className} />;
 const ChatIcon = ({ className = 'w-6 h-6' }) => <Icon path="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" className={className} />;
 const CopyIcon = ({ className = 'w-6 h-6' }) => <Icon path="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" className={className} />;
 const MailIcon = ({ className = 'w-6 h-6' }) => <Icon path="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" className={className} />;
@@ -1125,6 +1131,30 @@ const addToGoogleCalendar = async (suggestion, token, showMsg) => {
   }
 };
 
+// Incremental authorization: the login popup requests only basic profile/email
+// (non-sensitive, so Google shows no "unverified app" warning). The Calendar
+// scope is sensitive, so we ask for it on demand — only when the user actually
+// taps a calendar action. Returns an access token, or null if declined/failed.
+const ensureGoogleCalendarAccess = async (googleAccessToken, setGoogleAccessToken) => {
+  if (googleAccessToken) return googleAccessToken;
+  // Guests: a Google popup here would replace their anonymous session (and
+  // orphan its data), so skip straight to the .ics fallback instead.
+  if (auth.currentUser?.isAnonymous) return null;
+  try {
+    const provider = new GoogleAuthProvider();
+    provider.addScope('https://www.googleapis.com/auth/calendar.events');
+    // Re-prompting with the extra scope links it to the already-signed-in user.
+    if (auth.currentUser?.email) provider.setCustomParameters({ login_hint: auth.currentUser.email });
+    const result = await signInWithPopup(auth, provider);
+    const token = GoogleAuthProvider.credentialFromResult(result)?.accessToken || null;
+    if (token) setGoogleAccessToken(token);
+    return token;
+  } catch (error) {
+    console.warn('Calendar access not granted:', error);
+    return null;
+  }
+};
+
 // --- Avatar ---
 const Avatar = ({ src, alt, size = 'md', className = '' }) => {
   const sizeClasses = { xs: 'w-6 h-6', sm: 'w-8 h-8', md: 'w-10 h-10', lg: 'w-24 h-24', xl: 'w-32 h-32' };
@@ -1172,13 +1202,11 @@ const UserProfileDropdown = () => {
 
   return (
     <div className="relative" ref={dropdownRef}>
-      <button onClick={() => setIsOpen(!isOpen)} className="flex items-center gap-3 bg-white/60 backdrop-blur-md hover:bg-white/80 py-1 pl-1 pr-4 rounded-full shadow-sm border border-white/20 transition-all">
+      <button onClick={() => setIsOpen(!isOpen)} aria-label="Account menu" className="flex items-center p-0.5 rounded-full hover:bg-gray-100 active:scale-95 transition-all">
         <Avatar src={userProfile?.photoURL} alt={userProfile?.name} size="sm" />
-        <span className="text-sm font-medium text-gray-700 hidden sm:block">{userProfile?.name?.split(' ')[0] || 'User'}</span>
-        <MenuIcon />
       </button>
       {isOpen && (
-        <div className="absolute right-0 mt-2 w-64 bg-white rounded-xl shadow-xl py-2 z-40 border border-gray-100 overflow-hidden">
+        <div className="absolute right-0 mt-2 w-64 bg-white rounded-xl shadow-xl py-2 z-40 border border-line overflow-hidden">
           <div className="px-4 py-3 border-b border-gray-100 bg-gray-50/50">
             <p className="text-sm font-bold text-gray-900">{userProfile?.name || 'User'}</p>
             <p className="text-xs text-gray-500 truncate">{userId}</p>
@@ -1203,27 +1231,77 @@ const UserProfileDropdown = () => {
 };
 
 const Header = () => (
-  <header className="relative z-30 mb-8 flex justify-between items-center">
-    <h1 className="text-3xl font-extrabold text-indigo-900 tracking-tight">Hangouts</h1>
-    <UserProfileDropdown />
+  <header className="sticky top-0 z-30 bg-surface/90 backdrop-blur-md border-b border-line">
+    <div className="max-w-md mx-auto h-14 px-4 flex justify-between items-center">
+      <h1 className="text-[22px] font-extrabold text-ink tracking-tight">Hangouts</h1>
+      <UserProfileDropdown />
+    </div>
   </header>
 );
 
-const TabButton = ({ label, tabName, activeTab, setActiveTab, badge }) => (
+// Instagram-style bottom tab bar. The center "Plan" action is the accent —
+// planning an outing is the app's create-flow. Profile shows the user's
+// avatar instead of an icon.
+const BottomNavItem = ({ label, active, onClick, badge, children }) => (
   <button
-    className={`relative px-6 py-2.5 rounded-xl text-sm font-semibold transition-all duration-200 whitespace-nowrap ${
-      activeTab === tabName ? 'bg-white text-indigo-600 shadow-sm transform scale-105' : 'text-gray-600 hover:bg-white/50'
+    onClick={onClick}
+    aria-label={label}
+    className={`relative flex-1 h-full flex flex-col items-center justify-center gap-0.5 transition-colors ${
+      active ? 'text-ink' : 'text-ink-faint hover:text-ink-soft'
     }`}
-    onClick={() => setActiveTab(tabName)}
   >
-    {label}
+    {children}
+    <span className={`text-[10px] leading-none ${active ? 'font-bold' : 'font-medium'}`}>{label}</span>
     {badge > 0 && (
-      <span className="absolute -top-1 -right-1 min-w-5 h-5 px-1.5 bg-red-500 text-white text-xs font-bold rounded-full flex items-center justify-center shadow">
+      <span className="absolute top-1.5 left-1/2 ml-1 min-w-4 h-4 px-1 bg-red-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center">
         {badge > 9 ? '9+' : badge}
       </span>
     )}
   </button>
 );
+
+const BottomNav = ({ activeTab, setActiveTab }) => {
+  const { userProfile, unreadFeedCount } = useContext(AppContext);
+  return (
+    <nav className="fixed bottom-0 inset-x-0 z-40 bg-white/95 backdrop-blur-md border-t border-line pb-safe">
+      <div className="max-w-md mx-auto h-14 flex items-stretch">
+        <BottomNavItem label="Feed" active={activeTab === 'myFeed'} onClick={() => setActiveTab('myFeed')} badge={unreadFeedCount}>
+          <HomeIcon className="w-6 h-6" />
+        </BottomNavItem>
+        <BottomNavItem label="Explore" active={activeTab === 'suggestions'} onClick={() => setActiveTab('suggestions')}>
+          <SearchIcon className="w-6 h-6" />
+        </BottomNavItem>
+        {/* Center accent: Plan (the create flow) */}
+        <button
+          onClick={() => setActiveTab('plan')}
+          aria-label="Plan"
+          className="flex-1 h-full flex flex-col items-center justify-center"
+        >
+          <span
+            className={`w-11 h-11 -mt-4 rounded-2xl flex items-center justify-center shadow-lg transition ${
+              activeTab === 'plan'
+                ? 'bg-brand-700 text-white shadow-brand-600/30'
+                : 'bg-brand-600 text-white shadow-brand-600/25 hover:bg-brand-700'
+            }`}
+          >
+            <PlusIcon className="w-6 h-6" />
+          </span>
+          <span className={`text-[10px] leading-none mt-0.5 ${activeTab === 'plan' ? 'font-bold text-ink' : 'font-medium text-ink-faint'}`}>
+            Plan
+          </span>
+        </button>
+        <BottomNavItem label="Groups" active={activeTab === 'groups'} onClick={() => setActiveTab('groups')}>
+          <UsersIcon className="w-6 h-6" />
+        </BottomNavItem>
+        <BottomNavItem label="Profile" active={activeTab === 'profile'} onClick={() => setActiveTab('profile')}>
+          <span className={`rounded-full ${activeTab === 'profile' ? 'ring-2 ring-ink ring-offset-1' : ''}`}>
+            <Avatar src={userProfile?.photoURL} alt={userProfile?.name} size="xs" className="!border-0" />
+          </span>
+        </BottomNavItem>
+      </div>
+    </nav>
+  );
+};
 
 const MainContent = () => {
   const [activeTab, setActiveTab] = useState('myFeed');
@@ -1235,22 +1313,20 @@ const MainContent = () => {
   }, [activeTab, unreadFeedCount, markFeedRead]);
 
   return (
-    <div className="max-w-6xl mx-auto">
-      <nav className="mb-8 flex justify-center">
-        <div className="bg-white/40 backdrop-blur-lg p-1.5 rounded-2xl shadow-sm inline-flex overflow-x-auto max-w-full">
-          <TabButton label="My Feed" tabName="myFeed" activeTab={activeTab} setActiveTab={setActiveTab} badge={unreadFeedCount} />
-          <TabButton label="My Groups" tabName="groups" activeTab={activeTab} setActiveTab={setActiveTab} />
-          <TabButton label="Suggestions" tabName="suggestions" activeTab={activeTab} setActiveTab={setActiveTab} />
-          <TabButton label="Plan" tabName="plan" activeTab={activeTab} setActiveTab={setActiveTab} />
-        </div>
-      </nav>
-      <div className="bg-white/60 backdrop-blur-xl rounded-3xl shadow-xl border border-white/40 p-4 md:p-6 min-h-[60vh]">
+    <>
+      <main className="max-w-md mx-auto px-4 pt-4 pb-28 min-h-[70vh]">
         {activeTab === 'myFeed' && <MyFeedSection />}
         {activeTab === 'groups' && <GroupSection />}
         {activeTab === 'suggestions' && <SuggestionSection />}
         {activeTab === 'plan' && <PlanSection />}
-      </div>
-    </div>
+        {activeTab === 'profile' && (
+          <div className="bg-white rounded-2xl border border-line p-5">
+            <ProfileSection onClose={() => setActiveTab('myFeed')} />
+          </div>
+        )}
+      </main>
+      <BottomNav activeTab={activeTab} setActiveTab={setActiveTab} />
+    </>
   );
 };
 
@@ -1347,7 +1423,7 @@ const SettingsSection = ({ onClose }) => {
 };
 
 const ProfileSection = ({ onClose }) => {
-  const { userId, userProfile, setUserProfile, showGlobalMessage, googleAccessToken, triggerFeedRefresh } = useContext(AppContext);
+  const { userId, userProfile, setUserProfile, showGlobalMessage, googleAccessToken, setGoogleAccessToken, triggerFeedRefresh } = useContext(AppContext);
   const [name, setName] = useState(userProfile?.name || '');
   const [address, setAddress] = useState(userProfile?.address || '');
   const [kids, setKids] = useState(userProfile?.kids || []);
@@ -1561,8 +1637,9 @@ const ProfileSection = ({ onClose }) => {
   };
 
   const analyzeCalendarWithGemini = async () => {
-    if (!googleAccessToken) {
-      showGlobalMessage('Google Calendar access required. Please sign out and sign back in to grant permission.', 'error');
+    const token = await ensureGoogleCalendarAccess(googleAccessToken, setGoogleAccessToken);
+    if (!token) {
+      showGlobalMessage('Google Calendar access is needed to sync your availability.', 'error');
       return;
     }
     if (!geminiApiKey) {
@@ -1576,7 +1653,7 @@ const ProfileSection = ({ onClose }) => {
       nextMonth.setDate(now.getDate() + 30);
       const res = await fetch(
         `https://www.googleapis.com/calendar/v3/calendars/primary/events?timeMin=${now.toISOString()}&timeMax=${nextMonth.toISOString()}&singleEvents=true&orderBy=startTime`,
-        { headers: { Authorization: `Bearer ${googleAccessToken}` } }
+        { headers: { Authorization: `Bearer ${token}` } }
       );
       if (!res.ok) throw new Error('Failed to fetch calendar data.');
       const calendarData = await res.json();
@@ -2761,41 +2838,37 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
   return (
     <div className="space-y-6">
       {needsOnboarding && (
-        <div className="bg-gradient-to-r from-indigo-500 to-purple-500 text-white rounded-2xl p-5 flex flex-col md:flex-row items-start md:items-center justify-between gap-3 shadow-md">
-          <div>
-            <h3 className="font-bold text-lg">Welcome to Hangouts 👋</h3>
-            <p className="text-sm text-indigo-50 mt-1">
-              Set up your profile in 60 seconds — home location, interests, and when you're usually free — so we can find events you'll actually want to go to.
-            </p>
-          </div>
+        <div className="bg-brand-50 border border-brand-100 rounded-2xl p-5">
+          <h3 className="font-bold text-[17px] text-ink">Welcome to Hangouts 👋</h3>
+          <p className="text-sm text-ink-soft mt-1 leading-relaxed">
+            Set up your profile in 60 seconds — home location, interests, and when you're usually free — so we can find events you'll actually want to go to.
+          </p>
           <button
             onClick={() => setShowProfileModal(true)}
-            className="bg-white text-indigo-700 px-4 py-2.5 rounded-xl font-bold hover:bg-indigo-50 transition whitespace-nowrap shadow-sm"
+            className="mt-3 bg-brand-600 text-white px-4 py-2.5 rounded-xl font-semibold text-sm hover:bg-brand-700 transition"
           >
             Set up profile →
           </button>
         </div>
       )}
-      <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+      <div className="flex justify-between items-center gap-3">
         <div>
-          <h2 className="text-xl font-bold text-gray-800">Your Feed</h2>
+          <h2 className="text-lg font-bold text-ink tracking-tight">Your feed</h2>
           {isGenerating && (
-            <p className="text-xs text-indigo-600 mt-1 animate-pulse">{PATIENCE_MESSAGES[patienceIdx]}</p>
+            <p className="text-xs text-brand-600 mt-0.5 animate-pulse">{PATIENCE_MESSAGES[patienceIdx]}</p>
           )}
         </div>
-        <div className="flex gap-2 w-full md:w-auto">
-          <button onClick={generateForActiveTab} disabled={isGenerating !== false} className="flex-1 md:flex-none flex items-center justify-center gap-2 px-5 py-2 bg-gradient-to-r from-indigo-500 to-purple-600 text-white rounded-lg shadow-md hover:shadow-lg transition disabled:opacity-50 font-bold">
-            {isGenerating !== false ? <SearchIcon className="w-4 h-4 animate-spin" /> : <SparklesIcon className="w-4 h-4" />}
-            {isGenerating !== false ? 'Generating…' : feedTab === 'today' ? "Find today's ideas" : 'Find upcoming ideas'}
-          </button>
-        </div>
+        <button onClick={generateForActiveTab} disabled={isGenerating !== false} className="flex items-center gap-2 px-4 h-10 bg-brand-600 text-white rounded-xl hover:bg-brand-700 transition disabled:opacity-50 font-semibold text-sm whitespace-nowrap">
+          {isGenerating !== false ? <SearchIcon className="w-4 h-4 animate-spin" /> : <SparklesIcon className="w-4 h-4" />}
+          {isGenerating !== false ? 'Finding…' : feedTab === 'today' ? "Today's ideas" : 'New ideas'}
+        </button>
       </div>
 
       {feedItems.length === 0 ? (
-        <div className="text-center py-16 bg-white/50 rounded-2xl border border-dashed border-gray-300">
-          <SparklesIcon className="w-12 h-12 mx-auto text-gray-300 mb-3" />
-          <h3 className="text-lg font-bold text-gray-600">Your feed is empty</h3>
-          <p className="text-sm text-gray-500 max-w-sm mx-auto mt-2">Click <strong>Generate Ideas</strong> above to let AI find real-world events happening around you.</p>
+        <div className="text-center py-16 bg-white rounded-2xl border border-line">
+          <SparklesIcon className="w-10 h-10 mx-auto text-ink-faint mb-3" />
+          <h3 className="text-[17px] font-bold text-ink">Your feed is empty</h3>
+          <p className="text-sm text-ink-soft max-w-sm mx-auto mt-2 px-6">Tap <strong className="text-ink">Today's ideas</strong> above and we'll find real events happening around you.</p>
         </div>
       ) : (
         <div className="space-y-4">
@@ -2811,12 +2884,12 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
                 <button
                   key={t.id}
                   onClick={() => setFeedTab(t.id)}
-                  className={`relative px-4 py-2.5 text-sm font-bold transition -mb-px border-b-2 ${
-                    on ? 'border-indigo-600 text-indigo-600' : 'border-transparent text-gray-500 hover:text-gray-700'
+                  className={`relative px-4 py-2.5 text-sm transition -mb-px border-b-2 ${
+                    on ? 'border-ink text-ink font-bold' : 'border-transparent text-ink-faint hover:text-ink-soft font-semibold'
                   }`}
                 >
                   {t.label}
-                  <span className={`ml-1.5 text-xs font-semibold ${on ? 'text-indigo-400' : 'text-gray-400'}`}>{t.count}</span>
+                  <span className={`ml-1.5 text-xs font-semibold ${on ? 'text-ink-soft' : 'text-ink-faint'}`}>{t.count}</span>
                 </button>
               );
             })}
@@ -3003,10 +3076,9 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
 };
 
 const FeedCard = ({ item, onDelete }) => {
-  const { googleAccessToken, showGlobalMessage, userProfile } = useContext(AppContext);
+  const { googleAccessToken, setGoogleAccessToken, showGlobalMessage, userProfile } = useContext(AppContext);
   const { data, type } = item;
   const isInvite = type === 'groupProposal';
-  const bgColor = isInvite ? 'bg-amber-50 border-amber-100' : 'bg-white border-gray-100';
   const imageSrc = useEventImage(data);
   const ticket = useTicketAction(data);
   const [showSend, setShowSend] = useState(false);
@@ -3044,25 +3116,24 @@ const FeedCard = ({ item, onDelete }) => {
     );
 
   const handleCalendarClick = async () => {
-    if (googleAccessToken) {
-      await addToGoogleCalendar(data, googleAccessToken, showGlobalMessage);
+    // Ask for Calendar access on demand (incremental auth); fall back to .ics.
+    const token = await ensureGoogleCalendarAccess(googleAccessToken, setGoogleAccessToken);
+    if (token) {
+      await addToGoogleCalendar(data, token, showGlobalMessage);
     } else {
       generateICSFile(data);
     }
   };
 
   return (
-    <div className={`p-5 rounded-xl border ${bgColor} shadow-sm transition hover:shadow-md relative group overflow-hidden`}>
-      <button onClick={onDelete} className="absolute top-4 right-4 z-10 opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-500 bg-white/80 p-1 rounded-full transition" title="Dismiss">
-        <TrashIcon className="w-5 h-5" />
-      </button>
-
-      <div className="w-full h-48 mb-4 rounded-xl overflow-hidden bg-gray-100 -mt-2">
+    <div className="bg-white rounded-2xl border border-line overflow-hidden">
+      {/* Full-bleed hero image with a scrim-overlaid title (Instagram-style). */}
+      <div className="relative w-full aspect-[4/3] bg-gray-100">
         {imageSrc ? (
           <img
             src={imageSrc}
             alt={data.title}
-            className="w-full h-full object-cover"
+            className="absolute inset-0 w-full h-full object-cover"
             onError={(e) => {
               const stage = e.target.dataset.fallbackStage || '0';
               if (stage === '0') {
@@ -3075,95 +3146,123 @@ const FeedCard = ({ item, onDelete }) => {
             }}
           />
         ) : (
-          <div className="w-full h-full animate-pulse bg-gradient-to-br from-indigo-100 to-purple-100" />
+          <div className="absolute inset-0 animate-shimmer" />
         )}
-      </div>
-
-      <div className="flex justify-between items-start pr-8">
-        <div className="w-full">
-          {isInvite ? (
-            <span className="text-xs font-bold text-amber-600 uppercase tracking-wide mb-1 block">
-              Based on friend group{data.groupName ? ` · ${data.groupName}` : ''} · proposed by {data.proposerName}
-            </span>
-          ) : data.locationSource === 'current' ? (
-            <span className="text-xs font-bold text-emerald-600 uppercase tracking-wide mb-1 block">Based on current location</span>
-          ) : data.locationSource === 'home' ? (
-            <span className="text-xs font-bold text-indigo-600 uppercase tracking-wide mb-1 block">Based on home</span>
-          ) : null}
-          <h3 className="font-bold text-gray-900 text-xl">{data.title}</h3>
-          <p className="text-gray-600 text-sm mt-1 leading-relaxed">{data.description}</p>
-          <div className="flex flex-wrap gap-4 mt-3 text-sm text-gray-500 font-medium">
+        <div className="absolute inset-x-0 bottom-0 h-2/3 bg-gradient-to-t from-black/70 via-black/25 to-transparent" />
+        {/* Dismiss — always visible (touch screens have no hover). */}
+        <button
+          onClick={onDelete}
+          className="absolute top-3 right-3 w-8 h-8 flex items-center justify-center rounded-full bg-black/30 text-white/90 hover:bg-black/50 backdrop-blur-sm transition"
+          title="Dismiss"
+          aria-label="Dismiss"
+        >
+          <CloseIcon className="w-4 h-4" />
+        </button>
+        {isInvite ? (
+          <span className="absolute top-3 left-3 text-[10px] font-bold text-white bg-amber-500/90 backdrop-blur-sm uppercase tracking-wide px-2.5 py-1 rounded-full">
+            {data.groupName ? `${data.groupName} · ` : ''}from {data.proposerName}
+          </span>
+        ) : data.locationSource === 'current' ? (
+          <span className="absolute top-3 left-3 text-[10px] font-bold text-white bg-emerald-500/90 backdrop-blur-sm uppercase tracking-wide px-2.5 py-1 rounded-full">Near you</span>
+        ) : data.locationSource === 'home' ? (
+          <span className="absolute top-3 left-3 text-[10px] font-bold text-white bg-black/40 backdrop-blur-sm uppercase tracking-wide px-2.5 py-1 rounded-full">Near home</span>
+        ) : null}
+        <div className="absolute inset-x-0 bottom-0 p-4">
+          <h3 className="font-bold text-white text-xl leading-snug drop-shadow-sm">{data.title}</h3>
+          <div className="flex flex-wrap gap-x-3 gap-y-0.5 mt-1 text-[13px] text-white/85 font-medium">
             <span className="flex items-center gap-1">
-              <CalendarIcon className="w-4 h-4" /> {new Date(data.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}
+              <CalendarIcon className="w-3.5 h-3.5" /> {new Date(data.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}
             </span>
-            <span className="flex items-center gap-1">
-              <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-4 h-4" /> {data.location}
+            <span className="flex items-center gap-1 min-w-0">
+              <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-3.5 h-3.5 shrink-0" />
+              <span className="truncate">{data.location}</span>
             </span>
-            {(data.priceTier || data.isTicketed || SOURCE_LABELS[data.source] || (data.type && data.type !== 'Other')) && (
-              <span className="flex items-center gap-2 flex-wrap">
-                <TypeBadge type={data.type} />
-                <PriceTierBadge tier={data.priceTier} />
-                <TicketedBadge isTicketed={data.isTicketed} />
-                <SourceBadge source={data.source} />
-                <ResaleBadge event={data} />
-              </span>
-            )}
           </div>
         </div>
       </div>
 
-      <div className="mt-5 flex flex-wrap gap-2 border-t border-gray-100 pt-4 items-stretch">
-        <a
-          href={moreInfoUrl(data)}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="flex-1 text-center text-sm font-bold text-blue-600 bg-blue-50 hover:bg-blue-100 py-2.5 rounded-lg transition flex items-center justify-center gap-1"
-          title={data.url ? 'Open the event website' : 'Search the web for this event'}
-        >
-          <Icon path="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" className="w-4 h-4" />
-          More Info
-        </a>
-        {ticket && (
-          <a
-            href={ticket.href}
-            onClick={ticket.onClick || (() => trackAffiliateClick('tickets', ticket.href))}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex-1 text-center text-sm font-bold text-white bg-emerald-600 hover:bg-emerald-700 py-2.5 rounded-lg transition flex items-center justify-center gap-1"
-            title={ticket.label}
-          >
-            {ticket.label}
-          </a>
+      <div className="p-4">
+        <p className="text-ink-soft text-sm leading-relaxed">{data.description}</p>
+        {(data.priceTier || data.isTicketed || SOURCE_LABELS[data.source] || (data.type && data.type !== 'Other')) && (
+          <div className="flex items-center gap-2 flex-wrap mt-3">
+            <TypeBadge type={data.type} />
+            <PriceTierBadge tier={data.priceTier} />
+            <TicketedBadge isTicketed={data.isTicketed} />
+            <SourceBadge source={data.source} />
+            <ResaleBadge event={data} />
+          </div>
         )}
-        {isEvent && (() => {
-          const dir = directionsUrl(data);
-          return dir ? (
+
+        <div className="mt-4 flex gap-2 items-stretch">
+          {ticket ? (
             <a
-              href={dir}
+              href={ticket.href}
+              onClick={ticket.onClick || (() => trackAffiliateClick('tickets', ticket.href))}
               target="_blank"
               rel="noopener noreferrer"
-              className="flex-1 text-center text-sm font-bold text-gray-700 bg-gray-100 hover:bg-gray-200 py-2.5 rounded-lg transition flex items-center justify-center gap-1"
-              title="Directions from your current location to the venue"
+              className="flex-1 text-center text-sm font-semibold text-white bg-brand-600 hover:bg-brand-700 py-2.5 rounded-xl transition flex items-center justify-center gap-1.5"
+              title={ticket.label}
             >
-              <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-4 h-4" />
-              Directions
+              {ticket.label}
             </a>
-          ) : null;
-        })()}
-        <button onClick={handleCalendarClick} className="flex-1 text-sm font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 py-2.5 rounded-lg transition flex items-center justify-center gap-1">
-          <PlusIcon className="w-4 h-4" /> Add to my calendar
-        </button>
-        {isEvent && hasGroups && (
+          ) : (
+            <a
+              href={moreInfoUrl(data)}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex-1 text-center text-sm font-semibold text-ink bg-gray-100 hover:bg-gray-200 py-2.5 rounded-xl transition flex items-center justify-center gap-1.5"
+              title={data.url ? 'Open the event website' : 'Search the web for this event'}
+            >
+              More info
+            </a>
+          )}
           <button
-            ref={sendBtnRef}
-            onClick={openSendModal}
-            className="w-11 flex items-center justify-center text-amber-600 bg-amber-50 hover:bg-amber-100 rounded-lg transition"
-            title="Send to a group"
-            aria-label="Send to a group"
+            onClick={handleCalendarClick}
+            className="w-11 flex items-center justify-center text-ink-soft bg-gray-100 hover:bg-gray-200 rounded-xl transition"
+            title="Add to my calendar"
+            aria-label="Add to my calendar"
           >
-            <SendIcon className="w-5 h-5" />
+            <CalendarIcon className="w-5 h-5" />
           </button>
-        )}
+          {isEvent && (() => {
+            const dir = directionsUrl(data);
+            return dir ? (
+              <a
+                href={dir}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="w-11 flex items-center justify-center text-ink-soft bg-gray-100 hover:bg-gray-200 rounded-xl transition"
+                title="Directions to the venue"
+                aria-label="Directions"
+              >
+                <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-5 h-5" />
+              </a>
+            ) : null;
+          })()}
+          {ticket && (
+            <a
+              href={moreInfoUrl(data)}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="w-11 flex items-center justify-center text-ink-soft bg-gray-100 hover:bg-gray-200 rounded-xl transition"
+              title={data.url ? 'Open the event website' : 'Search the web for this event'}
+              aria-label="More info"
+            >
+              <Icon path="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" className="w-5 h-5" />
+            </a>
+          )}
+          {isEvent && hasGroups && (
+            <button
+              ref={sendBtnRef}
+              onClick={openSendModal}
+              className="w-11 flex items-center justify-center text-ink-soft bg-gray-100 hover:bg-gray-200 rounded-xl transition"
+              title="Send to a group"
+              aria-label="Send to a group"
+            >
+              <SendIcon className="w-5 h-5" />
+            </button>
+          )}
+        </div>
       </div>
       {showSend && (
         <SendToGroupModal
@@ -4127,16 +4226,18 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
 };
 
 const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage, proposeLabel = 'Propose' }) => {
+  const { setGoogleAccessToken } = useContext(AppContext);
   const imageSrc = useEventImage(idea);
   const ticket = useTicketAction(idea);
   return (
-    <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 flex flex-col hover:-translate-y-1 transition duration-300">
-      <div className="w-full h-32 mb-4 rounded-xl overflow-hidden bg-gray-100 -mt-2">
+    <div className="bg-white rounded-2xl border border-line overflow-hidden flex flex-col">
+      {/* Full-bleed hero with scrim-overlaid title, matching FeedCard. */}
+      <div className="relative w-full aspect-[16/10] bg-gray-100">
         {imageSrc ? (
           <img
             src={imageSrc}
             alt={idea.title}
-            className="w-full h-full object-cover"
+            className="absolute inset-0 w-full h-full object-cover"
             onError={(e) => {
               const stage = e.target.dataset.fallbackStage || '0';
               if (stage === '0') {
@@ -4149,20 +4250,27 @@ const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage,
             }}
           />
         ) : (
-          <div className="w-full h-full animate-pulse bg-gradient-to-br from-indigo-100 to-purple-100" />
+          <div className="absolute inset-0 animate-shimmer" />
         )}
+        <div className="absolute inset-x-0 bottom-0 h-2/3 bg-gradient-to-t from-black/70 via-black/25 to-transparent" />
+        <div className="absolute inset-x-0 bottom-0 p-4">
+          <h3 className="font-bold text-white text-lg leading-snug drop-shadow-sm">{idea.title}</h3>
+          <div className="flex flex-wrap gap-x-3 gap-y-0.5 mt-1 text-xs text-white/85 font-medium">
+            <span className="flex items-center gap-1">
+              <CalendarIcon className="w-3.5 h-3.5" /> {new Date(idea.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}
+            </span>
+            <span className="flex items-center gap-1 min-w-0">
+              <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-3.5 h-3.5 shrink-0" />
+              <span className="truncate">{idea.location}</span>
+            </span>
+          </div>
+        </div>
       </div>
-      <h3 className="font-bold text-lg text-gray-800 mb-2">{idea.title}</h3>
-      <p className="text-gray-600 text-sm mb-4 flex-1">{idea.description}</p>
-      <div className="text-xs text-gray-500 mb-4 space-y-1">
-        <p className="flex items-center gap-1">
-          <CalendarIcon className="w-3 h-3" /> {new Date(idea.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}
-        </p>
-        <p className="flex items-center gap-1">
-          <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-3 h-3" /> {idea.location}
-        </p>
+
+      <div className="p-4 flex flex-col flex-1">
+        <p className="text-ink-soft text-sm leading-relaxed flex-1">{idea.description}</p>
         {(idea.priceTier || idea.isTicketed || SOURCE_LABELS[idea.source] || (idea.type && idea.type !== 'Other')) && (
-          <div className="flex items-center gap-2 pt-1 flex-wrap">
+          <div className="flex items-center gap-2 flex-wrap mt-3">
             <TypeBadge type={idea.type} />
             <PriceTierBadge tier={idea.priceTier} />
             <TicketedBadge isTicketed={idea.isTicketed} />
@@ -4170,55 +4278,58 @@ const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage,
             <ResaleBadge event={idea} />
           </div>
         )}
-      </div>
-      <div className="flex flex-col gap-2 border-t pt-4 mt-auto">
-        <a
-          href={moreInfoUrl(idea)}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="flex items-center justify-center bg-blue-50 text-blue-600 text-sm font-bold p-2.5 rounded-lg hover:bg-blue-100 transition"
-          title={idea.url ? 'Open the event website' : 'Search the web for this event'}
-        >
-          <Icon path="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" className="w-4 h-4 mr-1" /> More Info
-        </a>
-        {ticket && (
-          <a
-            href={ticket.href}
-            onClick={ticket.onClick || (() => trackAffiliateClick('tickets', ticket.href))}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex items-center justify-center bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold p-2.5 rounded-lg transition"
-          >
-            {ticket.label}
-          </a>
-        )}
-        {(() => {
-          const dir = directionsUrl(idea);
-          return dir ? (
-            <a
-              href={dir}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="flex items-center justify-center bg-gray-100 text-gray-700 text-sm font-bold py-2.5 rounded-lg hover:bg-gray-200 transition gap-1"
-              title="Directions from your current location to the venue"
-            >
-              <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-4 h-4" />
-              Directions
-            </a>
-          ) : null;
-        })()}
-        <div className="flex gap-2">
-          <button onClick={() => onPropose(idea)} className="flex-1 bg-indigo-50 text-indigo-600 text-sm font-bold py-2.5 rounded-lg hover:bg-indigo-100 transition">
+
+        <div className="mt-4 flex gap-2 items-stretch">
+          <button onClick={() => onPropose(idea)} className="flex-1 bg-brand-600 hover:bg-brand-700 text-white text-sm font-semibold py-2.5 rounded-xl transition">
             {proposeLabel}
           </button>
+          {ticket && (
+            <a
+              href={ticket.href}
+              onClick={ticket.onClick || (() => trackAffiliateClick('tickets', ticket.href))}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex-1 flex items-center justify-center bg-gray-100 hover:bg-gray-200 text-ink text-sm font-semibold py-2.5 rounded-xl transition"
+            >
+              {ticket.label}
+            </a>
+          )}
+          <a
+            href={moreInfoUrl(idea)}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="w-11 flex items-center justify-center text-ink-soft bg-gray-100 hover:bg-gray-200 rounded-xl transition"
+            title={idea.url ? 'Open the event website' : 'Search the web for this event'}
+            aria-label="More info"
+          >
+            <Icon path="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" className="w-5 h-5" />
+          </a>
+          {(() => {
+            const dir = directionsUrl(idea);
+            return dir ? (
+              <a
+                href={dir}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="w-11 flex items-center justify-center text-ink-soft bg-gray-100 hover:bg-gray-200 rounded-xl transition"
+                title="Directions to the venue"
+                aria-label="Directions"
+              >
+                <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-5 h-5" />
+              </a>
+            ) : null;
+          })()}
           <button
             onClick={async () => {
-              if (googleAccessToken) await addToGoogleCalendar(idea, googleAccessToken, showGlobalMessage);
+              const token = await ensureGoogleCalendarAccess(googleAccessToken, setGoogleAccessToken);
+              if (token) await addToGoogleCalendar(idea, token, showGlobalMessage);
               else generateICSFile(idea);
             }}
-            className="flex-1 bg-gray-50 text-gray-700 text-sm font-bold py-2.5 rounded-lg hover:bg-gray-100 transition"
+            className="w-11 flex items-center justify-center text-ink-soft bg-gray-100 hover:bg-gray-200 rounded-xl transition"
+            title="Add to my calendar"
+            aria-label="Add to my calendar"
           >
-            Add to my calendar
+            <CalendarIcon className="w-5 h-5" />
           </button>
         </div>
       </div>
@@ -4663,71 +4774,249 @@ const PlanSection = () => {
 };
 
 // --- Auth Screen ---
-const AuthScreen = () => {
-  const { setGoogleAccessToken } = useContext(AppContext);
+// Flip to true once Apple Developer setup (Services ID + key + Firebase
+// config) is complete — see the launch checklist. Until then the Apple
+// button renders in a quiet "Soon" state instead of silently failing.
+const APPLE_SIGNIN_ENABLED = false;
 
+const EMAIL_FOR_SIGNIN_KEY = 'hangouts_email_for_signin';
+
+const AuthScreen = () => {
+  const { setGoogleAccessToken, showGlobalMessage } = useContext(AppContext);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [usePassword, setUsePassword] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [linkSentTo, setLinkSentTo] = useState('');
+  const [error, setError] = useState('');
+
+  const emailValid = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email.trim());
+
+  // Login asks only for basic profile/email (non-sensitive scopes), so Google
+  // shows no "unverified app" warning. Calendar access is requested on demand
+  // later via ensureGoogleCalendarAccess.
   const handleGoogleSignIn = async () => {
+    setError('');
     try {
       const provider = new GoogleAuthProvider();
-      provider.addScope('https://www.googleapis.com/auth/calendar.events');
       const result = await signInWithPopup(auth, provider);
       const credential = GoogleAuthProvider.credentialFromResult(result);
       if (credential?.accessToken) setGoogleAccessToken(credential.accessToken);
-    } catch (error) {
-      console.error('Google sign-in failed:', error);
+    } catch (err) {
+      if (err?.code !== 'auth/popup-closed-by-user') {
+        console.error('Google sign-in failed:', err);
+        setError('Google sign-in didn’t go through. Please try again.');
+      }
     }
   };
 
-  // Apple sign-in is disabled until we complete Apple Developer setup
-  // (Services ID, signing key, domain verification). The button remains
-  // visible but disabled so the UI shows the future option without
-  // surprising users with an error when they click.
-  const handleAppleSignIn = () => {};
+  const handleAppleSignIn = async () => {
+    if (!APPLE_SIGNIN_ENABLED) return;
+    setError('');
+    try {
+      const provider = new OAuthProvider('apple.com');
+      provider.addScope('email');
+      provider.addScope('name');
+      await signInWithPopup(auth, provider);
+    } catch (err) {
+      if (err?.code !== 'auth/popup-closed-by-user') {
+        console.error('Apple sign-in failed:', err);
+        setError('Apple sign-in didn’t go through. Please try again.');
+      }
+    }
+  };
+
+  const handleMagicLink = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      const addr = email.trim();
+      await sendSignInLinkToEmail(auth, addr, {
+        url: window.location.origin,
+        handleCodeInApp: true,
+      });
+      window.localStorage.setItem(EMAIL_FOR_SIGNIN_KEY, addr);
+      setLinkSentTo(addr);
+    } catch (err) {
+      console.error('Magic link failed:', err);
+      setError('Couldn’t send the sign-in link. Check the address and try again.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handlePasswordAuth = async () => {
+    setBusy(true);
+    setError('');
+    const addr = email.trim();
+    try {
+      await signInWithEmailAndPassword(auth, addr, password);
+    } catch (err) {
+      if (err?.code === 'auth/user-not-found') {
+        // No account yet — create one with these credentials.
+        try {
+          await createUserWithEmailAndPassword(auth, addr, password);
+        } catch (createErr) {
+          setError(friendlyAuthError(createErr));
+        }
+      } else if (err?.code === 'auth/invalid-credential') {
+        // Could be "no such user" or "wrong password" (Firebase hides which).
+        // Try creating; email-already-in-use means it was a wrong password.
+        try {
+          await createUserWithEmailAndPassword(auth, addr, password);
+        } catch (createErr) {
+          setError(
+            createErr?.code === 'auth/email-already-in-use'
+              ? 'That password doesn’t match this account.'
+              : friendlyAuthError(createErr)
+          );
+        }
+      } else {
+        setError(friendlyAuthError(err));
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const handleAnonSignIn = async () => {
+    setError('');
     try {
       await signInAnonymously(auth);
-    } catch (error) {
-      console.error('Anonymous sign-in failed:', error);
+    } catch (err) {
+      console.error('Guest sign-in failed:', err);
+      setError('Couldn’t start a guest session. Please try again.');
     }
   };
 
-  return (
-    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-500 via-purple-500 to-pink-500 p-4">
-      <div className="bg-white/90 backdrop-blur-xl p-8 rounded-3xl shadow-2xl w-full max-w-md text-center">
-        <div className="w-20 h-20 bg-indigo-100 rounded-full flex items-center justify-center mx-auto mb-6 text-indigo-600">
-          <UsersIcon className="w-10 h-10" />
-        </div>
-        <h1 className="text-4xl font-black text-gray-900 mb-2">Hangouts</h1>
-        <p className="text-gray-500 mb-4">Effortless social planning powered by AI &amp; Live Search.</p>
-        <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 mb-6 text-left">
-          <p className="text-xs font-bold text-amber-800 mb-1">⚠️ A note on Google sign-in</p>
-          <p className="text-xs text-amber-700 leading-relaxed">
-            Because this is a private beta, Google will show a "Google hasn't verified this app" warning. That's expected.
-            Click <span className="font-semibold">Advanced</span> → <span className="font-semibold">Go to Hangouts Planner (unsafe)</span> to continue.
-            It's safe — the app is the one you got the passcode for.
+  // "Check your inbox" confirmation state after a magic link is sent.
+  if (linkSentTo)
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-surface p-6">
+        <div className="w-full max-w-sm text-center">
+          <div className="w-16 h-16 bg-brand-50 rounded-2xl flex items-center justify-center mx-auto mb-6 text-brand-600">
+            <MailIcon className="w-8 h-8" />
+          </div>
+          <h1 className="text-2xl font-bold text-ink tracking-tight mb-2">Check your inbox</h1>
+          <p className="text-sm text-ink-soft leading-relaxed mb-8">
+            We sent a sign-in link to <span className="font-semibold text-ink">{linkSentTo}</span>.
+            Open it on this device and you’re in — no password needed.
           </p>
-        </div>
-        <div className="space-y-3">
-          <button onClick={handleGoogleSignIn} className="w-full py-3 px-4 bg-white border border-gray-200 rounded-xl hover:bg-gray-50 font-bold text-gray-700 flex items-center justify-center gap-3 transition">
-            <GoogleIcon /> Continue with Google
-          </button>
           <button
-            onClick={handleAppleSignIn}
-            disabled
-            title="Apple sign-in coming soon"
-            className="w-full py-3 px-4 bg-gray-100 text-gray-400 rounded-xl font-bold flex items-center justify-center gap-3 cursor-not-allowed border border-gray-200"
+            onClick={() => { setLinkSentTo(''); }}
+            className="text-sm font-semibold text-brand-600 hover:text-brand-700 transition"
           >
-            <AppleIcon /> Continue with Apple
-            <span className="text-xs font-medium ml-1 px-2 py-0.5 bg-gray-200 text-gray-500 rounded-full">Soon</span>
-          </button>
-          <button onClick={handleAnonSignIn} className="text-sm text-gray-400 hover:text-indigo-600 font-medium mt-4">
-            Skip for now (Anonymous)
+            Use a different email
           </button>
         </div>
       </div>
+    );
+
+  return (
+    <div className="min-h-screen flex flex-col bg-surface">
+      <div className="flex-1 flex flex-col justify-center px-6 py-10 w-full max-w-sm mx-auto">
+        {/* Brand */}
+        <div className="text-center mb-10">
+          <div className="w-16 h-16 bg-brand-600 rounded-2xl flex items-center justify-center mx-auto mb-5 text-white shadow-lg shadow-brand-600/20">
+            <UsersIcon className="w-8 h-8" />
+          </div>
+          <h1 className="text-4xl font-extrabold text-ink tracking-tight">Hangouts</h1>
+          <p className="text-ink-soft mt-2 text-[15px]">Plans with your people, made easy.</p>
+        </div>
+
+        {/* Sign-in stack */}
+        <div className="space-y-3">
+          <button
+            onClick={handleGoogleSignIn}
+            className="w-full h-12 bg-white border border-line rounded-xl hover:bg-gray-50 active:scale-[0.99] font-semibold text-[15px] text-ink flex items-center justify-center gap-3 transition"
+          >
+            <GoogleIcon /> Continue with Google
+          </button>
+          {APPLE_SIGNIN_ENABLED ? (
+            <button
+              onClick={handleAppleSignIn}
+              className="w-full h-12 bg-ink text-white rounded-xl hover:bg-black active:scale-[0.99] font-semibold text-[15px] flex items-center justify-center gap-3 transition"
+            >
+              <AppleIcon /> Continue with Apple
+            </button>
+          ) : (
+            <button
+              disabled
+              title="Apple sign-in coming soon"
+              className="w-full h-12 bg-gray-50 text-gray-400 rounded-xl font-semibold text-[15px] flex items-center justify-center gap-3 cursor-not-allowed border border-line"
+            >
+              <AppleIcon /> Continue with Apple
+              <span className="text-[11px] font-medium px-2 py-0.5 bg-gray-200/70 text-gray-500 rounded-full">Soon</span>
+            </button>
+          )}
+
+          <div className="flex items-center gap-3 py-2">
+            <div className="flex-1 h-px bg-line" />
+            <span className="text-xs text-ink-faint font-medium uppercase tracking-wider">or</span>
+            <div className="flex-1 h-px bg-line" />
+          </div>
+
+          <input
+            type="email"
+            inputMode="email"
+            autoComplete="email"
+            value={email}
+            onChange={(e) => { setEmail(e.target.value); setError(''); }}
+            placeholder="Email address"
+            className="w-full h-12 px-4 bg-white border border-line rounded-xl text-[15px] text-ink placeholder:text-ink-faint focus:outline-none focus:ring-2 focus:ring-brand-600/30 focus:border-brand-600 transition"
+          />
+          {usePassword && (
+            <input
+              type="password"
+              autoComplete="current-password"
+              value={password}
+              onChange={(e) => { setPassword(e.target.value); setError(''); }}
+              placeholder="Password"
+              className="w-full h-12 px-4 bg-white border border-line rounded-xl text-[15px] text-ink placeholder:text-ink-faint focus:outline-none focus:ring-2 focus:ring-brand-600/30 focus:border-brand-600 transition"
+            />
+          )}
+          <button
+            onClick={usePassword ? handlePasswordAuth : handleMagicLink}
+            disabled={busy || !emailValid || (usePassword && password.length < 6)}
+            className="w-full h-12 bg-brand-600 text-white rounded-xl font-semibold text-[15px] hover:bg-brand-700 active:scale-[0.99] disabled:opacity-40 disabled:pointer-events-none transition"
+          >
+            {busy ? 'One sec…' : usePassword ? 'Continue' : 'Email me a sign-in link'}
+          </button>
+          {error && <p className="text-[13px] text-red-500 font-medium text-center">{error}</p>}
+          <button
+            onClick={() => { setUsePassword((v) => !v); setError(''); }}
+            className="w-full text-[13px] text-ink-soft hover:text-ink font-medium py-1 transition"
+          >
+            {usePassword ? 'Email me a link instead' : 'Use a password instead'}
+          </button>
+        </div>
+      </div>
+
+      {/* Guest entry */}
+      <div className="pb-10 text-center">
+        <button onClick={handleAnonSignIn} className="text-sm text-ink-soft hover:text-brand-600 font-semibold transition">
+          Browse as guest →
+        </button>
+        <p className="text-[11px] text-ink-faint mt-2">Look around first — create an account whenever you’re ready.</p>
+      </div>
     </div>
   );
+};
+
+// Map Firebase auth error codes to copy a human can act on.
+const friendlyAuthError = (err) => {
+  switch (err?.code) {
+    case 'auth/weak-password':
+      return 'Password needs at least 6 characters.';
+    case 'auth/invalid-email':
+      return 'That doesn’t look like a valid email address.';
+    case 'auth/too-many-requests':
+      return 'Too many attempts — wait a minute and try again.';
+    case 'auth/email-already-in-use':
+      return 'That email already has an account.';
+    default:
+      return 'Something went wrong. Please try again.';
+  }
 };
 
 // --- Group Invites ---
@@ -5703,13 +5992,14 @@ const FeedbackButton = () => {
   if (!userId) return null;
   return (
     <>
+      {/* Quiet round FAB, raised above the bottom tab bar. */}
       <button
         onClick={() => setOpen(true)}
-        className="fixed bottom-6 right-6 bg-indigo-600 text-white pl-4 pr-5 py-3 rounded-full shadow-2xl hover:bg-indigo-700 z-40 flex items-center gap-2 font-medium text-sm transition-transform hover:scale-105"
+        className="fixed bottom-20 right-4 mb-safe w-11 h-11 bg-white border border-line text-ink-soft rounded-full shadow-md hover:text-brand-600 hover:shadow-lg z-30 flex items-center justify-center transition"
         title="Send feedback"
+        aria-label="Send feedback"
       >
         <ChatIcon className="w-5 h-5" />
-        Feedback
       </button>
       {open && <FeedbackModal onClose={() => setOpen(false)} />}
     </>
@@ -5843,13 +6133,13 @@ const PasscodeGate = ({ children }) => {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-500 via-purple-500 to-pink-500 p-4">
-      <div className="bg-white/95 backdrop-blur-xl p-8 rounded-3xl shadow-2xl w-full max-w-md text-center">
-        <div className="w-20 h-20 bg-indigo-100 rounded-full flex items-center justify-center mx-auto mb-6 text-indigo-600">
-          <Icon path="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" className="w-10 h-10" />
+    <div className="min-h-screen flex items-center justify-center bg-surface p-6">
+      <div className="w-full max-w-sm text-center">
+        <div className="w-16 h-16 bg-brand-600 rounded-2xl flex items-center justify-center mx-auto mb-6 text-white shadow-lg shadow-brand-600/20">
+          <Icon path="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" className="w-8 h-8" />
         </div>
-        <h1 className="text-3xl font-black text-gray-900 mb-2">Hangouts</h1>
-        <p className="text-gray-500 mb-6">Private preview. Enter the passcode to continue.</p>
+        <h1 className="text-3xl font-extrabold text-ink tracking-tight mb-2">Hangouts</h1>
+        <p className="text-ink-soft mb-8 text-[15px]">Private preview. Enter the passcode to continue.</p>
         <form onSubmit={tryUnlock} className="space-y-3">
           <input
             autoFocus
@@ -5857,18 +6147,18 @@ const PasscodeGate = ({ children }) => {
             value={input}
             onChange={(e) => { setInput(e.target.value); setError(''); }}
             placeholder="Passcode"
-            className="w-full p-3 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:bg-white text-center transition"
+            className="w-full h-12 px-4 bg-white border border-line rounded-xl focus:outline-none focus:ring-2 focus:ring-brand-600/30 focus:border-brand-600 text-center transition"
           />
           {error && <p className="text-sm text-red-500 font-medium">{error}</p>}
           <button
             type="submit"
             disabled={!input.trim() || checking}
-            className="w-full py-3 px-4 bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 font-bold transition disabled:opacity-50"
+            className="w-full h-12 bg-brand-600 text-white rounded-xl hover:bg-brand-700 font-semibold transition disabled:opacity-40"
           >
             {checking ? 'Checking…' : 'Unlock'}
           </button>
         </form>
-        <p className="text-xs text-gray-400 mt-6">Don't have the passcode? Ask Paul.</p>
+        <p className="text-xs text-ink-faint mt-8">Don't have the passcode? Ask Paul.</p>
       </div>
     </div>
   );
@@ -6261,6 +6551,32 @@ export default function App() {
     }
   }, []);
 
+  // Complete an email magic-link sign-in if the app was opened from one.
+  // The email was stashed in localStorage when the link was requested; if
+  // it's missing (e.g. link opened on a different device), ask for it.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (!isSignInWithEmailLink(auth, window.location.href)) return;
+    let email = window.localStorage.getItem(EMAIL_FOR_SIGNIN_KEY);
+    if (!email) {
+      email = window.prompt('Confirm your email to finish signing in:') || '';
+    }
+    if (!email.trim()) return;
+    signInWithEmailLink(auth, email.trim(), window.location.href)
+      .then(() => {
+        window.localStorage.removeItem(EMAIL_FOR_SIGNIN_KEY);
+        showGlobalMessage('You’re signed in!');
+      })
+      .catch((err) => {
+        console.error('Email link sign-in failed:', err);
+        showGlobalMessage('That sign-in link didn’t work — request a fresh one.', 'error');
+      })
+      .finally(() => {
+        // Strip the one-time-code params so refreshes don't retry a used link.
+        window.history.replaceState({}, '', window.location.pathname);
+      });
+  }, [showGlobalMessage]);
+
   useEffect(() => {
     // Track the profile snapshot listener so we can detach it on sign-out
     // (or on each auth-state change) — otherwise every token refresh stacked
@@ -6358,10 +6674,10 @@ export default function App() {
             </div>
           )
         ) : (
-        <div className="min-h-screen bg-[#F3F4F6] text-gray-900 font-sans p-4 md:p-8 overflow-x-hidden">
+        <div className="min-h-screen bg-surface text-ink font-sans overflow-x-hidden">
           <Header />
           {msg && (
-            <div className={`fixed top-6 right-6 px-6 py-3 rounded-xl shadow-2xl text-white font-bold z-[100] animate-fade-in ${msg.type === 'error' ? 'bg-red-500' : 'bg-emerald-500'}`}>
+            <div className={`fixed top-16 inset-x-4 sm:inset-x-auto sm:right-6 sm:max-w-sm px-5 py-3 rounded-xl shadow-2xl text-white font-semibold text-sm z-[100] animate-fade-in ${msg.type === 'error' ? 'bg-red-500' : 'bg-emerald-500'}`}>
               {msg.text}
             </div>
           )}

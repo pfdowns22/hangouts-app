@@ -2,19 +2,59 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#fafafa" />
     <title>Hangouts</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      // Design tokens for the mobile-first redesign. The CDN build reads this
+      // global before scanning classes — keep it tiny and semantic:
+      //   surface     near-white app canvas (Instagram-style)
+      //   ink         primary text (near-black) + soft/faint steps
+      //   line        hairline borders
+      //   brand       the single indigo accent, used sparingly
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              surface: '#fafafa',
+              ink: { DEFAULT: '#111114', soft: '#6b7280', faint: '#9ca3af' },
+              line: '#e5e7eb',
+              brand: {
+                50: '#eef2ff',
+                100: '#e0e7ff',
+                500: '#6366f1',
+                600: '#4f46e5',
+                700: '#4338ca',
+              },
+            },
+            borderRadius: { xl: '0.875rem', '2xl': '1.25rem' },
+          },
+        },
+      };
+    </script>
     <style>
       @keyframes fade-in {
         from { opacity: 0; transform: translateY(-10px); }
         to   { opacity: 1; transform: translateY(0); }
       }
       .animate-fade-in { animation: fade-in 0.2s ease-out; }
+      @keyframes shimmer {
+        from { background-position: 200% 0; }
+        to   { background-position: -200% 0; }
+      }
+      .animate-shimmer {
+        background: linear-gradient(90deg, #f3f4f6 25%, #e5e7eb 50%, #f3f4f6 75%);
+        background-size: 200% 100%;
+        animation: shimmer 1.4s ease-in-out infinite;
+      }
       body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
       /* Never allow horizontal scroll on small screens (a stray wide element
          was causing side-to-side scroll on iPhone). */
       html, body { max-width: 100%; overflow-x: hidden; }
+      /* Respect iPhone home-indicator / notch insets (bottom nav sits above it). */
+      .pb-safe { padding-bottom: env(safe-area-inset-bottom); }
+      .mb-safe { margin-bottom: env(safe-area-inset-bottom); }
     </style>
   </head>
   <body>
