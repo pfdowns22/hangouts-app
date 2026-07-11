@@ -51,6 +51,19 @@ export const fetchPlaces = async ({ lat, lng, location, radius, term, categories
   }
 };
 
+// Fetch a page's og:image + liveness via the proxy's ?kind=meta mode.
+// Returns { alive, image } or null on any failure (never throws).
+export const fetchUrlMeta = async (url) => {
+  try {
+    if (!url) return null;
+    const res = await fetch(`/api/events?kind=meta&url=${encodeURIComponent(url)}`, { headers: { Accept: 'application/json' } });
+    if (!res.ok) return null;
+    return (await res.json().catch(() => null)) || null;
+  } catch {
+    return null;
+  }
+};
+
 // Resolve an event's REAL ticket-purchase URL via the ticketing APIs
 // (Ticketmaster Discovery + SeatGeek). Returns { url, source } only on a
 // confident match, else null so the caller keeps its web-search fallback.

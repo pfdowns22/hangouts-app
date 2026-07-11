@@ -33,13 +33,16 @@ import {
   Timestamp,
   orderBy,
   limit,
+  documentId,
+  startAt,
+  endAt,
 } from 'firebase/firestore';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 
 import { createPortal } from 'react-dom';
 
 import { auth, db, storage, appId, geminiApiKey } from './firebase.js';
-import { fetchRealEvents, verifyVenue, resolveTicketLink } from './events.js';
+import { fetchRealEvents, verifyVenue, resolveTicketLink, fetchUrlMeta } from './events.js';
 
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_URL_FOR_KEY = (key) =>
@@ -179,8 +182,30 @@ const callOpenAI = async (prompt, key, useWebSearch) => {
 // Dispatcher used by every AI call site in the app. The caller passes
 // the provider object directly (we don't read from React state here so
 // it stays as a pure function callable from class-free helpers).
+// Server-side proxy path: used automatically when no Gemini key is bundled
+// into the client (the production setup — see api/ai.js). The proxy verifies
+// the caller's Firebase session and enforces per-user daily caps.
+const callGeminiProxy = async (prompt, useWebSearch) => {
+  const token = await auth.currentUser?.getIdToken?.();
+  if (!token) throw new Error('Sign in required for AI features.');
+  const res = await fetch('/api/ai', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ prompt, useWebSearch }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.error || `AI proxy error ${res.status}`);
+  return data.text || '';
+};
+
+// True when SOME shared-Gemini path exists: a bundled key (dev/beta) or the
+// server proxy (production). Guards that used to demand VITE_GEMINI_API_KEY
+// should use this instead of blocking.
+const hasSharedGemini = true; // proxy fallback means the shared path always exists
+
 const callAI = async ({ prompt, useWebSearch = false, provider = 'gemini' }) => {
-  if (provider === 'gemini') return callGemini(prompt, geminiApiKey, useWebSearch);
+  if (provider === 'gemini')
+    return geminiApiKey ? callGemini(prompt, geminiApiKey, useWebSearch) : callGeminiProxy(prompt, useWebSearch);
   if (provider === 'gemini-own') return callGemini(prompt, getStoredKey('gemini-own'), useWebSearch);
   if (provider === 'claude') return callClaude(prompt, getStoredKey('claude'), useWebSearch);
   if (provider === 'openai') return callOpenAI(prompt, getStoredKey('openai'), useWebSearch);
@@ -720,11 +745,17 @@ const textPlaceholder = (title) => {
 // don't burn the free-tier 50/hr quota on repeat renders of the same event.
 const unsplashCache = new Map();
 
-// React hook: returns the best image URL for an event.
-// When VITE_UNSPLASH_KEY is configured, Unsplash is *always* the primary
-// source — Gemini's claimed imageUrls are notoriously unreliable (often
-// pointing at images that 404 or aren't really images at all). We only
-// fall back to Gemini's URL or pollinations if Unsplash has no results.
+// Session cache: event page URL → og:image (or null when the page had none).
+const ogImageCache = new Map();
+
+// React hook: returns the best image URL for an event. Priority:
+// 1. The provider's own image when the event came from a partner API
+//    (Ticketmaster/SeatGeek/etc. photos are the event's REAL artwork).
+// 2. The event page's og:image (via the ?kind=meta proxy) when the event
+//    carries a plausible URL — the actual photo beats any guess.
+// 3. Unsplash keyword search (real photos, but generic).
+// 4. Gemini's claimed imageUrl, then pollinations, then a text placeholder
+//    (handled by the <img> onError chain in the cards).
 const useEventImage = (data) => {
   // Optimistic starting state: when no Unsplash key, fall back immediately
   // to pollinations so users see *something* before any async work.
@@ -735,36 +766,66 @@ const useEventImage = (data) => {
   useEffect(() => {
     const query = (data?.imageKeywords || data?.title || 'event').slice(0, 80);
 
-    // No Unsplash key: defer to Gemini's URL (if any) or pollinations.
-    if (!UNSPLASH_KEY) {
-      setSrc(data?.imageUrl || pollinationsImage(query));
+    // 1. Partner-API events ship their real artwork — always use it.
+    if (TRUSTED_URL_SOURCES.has(data?.source) && validHttpUrl(data?.imageUrl)) {
+      setSrc(data.imageUrl);
       return;
     }
 
-    // With Unsplash configured, always try Unsplash first.
-    if (unsplashCache.has(query)) {
-      setSrc(unsplashCache.get(query));
-      return;
-    }
     let cancelled = false;
-    fetch(`https://api.unsplash.com/search/photos?query=${encodeURIComponent(query)}&per_page=1&orientation=landscape&client_id=${UNSPLASH_KEY}`)
-      .then((r) => r.json())
-      .then((j) => {
-        if (cancelled) return;
-        const url = j?.results?.[0]?.urls?.regular;
-        if (url) {
-          unsplashCache.set(query, url);
-          setSrc(url);
-        } else {
-          // Unsplash returned no results — try Gemini's URL, then pollinations.
-          setSrc(data?.imageUrl || pollinationsImage(query));
-        }
-      })
-      .catch(() => {
+
+    const unsplashThenFallbacks = () => {
+      if (!UNSPLASH_KEY) {
         if (!cancelled) setSrc(data?.imageUrl || pollinationsImage(query));
+        return;
+      }
+      if (unsplashCache.has(query)) {
+        if (!cancelled) setSrc(unsplashCache.get(query));
+        return;
+      }
+      fetch(`https://api.unsplash.com/search/photos?query=${encodeURIComponent(query)}&per_page=1&orientation=landscape&client_id=${UNSPLASH_KEY}`)
+        .then((r) => r.json())
+        .then((j) => {
+          if (cancelled) return;
+          const url = j?.results?.[0]?.urls?.regular;
+          if (url) {
+            unsplashCache.set(query, url);
+            setSrc(url);
+          } else {
+            setSrc(data?.imageUrl || pollinationsImage(query));
+          }
+        })
+        .catch(() => {
+          if (!cancelled) setSrc(data?.imageUrl || pollinationsImage(query));
+        });
+    };
+
+    // 2. Event page's og:image — the event's actual photo, not a lookalike.
+    const pageUrl = validHttpUrl(data?.url);
+    if (pageUrl) {
+      if (ogImageCache.has(pageUrl)) {
+        const cached = ogImageCache.get(pageUrl);
+        if (cached) {
+          setSrc(cached);
+          return;
+        }
+        unsplashThenFallbacks();
+        return;
+      }
+      fetchUrlMeta(pageUrl).then((meta) => {
+        const img = meta?.image && validHttpUrl(meta.image) ? meta.image : null;
+        ogImageCache.set(pageUrl, img);
+        if (cancelled) return;
+        if (img) setSrc(img);
+        else unsplashThenFallbacks();
       });
+      return () => { cancelled = true; };
+    }
+
+    // 3-4. No usable page URL → straight to Unsplash / fallbacks.
+    unsplashThenFallbacks();
     return () => { cancelled = true; };
-  }, [data?.imageUrl, data?.title, data?.imageKeywords]);
+  }, [data?.imageUrl, data?.title, data?.imageKeywords, data?.url, data?.source]);
 
   return src;
 };
@@ -877,6 +938,97 @@ const mergeEvents = (...lists) => {
     if (!seen.has(key)) seen.set(key, ev);
   }
   return [...seen.values()];
+};
+
+// --- Taste signals (the feedback loop) --------------------------------------
+// Saves and dismissals are recorded on the profile as lightweight counters +
+// recent titles, then fed back into the generation prompts, so the feed gets
+// sharper the more it's used. Firestore field paths only tolerate simple
+// names, so event types are slugged (Food & Drink → food_drink).
+const typeKey = (t) => (t || 'Other').toLowerCase().replace(/[^a-z0-9]+/g, '_');
+const recordTasteSignal = (uid, kind /* 'saved' | 'dismissed' */, event) => {
+  if (!uid || !event?.title) return;
+  const patch = { [`tasteSignals.${kind}Types.${typeKey(event.type)}`]: increment(1) };
+  if (kind === 'saved') patch['tasteSignals.savedTitles'] = arrayUnion(String(event.title).slice(0, 80));
+  updateDoc(doc(db, `artifacts/${appId}/users/${uid}/profiles`, 'myProfile'), patch).catch(() => {});
+};
+// Top-N keys of a {slug: count} map, de-slugged for prompt text.
+const topTasteTypes = (m, n = 4) =>
+  Object.entries(m || {})
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, n)
+    .map(([k]) => k.replace(/_/g, ' '));
+
+// --- Shared event pool (community cache) ------------------------------------
+// Every generation run contributes its discovered events to a public pool
+// keyed by geo bucket, so the NEXT person (or the same person tomorrow) gets
+// an instant feed from cache instead of a 20-second metered AI search. Doc ids
+// are content-addressed (`geo|title|day`) so the same event never duplicates,
+// and a doc-ID prefix range query fetches a bucket without a composite index.
+
+// A coarse geo bucket from a free-text location: NYC borough when detectable,
+// else the first comma-segment ("Austin, TX" → "austin"), slug-safe.
+const poolGeoBucket = (locLabel) => {
+  const b = nycBorough(locLabel);
+  const raw = b || (locLabel || '').split(',')[0];
+  const slug = raw.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+  return slug || 'unknown';
+};
+
+const poolDocId = (event, geo) => {
+  const t = (normalizeTitle(event.title) || 'untitled').replace(/\s+/g, '-').slice(0, 80);
+  const day = String(event.date || '').slice(0, 10) || 'undated';
+  return `${geo}|${t}|${day}`;
+};
+
+const poolCollection = () => collection(db, `artifacts/${appId}/public/data/eventPool`);
+
+// Contribute events to the pool. Fire-and-forget: pool writes must never
+// block or fail the feed write. Only future-dated events with titles go in.
+const writeEventsToPool = (events, geo) => {
+  if (!geo || geo === 'unknown') return;
+  const today = new Date().toISOString().slice(0, 10);
+  (events || [])
+    .filter((e) => e?.title && String(e.date || '').slice(0, 10) >= today)
+    .slice(0, 12)
+    .forEach((e) => {
+      const day = String(e.date).slice(0, 10);
+      setDoc(
+        doc(poolCollection(), poolDocId(e, geo)),
+        { ...e, poolGeo: geo, poolDay: day, pooledAt: serverTimestamp() },
+        { merge: true }
+      ).catch(() => {});
+    });
+};
+
+// Read the pool for a geo bucket + timeframe. Uses a documentId() prefix range
+// (ids start with `${geo}|`) so no composite index is needed; date filtering
+// happens client-side on the small result set. Excludes titles already seen.
+const fetchPoolEvents = async ({ geo, forToday, excludeTitleKeys = new Set(), max = 6 }) => {
+  if (!geo || geo === 'unknown') return [];
+  try {
+    const snap = await getDocs(
+      query(poolCollection(), orderBy(documentId()), startAt(`${geo}|`), endAt(`${geo}|`), limit(80))
+    );
+    const today = new Date().toISOString().slice(0, 10);
+    const horizon = new Date(Date.now() + 14 * 864e5).toISOString().slice(0, 10);
+    const picks = [];
+    for (const d of snap.docs) {
+      const e = d.data();
+      const day = e.poolDay || String(e.date || '').slice(0, 10);
+      const inFrame = forToday ? day === today : day > today && day <= horizon;
+      if (!inFrame) continue;
+      if (excludeTitleKeys.has(normalizeTitle(e.title))) continue;
+      const { poolGeo: _g, poolDay: _d, pooledAt: _t, ...event } = e;
+      picks.push(event);
+    }
+    // Soonest first; cap.
+    picks.sort((a, b) => String(a.date || '').localeCompare(String(b.date || '')));
+    return picks.slice(0, max);
+  } catch (e) {
+    console.warn('Event pool read failed (non-fatal):', e);
+    return [];
+  }
 };
 
 // Ask the AI to rank/personalize a list of REAL partner-API events. It may
@@ -1642,8 +1794,8 @@ const ProfileSection = ({ onClose }) => {
       showGlobalMessage('Google Calendar access is needed to sync your availability.', 'error');
       return;
     }
-    if (!geminiApiKey) {
-      showGlobalMessage('Gemini API key missing. Set VITE_GEMINI_API_KEY in your environment.', 'error');
+    if (!hasSharedGemini) {
+      showGlobalMessage('AI is not configured for this deployment.', 'error');
       return;
     }
     setAnalyzingCalendar(true);
@@ -2311,8 +2463,14 @@ const eventDateBucket = (item) => {
 const MyFeedSection = () => {
   const { userId, userProfile, showGlobalMessage, setShowProfileModal, feedRefreshTick } = useContext(AppContext);
   const [feedItems, setFeedItems] = useState([]);
+  const [feedLoaded, setFeedLoaded] = useState(false); // first snapshot landed
   const [isGenerating, setIsGenerating] = useState(false);
   const [patienceIdx, setPatienceIdx] = useState(0);
+  const autoRunRef = useRef(false); // one auto-populate/stale-refresh per session
+  const pullRef = useRef({ startY: 0, active: false });
+  const [pull, setPull] = useState(0); // pull-to-refresh drag distance (px)
+  const [savedItems, setSavedItems] = useState([]); // hearted events (own collection)
+  const [showSaved, setShowSaved] = useState(false); // Saved view toggle
   const [feedTab, setFeedTab] = useState('today'); // today | upcoming
   const [filterMode, setFilterMode] = useState('all'); // all | free | cheap | expensive | ticketed
   const [typeFilter, setTypeFilter] = useState('all'); // all | one of EVENT_TYPES
@@ -2432,7 +2590,10 @@ const MyFeedSection = () => {
     // with synthetic old timestamps (see SCROLL_TIMESTAMP_BASE) so they
     // always sit below freshly-refreshed/proposed items.
     const q = query(collection(db, `artifacts/${appId}/users/${userId}/feed`), orderBy('timestamp', 'desc'), limit(200));
-    return onSnapshot(q, (snapshot) => setFeedItems(snapshot.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return onSnapshot(q, (snapshot) => {
+      setFeedItems(snapshot.docs.map((d) => ({ id: d.id, ...d.data() })));
+      setFeedLoaded(true);
+    });
   }, [userId]);
 
   // Auto-clear events that have already happened. Runs whenever the feed
@@ -2565,13 +2726,46 @@ const MyFeedSection = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [feedItems.length, userProfile, feedTab]);
 
-  const deleteFeedItem = async (itemId) => {
+  const deleteFeedItem = async (item) => {
     try {
-      await deleteDoc(doc(db, `artifacts/${appId}/users/${userId}/feed/${itemId}`));
+      await deleteDoc(doc(db, `artifacts/${appId}/users/${userId}/feed/${item.id}`));
+      // Dismissing an event suggestion is a taste signal: bias future
+      // generations away from what keeps getting swiped away.
+      if (item.type === 'personalSuggestion' && item.data) recordTasteSignal(userId, 'dismissed', item.data);
       showGlobalMessage('Item dismissed from feed.');
     } catch (e) {
       console.error(e);
       showGlobalMessage('Could not delete item.', 'error');
+    }
+  };
+
+  // --- Saved (♥) events ---------------------------------------------------
+  useEffect(() => {
+    if (!userId) return;
+    return onSnapshot(collection(db, `artifacts/${appId}/users/${userId}/saved`), (snap) =>
+      setSavedItems(snap.docs.map((d) => ({ id: d.id, ...d.data() })))
+    );
+  }, [userId]);
+  const savedKeySet = useMemo(
+    () => new Set(savedItems.map((s) => normalizeTitle(s.data?.title)).filter(Boolean)),
+    [savedItems]
+  );
+  const savedDocId = (event) =>
+    `${(normalizeTitle(event.title) || 'untitled').replace(/\s+/g, '-').slice(0, 80)}|${String(event.date || '').slice(0, 10)}`;
+  const toggleSave = async (event) => {
+    if (!event?.title) return;
+    try {
+      const ref = doc(db, `artifacts/${appId}/users/${userId}/saved`, savedDocId(event));
+      if (savedKeySet.has(normalizeTitle(event.title))) {
+        await deleteDoc(ref);
+      } else {
+        await setDoc(ref, { type: 'personalSuggestion', data: event, savedAt: serverTimestamp() });
+        recordTasteSignal(userId, 'saved', event);
+        showGlobalMessage('Saved ♥');
+      }
+    } catch (e) {
+      console.error(e);
+      showGlobalMessage('Could not update saved events.', 'error');
     }
   };
 
@@ -2595,8 +2789,8 @@ const MyFeedSection = () => {
   const generatePersonalSuggestions = async (forToday = false, opts = {}) => {
     const { fromScroll = false } = opts;
     const provider = userProfile?.aiProvider || 'gemini';
-    if (provider === 'gemini' && !geminiApiKey) {
-      showGlobalMessage('Gemini API key missing. Set VITE_GEMINI_API_KEY in your environment.', 'error');
+    if (provider === 'gemini' && !hasSharedGemini) {
+      showGlobalMessage('AI is not configured for this deployment.', 'error');
       return;
     }
     // Refresh (button or context tick) resets scope to immediate area.
@@ -2611,6 +2805,52 @@ const MyFeedSection = () => {
       const home = userProfile?.address || 'New York, NY';
       const current = userProfile?.currentLocation?.label || '';
       const locPref = userProfile?.locationPreference || 'home';
+
+      // Writes a batch of suggestions into the user's feed with the standard
+      // refresh/scroll timestamp ordering. Shared by the pool fast-path and
+      // the full generation below.
+      const persistSuggestions = async (list) => {
+        if (!list.length) return;
+        const batch = writeBatch(db);
+        list.forEach((s) => {
+          let ts;
+          if (fromScroll) {
+            scrollCounterRef.current += 1;
+            ts = Timestamp.fromMillis(SCROLL_TIMESTAMP_BASE - scrollCounterRef.current);
+          } else {
+            ts = serverTimestamp();
+          }
+          batch.set(doc(collection(db, `artifacts/${appId}/users/${userId}/feed`)), {
+            type: 'personalSuggestion',
+            data: s,
+            timestamp: ts,
+          });
+        });
+        await batch.commit();
+      };
+
+      // --- Pool fast-path: serve the community cache instantly. -------------
+      // Anything this area already discovered (and this user hasn't seen)
+      // appears in the feed immediately; the metered AI search below only
+      // runs when the pool can't fill the request. Sorted so events matching
+      // the user's interests come first.
+      const geoLabel = locPref === 'current' && current ? current : home;
+      const geo = poolGeoBucket(geoLabel);
+      const seenKeys = new Set(feedItems.map((i) => normalizeTitle(i.data?.title)).filter(Boolean));
+      const prefTypes = new Set((userProfile?.preferences || []).map((p) => normalizeType(p)));
+      const poolPicks = (
+        await fetchPoolEvents({ geo, forToday, excludeTitleKeys: seenKeys, max: 6 })
+      ).sort((a, b) => (prefTypes.has(b.type) ? 1 : 0) - (prefTypes.has(a.type) ? 1 : 0));
+      if (poolPicks.length) {
+        await persistSuggestions(poolPicks);
+        poolPicks.forEach((p) => seenKeys.add(normalizeTitle(p.title)));
+      }
+      if (poolPicks.length >= 4) {
+        // Pool alone filled the request — done, no AI spend. A later press
+        // (or scroll) digs deeper since these are now excluded as seen.
+        setIsGenerating(false);
+        return;
+      }
       // Location context — incorporates the current scope tier so the
       // radius expands as the user scrolls for more.
       let locationBlock;
@@ -2671,11 +2911,20 @@ HARD RULE: of 5 returned events, at least 2 MUST be tagged locationSource="home"
       const seenTitles = [...new Set(feedItems.map((i) => i.data?.title).filter(Boolean))];
       const seenList = seenTitles.slice(0, 100).join(' | ');
 
+      // Taste signals from the save/dismiss feedback loop.
+      const taste = userProfile?.tasteSignals || {};
+      const savedTitles = (taste.savedTitles || []).slice(-8);
+      const dismissedTypes = topTasteTypes(taste.dismissedTypes);
+      const savedTypes = topTasteTypes(taste.savedTypes);
+
       const prompt = `Today is ${today}. Find 5 hyper-local, PERSONALLY-TAILORED things for ONE person to do, ${timeframePrompt}
 
 WHO THIS IS FOR — tailor every single pick to THIS person:
 - Interests: ${prefs}
 ${detailLines ? `- Specific tastes:\n${detailLines}` : ''}
+${savedTitles.length ? `- They SAVED these recently (strong positive signal — find more in this spirit): ${savedTitles.join(' | ')}` : ''}
+${savedTypes.length ? `- Categories they save most: ${savedTypes.join(', ')} — over-weight these.` : ''}
+${dismissedTypes.length ? `- Categories they keep DISMISSING: ${dismissedTypes.join(', ')} — avoid unless a pick is a spectacular, specific fit.` : ''}
 ${groupInterests.length ? `- Their friend groups enjoy together: ${groupInterests.join(', ')} — make 1 pick a great fit for these shared interests.` : ''}
 - Family: ${kidsText}
 ${budgetLine ? `- Budget: ${budgetLine}. Respect this — set each pick's priceTier accordingly and skip options that clearly exceed it.` : ''}
@@ -2754,10 +3003,9 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
       // Run both sources in parallel and merge + de-dupe by normalized title.
       const [aEvents, bEvents] = await Promise.all([aiSearch, partnerSearch]);
       let suggestions = mergeEvents(aEvents, bEvents);
-      // Hard de-dupe against what's ALREADY in the feed (both tabs) — never trust
-      // the AI to fully obey the "already shown" list. This is what stops the
-      // same event reappearing across presses.
-      const seenKeys = new Set(feedItems.map((i) => normalizeTitle(i.data?.title)).filter(Boolean));
+      // Hard de-dupe against what's ALREADY in the feed (both tabs) plus the
+      // pool picks just written — never trust the AI to fully obey the
+      // "already shown" list. This is what stops the same event reappearing.
       suggestions = suggestions.filter((s) => !seenKeys.has(normalizeTitle(s.title)));
 
       // Verify AI food/drink picks against Google Places (real & within radius):
@@ -2789,31 +3037,16 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
       }
 
       if (!suggestions.length) {
+        // Pool picks already landed → this run still succeeded quietly.
+        if (poolPicks.length) return;
         throw new Error(
           aiError ? `AI search failed — ${aiError.message}` : 'No new ideas right now — try again later or widen your interests.'
         );
       }
-      const batch = writeBatch(db);
-      suggestions.forEach((s) => {
-        // Refresh writes use serverTimestamp() (real now) so they sort at
-        // the top. Scroll writes use a deeply-past timestamp that
-        // monotonically decreases per item so each new scroll batch lands
-        // below the previous scroll batch (which is below the refreshed
-        // items).
-        let ts;
-        if (fromScroll) {
-          scrollCounterRef.current += 1;
-          ts = Timestamp.fromMillis(SCROLL_TIMESTAMP_BASE - scrollCounterRef.current);
-        } else {
-          ts = serverTimestamp();
-        }
-        batch.set(doc(collection(db, `artifacts/${appId}/users/${userId}/feed`)), {
-          type: 'personalSuggestion',
-          data: s,
-          timestamp: ts,
-        });
-      });
-      await batch.commit();
+      await persistSuggestions(suggestions);
+      // Contribute the fresh discoveries to the community pool so the next
+      // person in this area gets them instantly (fire-and-forget).
+      writeEventsToPool(suggestions, geo);
     } catch (e) {
       console.error(e);
       showGlobalMessage(e?.message || 'Could not fetch real events. Try again.', 'error');
@@ -2835,8 +3068,54 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
     }
   };
 
+  // --- Cold start & freshness -------------------------------------------
+  // A new user should never stare at an empty feed, and a returning user
+  // shouldn't see week-old ideas: once the first snapshot lands, if there
+  // are no event suggestions (or the newest is >24h old) kick off a fetch
+  // automatically. The pool fast-path makes this near-instant and usually
+  // free. One run per session; the button/pull always work on top.
+  useEffect(() => {
+    if (!userId || !userProfile || !feedLoaded || autoRunRef.current) return;
+    if (isGenerating !== false || generatingRef.current) return;
+    const events = feedItems.filter((i) => i.type === 'personalSuggestion');
+    const newestMs = events.reduce((m, i) => {
+      const t = i.timestamp?.toMillis ? i.timestamp.toMillis() : 0;
+      // Ignore synthetic infinite-scroll timestamps (see SCROLL_TIMESTAMP_BASE).
+      return t > SCROLL_TIMESTAMP_BASE + 864e5 && t > m ? t : m;
+    }, 0);
+    const isStale = events.length > 0 && newestMs > 0 && Date.now() - newestMs > 24 * 3600e3;
+    if (events.length === 0 || isStale) {
+      autoRunRef.current = true;
+      generateForActiveTab();
+    }
+  }, [userId, userProfile, feedLoaded, feedItems, isGenerating]);
+
+  // --- Pull-to-refresh (touch) --------------------------------------------
+  const onPullStart = (e) => {
+    if (window.scrollY <= 0) pullRef.current = { startY: e.touches[0].clientY, active: true };
+  };
+  const onPullMove = (e) => {
+    if (!pullRef.current.active) return;
+    const dy = e.touches[0].clientY - pullRef.current.startY;
+    if (dy > 0 && window.scrollY <= 0) setPull(Math.min(90, dy * 0.4));
+    else setPull(0);
+  };
+  const onPullEnd = () => {
+    if (pull > 55 && isGenerating === false) generateForActiveTab();
+    pullRef.current.active = false;
+    setPull(0);
+  };
+
   return (
-    <div className="space-y-6">
+    <div className="space-y-6" onTouchStart={onPullStart} onTouchMove={onPullMove} onTouchEnd={onPullEnd}>
+      {pull > 0 && (
+        <div style={{ height: pull }} className="flex items-end justify-center overflow-hidden -mb-4">
+          <div
+            className={`w-6 h-6 border-2 border-brand-600 border-t-transparent rounded-full transition-transform ${pull > 55 ? 'animate-spin' : ''}`}
+            style={{ transform: `rotate(${pull * 3}deg)` }}
+          />
+        </div>
+      )}
       {needsOnboarding && (
         <div className="bg-brand-50 border border-brand-100 rounded-2xl p-5">
           <h3 className="font-bold text-[17px] text-ink">Welcome to Hangouts 👋</h3>
@@ -2858,13 +3137,50 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
             <p className="text-xs text-brand-600 mt-0.5 animate-pulse">{PATIENCE_MESSAGES[patienceIdx]}</p>
           )}
         </div>
-        <button onClick={generateForActiveTab} disabled={isGenerating !== false} className="flex items-center gap-2 px-4 h-10 bg-brand-600 text-white rounded-xl hover:bg-brand-700 transition disabled:opacity-50 font-semibold text-sm whitespace-nowrap">
-          {isGenerating !== false ? <SearchIcon className="w-4 h-4 animate-spin" /> : <SparklesIcon className="w-4 h-4" />}
-          {isGenerating !== false ? 'Finding…' : feedTab === 'today' ? "Today's ideas" : 'New ideas'}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowSaved((v) => !v)}
+            className={`relative w-10 h-10 flex items-center justify-center rounded-xl border transition ${
+              showSaved ? 'bg-red-50 border-red-200 text-red-500' : 'bg-white border-line text-ink-faint hover:text-ink-soft'
+            }`}
+            title="Saved events"
+            aria-label="Saved events"
+          >
+            <HeartIcon className="w-5 h-5" />
+            {savedItems.length > 0 && (
+              <span className="absolute -top-1.5 -right-1.5 min-w-4 h-4 px-1 bg-red-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center">
+                {savedItems.length > 9 ? '9+' : savedItems.length}
+              </span>
+            )}
+          </button>
+          <button onClick={generateForActiveTab} disabled={isGenerating !== false} className="flex items-center gap-2 px-4 h-10 bg-brand-600 text-white rounded-xl hover:bg-brand-700 transition disabled:opacity-50 font-semibold text-sm whitespace-nowrap">
+            {isGenerating !== false ? <SearchIcon className="w-4 h-4 animate-spin" /> : <SparklesIcon className="w-4 h-4" />}
+            {isGenerating !== false ? 'Finding…' : feedTab === 'today' ? "Today's ideas" : 'New ideas'}
+          </button>
+        </div>
       </div>
 
-      {feedItems.length === 0 ? (
+      {showSaved ? (
+        <div className="space-y-4">
+          {savedItems.length === 0 ? (
+            <div className="text-center py-16 bg-white rounded-2xl border border-line">
+              <HeartIcon className="w-10 h-10 mx-auto text-ink-faint mb-3" />
+              <h3 className="text-[17px] font-bold text-ink">Nothing saved yet</h3>
+              <p className="text-sm text-ink-soft max-w-sm mx-auto mt-2 px-6">Tap the ♥ on any event to keep it here.</p>
+            </div>
+          ) : (
+            savedItems.map((it) => (
+              <FeedCard
+                key={it.id}
+                item={it}
+                saved
+                onToggleSave={() => toggleSave(it.data)}
+                onDelete={() => toggleSave(it.data)}
+              />
+            ))
+          )}
+        </div>
+      ) : feedItems.length === 0 ? (
         <div className="text-center py-16 bg-white rounded-2xl border border-line">
           <SparklesIcon className="w-10 h-10 mx-auto text-ink-faint mb-3" />
           <h3 className="text-[17px] font-bold text-ink">Your feed is empty</h3>
@@ -2926,7 +3242,12 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
             displayItems.map((item, i) => (
               <React.Fragment key={item.id}>
                 {sponsored && i === sponsoredSlot && <SponsoredCard item={sponsored} onClick={sponsoredClick} />}
-                <FeedCard item={item} onDelete={() => deleteFeedItem(item.id)} />
+                <FeedCard
+                  item={item}
+                  onDelete={() => deleteFeedItem(item)}
+                  saved={savedKeySet.has(normalizeTitle(item.data?.title))}
+                  onToggleSave={() => toggleSave(item.data)}
+                />
               </React.Fragment>
             ))
           )}
@@ -3075,7 +3396,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
   );
 };
 
-const FeedCard = ({ item, onDelete }) => {
+const FeedCard = ({ item, onDelete, saved = false, onToggleSave }) => {
   const { googleAccessToken, setGoogleAccessToken, showGlobalMessage, userProfile } = useContext(AppContext);
   const { data, type } = item;
   const isInvite = type === 'groupProposal';
@@ -3194,6 +3515,18 @@ const FeedCard = ({ item, onDelete }) => {
         )}
 
         <div className="mt-4 flex gap-2 items-stretch">
+          {onToggleSave && (
+            <button
+              onClick={onToggleSave}
+              className={`w-11 flex items-center justify-center rounded-xl transition ${
+                saved ? 'text-red-500 bg-red-50 hover:bg-red-100' : 'text-ink-soft bg-gray-100 hover:bg-gray-200'
+              }`}
+              title={saved ? 'Remove from saved' : 'Save'}
+              aria-label={saved ? 'Remove from saved' : 'Save'}
+            >
+              <HeartIcon className="w-5 h-5" />
+            </button>
+          )}
           {ticket ? (
             <a
               href={ticket.href}
@@ -3899,6 +4232,25 @@ const ChatRoom = ({ groupId }) => {
   );
 };
 
+// Explore timeframe chips: value → { label, matches(dayString YYYY-MM-DD) }.
+const EXPLORE_WHEN = [
+  { id: 'today', label: 'Today' },
+  { id: 'week', label: 'This week' },
+  { id: 'weekend', label: 'Weekend' },
+];
+const exploreDayMatches = (whenId, day) => {
+  if (!day) return false;
+  const today = new Date().toISOString().slice(0, 10);
+  if (whenId === 'today') return day === today;
+  const horizon = new Date(Date.now() + 7 * 864e5).toISOString().slice(0, 10);
+  if (whenId === 'week') return day >= today && day <= horizon;
+  // weekend: next Sat/Sun within 14 days
+  const d = new Date(`${day}T12:00`);
+  const dow = d.getDay();
+  const far = new Date(Date.now() + 14 * 864e5).toISOString().slice(0, 10);
+  return (dow === 0 || dow === 6) && day >= today && day <= far;
+};
+
 const SuggestionSection = () => {
   const { userId, userProfile, showGlobalMessage, googleAccessToken } = useContext(AppContext);
   const [groups, setGroups] = useState([]);
@@ -3907,6 +4259,13 @@ const SuggestionSection = () => {
   const [ideas, setIdeas] = useState([]);
   const [memberSummary, setMemberSummary] = useState(null);
   const [generateError, setGenerateError] = useState('');
+  // Solo explore state — works with zero groups.
+  const [exploreType, setExploreType] = useState('all');
+  const [exploreWhen, setExploreWhen] = useState('week');
+  const [exploreResults, setExploreResults] = useState([]);
+  const [exploring, setExploring] = useState(false);
+  const [exploreError, setExploreError] = useState('');
+  const exploreRanRef = useRef(false);
 
   const groupIdsKey = userProfile?.groupIds?.join(',') || '';
 
@@ -3956,8 +4315,8 @@ const SuggestionSection = () => {
   }, [selectedId, groups]);
 
   const generate = async () => {
-    if (!geminiApiKey) {
-      showGlobalMessage('Gemini API key missing. Set VITE_GEMINI_API_KEY in your environment.', 'error');
+    if (!hasSharedGemini) {
+      showGlobalMessage('AI is not configured for this deployment.', 'error');
       return;
     }
     setGenerating(true);
@@ -4130,6 +4489,99 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
     }
   };
 
+  // --- Solo explore: browse by category + timeframe, no group needed. ------
+  // Pool-first (instant, free); tops up with a category-targeted grounded
+  // search + partner APIs only when the pool is thin. Results feed back into
+  // the pool so browsing enriches the cache for everyone.
+  const runExplore = async (typeSel = exploreType, whenSel = exploreWhen) => {
+    setExploring(true);
+    setExploreError('');
+    try {
+      const locPref = userProfile?.locationPreference || 'home';
+      const current = userProfile?.currentLocation?.label || '';
+      const home = userProfile?.address || 'New York, NY';
+      const locLabel = locPref === 'current' && current ? current : home;
+      const geo = poolGeoBucket(locLabel);
+      const typeOk = (e) => typeSel === 'all' || (e.type || 'Other') === typeSel;
+      const whenOk = (e) => exploreDayMatches(whenSel, String(e.date || '').slice(0, 10));
+
+      // 1) Pool.
+      const pool = await fetchPoolEvents({ geo, forToday: whenSel === 'today', max: 40 });
+      let results = pool.filter((e) => typeOk(e) && whenOk(e));
+
+      // 2) Top up with a targeted search when thin.
+      if (results.length < 4) {
+        const provider = userProfile?.aiProvider || 'gemini';
+        const catLine = typeSel === 'all' ? 'any fun local category' : `the category "${typeSel}"`;
+        const whenLine =
+          whenSel === 'today'
+            ? `happening strictly TODAY (${new Date().toDateString()})`
+            : whenSel === 'weekend'
+              ? 'happening on the upcoming Saturday or Sunday'
+              : 'happening in the next 7 days';
+        const prompt = `Today is ${new Date().toDateString()}. Search the web for 6 REAL local events in ${catLine}, ${whenLine}, near ${locLabel} (within ~10 miles). Real and verifiable only — no invented events; prefer distinctive local picks over generic listings.
+Return ONLY a JSON array (no prose, no fences) of objects with keys: title, description, location, date (YYYY-MM-DD HH:MM), url (official page or null — never guess), imageUrl (real public image URL or null), imageKeywords (3-6 visual words), type (EXACTLY ONE of: ${EVENT_TYPES.join(', ')}), priceTier ("Free","$","$$","$$$","$$$$" or null), isTicketed (true/false), ticketsUrl (exact purchase page you saw, else null).`;
+
+        const aiSearch = (async () => {
+          if (provider === 'gemini' && !(await reserveGroundedSearch())) return [];
+          try {
+            const text = await callAI({ prompt, useWebSearch: true, provider });
+            return (extractJsonArray(text) || []).map((e) => ({ ...e, source: e.source || 'ai', type: normalizeType(e.type || e.category) }));
+          } catch (err) {
+            console.warn('Explore AI search failed:', err);
+            return [];
+          }
+        })();
+        const partnerSearch = fetchRealEvents({
+          location: locLabel,
+          startDate: ymdLocal(new Date()),
+          endDate: ymdLocal(new Date(Date.now() + (whenSel === 'today' ? 1 : 14) * 864e5)),
+          radius: 10,
+          keywords: typeSel === 'all' ? '' : typeSel,
+          size: 12,
+          borough: nycBorough(locLabel),
+        });
+        const [a, b] = await Promise.all([aiSearch, partnerSearch]);
+        const fresh = mergeEvents(a, b).filter((e) => typeOk(e) && whenOk(e));
+        writeEventsToPool(fresh, geo);
+        results = mergeEvents(results, fresh);
+      }
+
+      results.sort((a, b) => String(a.date || '').localeCompare(String(b.date || '')));
+      setExploreResults(results.slice(0, 12));
+      if (!results.length) setExploreError('Nothing found for that combo — try a different day or category.');
+    } catch (e) {
+      console.error('Explore failed:', e);
+      setExploreError(e?.message || 'Could not load events.');
+    } finally {
+      setExploring(false);
+    }
+  };
+
+  // First visit to Explore: load the default browse (pool-first, usually
+  // instant) so the tab is never an empty dead end.
+  useEffect(() => {
+    if (!userProfile || exploreRanRef.current) return;
+    exploreRanRef.current = true;
+    runExplore();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userProfile]);
+
+  // Solo "propose" → drop the idea into your own feed.
+  const addExploreToFeed = async (idea) => {
+    try {
+      await addDoc(collection(db, `artifacts/${appId}/users/${userId}/feed`), {
+        type: 'personalSuggestion',
+        data: idea,
+        timestamp: serverTimestamp(),
+      });
+      showGlobalMessage('Added to your feed!');
+    } catch (e) {
+      console.error(e);
+      showGlobalMessage('Could not add to feed.', 'error');
+    }
+  };
+
   const handleProposeSuggestion = async (suggestion) => {
     try {
       const group = groups.find((g) => g.id === selectedId);
@@ -4171,24 +4623,96 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
     }
   };
 
+  const whenChip = (w) => (
+    <button
+      key={w.id}
+      onClick={() => { setExploreWhen(w.id); runExplore(exploreType, w.id); }}
+      className={`px-4 h-9 rounded-full text-sm font-semibold whitespace-nowrap transition ${
+        exploreWhen === w.id ? 'bg-ink text-white' : 'bg-white border border-line text-ink-soft hover:text-ink'
+      }`}
+    >
+      {w.label}
+    </button>
+  );
+  const typeChip = (t) => (
+    <button
+      key={t}
+      onClick={() => { setExploreType(t); runExplore(t, exploreWhen); }}
+      className={`px-3.5 h-8 rounded-full text-[13px] font-semibold whitespace-nowrap transition ${
+        exploreType === t ? 'bg-brand-600 text-white' : 'bg-white border border-line text-ink-soft hover:text-ink'
+      }`}
+    >
+      {t === 'all' ? 'Everything' : t}
+    </button>
+  );
+
   return (
     <div>
-      <div className="flex flex-col md:flex-row gap-4 mb-4 bg-indigo-50 p-6 rounded-2xl items-end">
-        <div className="flex-1 w-full">
-          <label className="block text-sm font-bold text-indigo-900 mb-2">Select a Group</label>
-          <select value={selectedId} onChange={(e) => setSelectedId(e.target.value)} className="w-full p-3 rounded-xl border-indigo-200 focus:ring-indigo-500 bg-white">
-            <option value="">Choose a group...</option>
+      {/* --- Solo explore: browse what's on, no group required. ----------- */}
+      <div className="flex justify-between items-center mb-3">
+        <h2 className="text-lg font-bold text-ink tracking-tight">What's on</h2>
+        <button
+          onClick={() => runExplore()}
+          disabled={exploring}
+          className="text-sm font-semibold text-brand-600 hover:text-brand-700 disabled:opacity-50 transition"
+        >
+          {exploring ? 'Searching…' : 'Refresh'}
+        </button>
+      </div>
+      <div className="flex gap-2 mb-2">{EXPLORE_WHEN.map(whenChip)}</div>
+      <div className="flex gap-2 overflow-x-auto pb-2 -mx-4 px-4 [-webkit-overflow-scrolling:touch]">
+        {['all', ...EVENT_TYPES.filter((t) => t !== 'Other')].map(typeChip)}
+      </div>
+
+      {exploring && !exploreResults.length ? (
+        <div className="space-y-4 mt-3">
+          {[0, 1].map((i) => (
+            <div key={i} className="rounded-2xl overflow-hidden border border-line">
+              <div className="w-full aspect-[16/10] animate-shimmer" />
+              <div className="p-4 space-y-2">
+                <div className="h-3.5 w-2/3 rounded animate-shimmer" />
+                <div className="h-3 w-full rounded animate-shimmer" />
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : exploreError && !exploreResults.length ? (
+        <div className="mt-3 text-center py-10 bg-white rounded-2xl border border-line">
+          <p className="text-sm text-ink-soft px-6">{exploreError}</p>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 gap-4 mt-3">
+          {exploreResults.map((idea, i) => (
+            <SuggestionCard
+              key={`${idea.title}-${i}`}
+              idea={idea}
+              onPropose={addExploreToFeed}
+              proposeLabel="Add to feed"
+              googleAccessToken={googleAccessToken}
+              showGlobalMessage={showGlobalMessage}
+            />
+          ))}
+        </div>
+      )}
+
+      {/* --- Group mode: find something for a whole crew. ------------------ */}
+      <div className="mt-8 pt-6 border-t border-line">
+        <h2 className="text-lg font-bold text-ink tracking-tight mb-1">Planning with a group?</h2>
+        <p className="text-sm text-ink-soft mb-4">Pick a group and we'll match everyone's interests and free time.</p>
+        <div className="flex flex-col gap-3 mb-4">
+          <select value={selectedId} onChange={(e) => setSelectedId(e.target.value)} className="w-full h-12 px-3 rounded-xl border border-line focus:outline-none focus:ring-2 focus:ring-brand-600/30 bg-white text-[15px]">
+            <option value="">{groups.length ? 'Choose a group…' : 'No groups yet — create one in Groups'}</option>
             {groups.map((g) => (
               <option key={g.id} value={g.id}>
                 {g.name}
               </option>
             ))}
           </select>
+          <button onClick={generate} disabled={!selectedId || generating} className="w-full h-12 bg-brand-600 text-white rounded-xl font-semibold hover:bg-brand-700 transition disabled:opacity-40 flex items-center justify-center gap-2">
+            {generating ? <SearchIcon className="w-5 h-5 animate-spin" /> : <SparklesIcon className="w-5 h-5" />}
+            {generating ? 'Searching web…' : 'Find events for this group'}
+          </button>
         </div>
-        <button onClick={generate} disabled={!selectedId || generating} className="w-full md:w-auto bg-indigo-600 text-white px-8 py-3 rounded-xl font-bold shadow-lg hover:shadow-xl transition disabled:opacity-50 flex items-center justify-center gap-2">
-          {generating ? <SearchIcon className="w-5 h-5 animate-spin" /> : <SparklesIcon className="w-5 h-5" />}
-          {generating ? 'Searching web...' : 'Find Real Events'}
-        </button>
       </div>
 
       {generateError && (

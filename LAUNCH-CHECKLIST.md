@@ -1,5 +1,21 @@
 # Launch checklist — sign-in & mobile release
 
+## 0. Engine upgrades (added with the discovery-engine build)
+- [ ] **Publish the updated `firestore.rules`** (Firebase Console → Firestore →
+      Rules → paste + Publish). Adds the `eventPool` block — until published,
+      the shared event cache silently no-ops (app still works, just slower
+      and AI-only).
+- [ ] **AI key proxy:** in Vercel set **`GEMINI_API_KEY`** (server-side) and
+      **remove `VITE_GEMINI_API_KEY`** — the client then routes shared-key AI
+      calls through `/api/ai` (Firebase-token-authed, per-user daily caps),
+      so nobody can scrape the key from the bundle. Requires
+      `FIREBASE_SERVICE_ACCOUNT` (already needed by the Stripe webhook).
+      Keep `VITE_GEMINI_API_KEY` only in local `.env.local` for dev.
+- [ ] **Confirm partner event keys** in Vercel: `TICKETMASTER_API_KEY`,
+      `SEATGEEK_CLIENT_ID` (+ `GOOGLE_PLACES_API_KEY` for venue verification).
+      Without them the whole partner lane (real ticket links, real event
+      images, ticket resolution) is silently off and the feed is AI-only.
+
 Code-side work (branch `mobile-redesign`) removed the Calendar scope from the
 login popup, so **basic Google sign-in shows no "unverified app" warning as
 soon as this deploys** — no console work needed for that. The items below

@@ -511,6 +511,72 @@ export default async function handler(req, res) {
     return;
   }
 
+  // Meta mode: fetch a page's og:image and confirm the URL is alive, so the
+  // client can upgrade AI-event cards with the event's real photo. Public
+  // http(s) pages only; small read window + timeout; edge-cached. Returns
+  // { alive, image } and never throws.
+  if ((q.kind || '').toString() === 'meta') {
+    const target = (q.url || '').toString().slice(0, 2000);
+    let parsed;
+    try {
+      parsed = new URL(target);
+    } catch {
+      res.status(200).json({ alive: false, image: null });
+      return;
+    }
+    const host = parsed.hostname;
+    // Only public http(s) hosts — no localhost/intranet probing via the proxy.
+    const isPrivateHost =
+      !/^https?:$/.test(parsed.protocol) ||
+      !host.includes('.') ||
+      /^(localhost|127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(host) ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(host);
+    if (isPrivateHost) {
+      res.status(200).json({ alive: false, image: null });
+      return;
+    }
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 5000);
+      const page = await fetch(parsed.href, {
+        signal: ctrl.signal,
+        redirect: 'follow',
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; hangouts-app/1.0; +event preview)', Accept: 'text/html' },
+      });
+      clearTimeout(timer);
+      if (!page.ok) {
+        res.status(200).json({ alive: false, image: null });
+        return;
+      }
+      // Read only the head-ish part of the document — og tags live early.
+      const reader = page.body?.getReader?.();
+      let html = '';
+      if (reader) {
+        const decoder = new TextDecoder();
+        while (html.length < 60000) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          html += decoder.decode(value, { stream: true });
+        }
+        reader.cancel().catch(() => {});
+      } else {
+        html = (await page.text()).slice(0, 60000);
+      }
+      const m =
+        html.match(/<meta[^>]+property=["']og:image(?::secure_url)?["'][^>]+content=["']([^"']+)["']/i) ||
+        html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image(?::secure_url)?["']/i) ||
+        html.match(/<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i);
+      let image = m ? m[1] : null;
+      if (image && image.startsWith('/')) image = `${parsed.origin}${image}`;
+      if (image && !/^https?:\/\//.test(image)) image = null;
+      res.setHeader('Cache-Control', 's-maxage=86400, stale-while-revalidate=604800');
+      res.status(200).json({ alive: true, image });
+    } catch {
+      res.status(200).json({ alive: false, image: null });
+    }
+    return;
+  }
+
   // Ticket-link mode: resolve an AI event's real purchase URL via the ticketing
   // APIs. Returns { url, source } on a confident match, else { url: null } so the
   // client uses its web-search fallback. Never throws.

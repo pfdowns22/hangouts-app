@@ -47,6 +47,19 @@ service cloud.firestore {
       allow read, write: if request.auth != null;
     }
 
+    // Shared event pool: a community cache of discovered events (no personal
+    // data) so feeds hydrate instantly and the AI budget is spent once per
+    // area rather than once per user. Signed-in users read and contribute;
+    // no client deletes. Docs are content-addressed (geo|title|day), so
+    // writes are idempotent merges with basic shape checks.
+    match /artifacts/{appId}/public/data/eventPool/{eventId} {
+      allow read: if request.auth != null;
+      allow create, update: if request.auth != null
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() < 300;
+    }
+
     // Sponsored placements: any signed-in user can read; content is authored by
     // the owner via the Firebase Console (no client create/delete). Clients may
     // only increment the aggregate impressions/clicks counters.
