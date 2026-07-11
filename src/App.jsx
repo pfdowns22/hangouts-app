@@ -4,6 +4,8 @@ import {
   onAuthStateChanged,
   GoogleAuthProvider,
   signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
   OAuthProvider,
   signOut,
   createUserWithEmailAndPassword,
@@ -5321,16 +5323,28 @@ const AuthScreen = () => {
   // later via ensureGoogleCalendarAccess.
   const handleGoogleSignIn = async () => {
     setError('');
+    const provider = new GoogleAuthProvider();
     try {
-      const provider = new GoogleAuthProvider();
       const result = await signInWithPopup(auth, provider);
       const credential = GoogleAuthProvider.credentialFromResult(result);
       if (credential?.accessToken) setGoogleAccessToken(credential.accessToken);
     } catch (err) {
-      if (err?.code !== 'auth/popup-closed-by-user') {
+      // User closed the popup themselves — not an error, stay quiet.
+      if (err?.code === 'auth/popup-closed-by-user' || err?.code === 'auth/cancelled-popup-request') return;
+      // Mobile browsers and embedded webviews often block popups outright —
+      // fall back to a full-page redirect (completed by getRedirectResult on
+      // return). Only surface an error if even that can't start.
+      if (err?.code === 'auth/popup-blocked' || err?.code === 'auth/operation-not-supported-in-this-environment') {
+        try {
+          await signInWithRedirect(auth, provider);
+          return;
+        } catch (redirectErr) {
+          console.error('Google redirect sign-in failed:', redirectErr);
+        }
+      } else {
         console.error('Google sign-in failed:', err);
-        setError('Google sign-in didn’t go through. Please try again.');
       }
+      setError('Google sign-in didn’t go through. Please try again.');
     }
   };
 
@@ -7074,6 +7088,18 @@ export default function App() {
       window.history.replaceState({}, '', newUrl);
     }
   }, []);
+
+  // Complete a redirect-based Google sign-in (the popup-blocked fallback).
+  // onAuthStateChanged picks up the session either way; this call drains the
+  // pending redirect and surfaces any error instead of failing silently.
+  useEffect(() => {
+    getRedirectResult(auth).catch((err) => {
+      if (err?.code && err.code !== 'auth/no-auth-event') {
+        console.error('Redirect sign-in failed:', err);
+        showGlobalMessage('Sign-in didn’t complete — please try again.', 'error');
+      }
+    });
+  }, [showGlobalMessage]);
 
   // Complete an email magic-link sign-in if the app was opened from one.
   // The email was stashed in localStorage when the link was requested; if
