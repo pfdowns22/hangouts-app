@@ -2072,7 +2072,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with shape:
         )}
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+      <div className="grid grid-cols-1 gap-8">
         <div>
           <div className="flex items-center justify-between mb-3">
             <h3 className="font-bold text-gray-800 flex items-center gap-2">
@@ -3637,7 +3637,7 @@ const GroupSection = () => {
           <PlusIcon /> New Group
         </button>
       </div>
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 gap-4">
         {groups.length === 0 ? (
           <p className="text-gray-500">No groups yet.</p>
         ) : (
@@ -3843,13 +3843,13 @@ const GroupDetailView = ({ group, onBack }) => {
   };
 
   return (
-    <div className="flex flex-col h-[70vh]">
-      <div className="flex items-center justify-between mb-4 pb-4 border-b">
-        <button onClick={onBack} className="text-gray-500 hover:text-indigo-600 font-medium flex items-center gap-1">
-          <Icon path="M15 19l-7-7 7-7" /> Back
+    <div className="flex flex-col h-[calc(100dvh-11rem)] min-h-[24rem]">
+      <div className="flex items-center justify-between mb-2 pb-3 border-b border-line">
+        <button onClick={onBack} className="text-ink-soft hover:text-ink font-medium flex items-center gap-1 text-sm">
+          <Icon path="M15 19l-7-7 7-7" className="w-5 h-5" /> Back
         </button>
-        <h2 className="text-xl font-bold">{group.name}</h2>
-        <div className="flex items-center gap-1">
+        <h2 className="text-[17px] font-bold text-ink truncate px-2">{group.name}</h2>
+        <div className="flex items-center gap-0.5">
           <button
             onClick={() => setShowChatIdeas(true)}
             className="text-amber-500 hover:text-amber-700 p-2 rounded-full hover:bg-amber-50 flex items-center gap-1"
@@ -3859,7 +3859,7 @@ const GroupDetailView = ({ group, onBack }) => {
           </button>
           <button
             onClick={() => setShowInvite(true)}
-            className="text-indigo-500 hover:text-indigo-700 p-2 rounded-full hover:bg-indigo-50 flex items-center gap-1"
+            className="text-brand-600 hover:text-brand-700 p-2 rounded-full hover:bg-brand-50 flex items-center gap-1"
             title="Invite people"
           >
             <InviteIcon className="w-5 h-5" />
@@ -3869,10 +3869,16 @@ const GroupDetailView = ({ group, onBack }) => {
           </button>
         </div>
       </div>
+      {/* Compact member strip — replaces the old md:w-64 sidebar, which
+          squeezed the chat to ~160px inside the phone-width canvas. */}
+      <p className="text-xs text-ink-faint mb-2 truncate">
+        <span className="font-semibold text-ink-soft">{members.length} member{members.length === 1 ? '' : 's'}:</span>{' '}
+        {members.join(' · ')}
+      </p>
       {showInvite && <InviteModal group={group} onClose={() => setShowInvite(false)} />}
       {showChatIdeas && <ChatIdeasModal group={group} onClose={() => setShowChatIdeas(false)} />}
-      <div className="flex-1 overflow-hidden flex flex-col md:flex-row gap-4">
-        <div className="flex-1 flex flex-col min-h-0 bg-white rounded-2xl border shadow-sm overflow-hidden">
+      <div className="flex-1 overflow-hidden flex flex-col">
+        <div className="flex-1 flex flex-col min-h-0 bg-white rounded-2xl border border-line overflow-hidden">
           <div className="flex border-b border-gray-100 px-2">
             <button
               onClick={() => setGroupTab('proposals')}
@@ -3896,19 +3902,6 @@ const GroupDetailView = ({ group, onBack }) => {
           ) : (
             <ChatRoom groupId={group.id} />
           )}
-        </div>
-        <div className="w-full md:w-64 space-y-4 overflow-y-auto">
-          <div className="bg-gray-50 p-4 rounded-xl">
-            <h4 className="font-bold text-gray-700 mb-2 text-sm uppercase">Members</h4>
-            <div className="space-y-2">
-              {members.map((m, i) => (
-                <div key={i} className="flex items-center gap-2 text-sm text-gray-600">
-                  <div className="w-2 h-2 rounded-full bg-green-400"></div>
-                  {m}
-                </div>
-              ))}
-            </div>
-          </div>
         </div>
       </div>
     </div>
@@ -4742,7 +4735,7 @@ Return ONLY a JSON array (no prose, no fences) of objects with keys: title, desc
           </p>
         </div>
       )}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+      <div className="grid grid-cols-1 gap-4">
         {ideas.map((idea, i) => (
           <SuggestionCard key={i} idea={idea} onPropose={handleProposeSuggestion} googleAccessToken={googleAccessToken} showGlobalMessage={showGlobalMessage} />
         ))}
@@ -5081,8 +5074,8 @@ const PlanChat = ({ plan, groupName, onBack }) => {
   const onPropose = (idea) => { if (plan.scope === 'group') proposeToGroup(idea); else setSendEvent(idea); };
 
   return (
-    <div className="flex flex-col h-[70vh] -m-4 md:-m-6">
-      <header className="flex items-center gap-3 p-4 border-b border-gray-100 bg-white/70">
+    <div className="flex flex-col h-[calc(100dvh-11rem)] min-h-[24rem] bg-white rounded-2xl border border-line overflow-hidden">
+      <header className="flex items-center gap-3 p-4 border-b border-line bg-white">
         <button onClick={onBack} className="p-2 rounded-full hover:bg-gray-100 text-gray-500" title="Back to plans" aria-label="Back to plans">
           <Icon path="M15 19l-7-7 7-7" className="w-5 h-5" />
         </button>
@@ -5105,13 +5098,15 @@ const PlanChat = ({ plan, groupName, onBack }) => {
           const sugg = Array.isArray(m.suggestions) ? m.suggestions : [];
           return (
             <div key={m.id} className={`flex ${isMine ? 'justify-end' : 'justify-start'}`}>
-              <div className={sugg.length ? 'max-w-[92%] w-full' : 'max-w-[85%]'}>
+              <div className={sugg.length ? 'w-full' : 'max-w-[85%]'}>
                 <div className={`px-4 py-2 rounded-2xl text-sm ${isMine ? 'bg-indigo-600 text-white rounded-br-none' : 'bg-white text-gray-800 shadow-sm border border-gray-100 rounded-bl-none'}`}>
                   {!isMine && <p className="text-xs font-bold text-gray-400 mb-1">{isAssistant ? '✨ Planner' : m.senderName || 'Member'}</p>}
                   {m.text && <span className="whitespace-pre-wrap">{m.text}</span>}
                 </div>
                 {sugg.length > 0 && (
-                  <div className="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  // Always one column: the app canvas is phone-width (max-w-md),
+                  // so viewport breakpoints would cram half-size tiles here.
+                  <div className="mt-2 grid grid-cols-1 gap-3">
                     {sugg.map((idea, i) => (
                       <SuggestionCard
                         key={i}
