@@ -16,6 +16,13 @@ const GEMINI_MODEL = 'gemini-2.5-flash';
 // kind, so they get a tighter cap than plain generation.
 const DAILY_CAP_TOTAL = 80;
 const DAILY_CAP_GROUNDED = 25;
+// GLOBAL daily circuit-breaker — the bankruptcy guard. Whatever any single
+// user does, total spend across the whole app cannot exceed these. Override
+// via env as usage grows. When tripped, clients degrade to pool-only mode
+// (cached events) and surface the BYO-key upsell — an outage of freshness,
+// never of the app.
+const GLOBAL_CAP_TOTAL = parseInt(process.env.AI_GLOBAL_DAILY_CAP, 10) || 1500;
+const GLOBAL_CAP_GROUNDED = parseInt(process.env.AI_GLOBAL_GROUNDED_CAP, 10) || 300;
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -52,16 +59,27 @@ export default async function handler(req, res) {
   const day = new Date().toISOString().slice(0, 10);
   const admin = getAdmin();
   const usageRef = admin.firestore().doc(`artifacts/${appId}/aiUsage/${uid}_${day}`);
+  const globalRef = admin.firestore().doc(`artifacts/${appId}/aiUsage/global_${day}`);
   try {
     const inc = admin.firestore.FieldValue.increment(1);
-    await usageRef.set(
-      { total: inc, ...(useWebSearch ? { grounded: inc } : {}), updatedAt: admin.firestore.FieldValue.serverTimestamp() },
-      { merge: true }
-    );
-    const snap = await usageRef.get();
+    const stamp = admin.firestore.FieldValue.serverTimestamp();
+    const patch = { total: inc, ...(useWebSearch ? { grounded: inc } : {}), updatedAt: stamp };
+    await Promise.all([usageRef.set(patch, { merge: true }), globalRef.set(patch, { merge: true })]);
+    const [snap, gsnap] = await Promise.all([usageRef.get(), globalRef.get()]);
     const { total = 0, grounded = 0 } = snap.data() || {};
+    const { total: gTotal = 0, grounded: gGrounded = 0 } = gsnap.data() || {};
+    if (gTotal > GLOBAL_CAP_TOTAL || (useWebSearch && gGrounded > GLOBAL_CAP_GROUNDED)) {
+      res.status(429).json({
+        code: 'budget',
+        error: 'Today’s shared AI budget is used up — showing cached local events instead. Add your own AI key in Profile → AI Provider for unlimited searches.',
+      });
+      return;
+    }
     if (total > DAILY_CAP_TOTAL || (useWebSearch && grounded > DAILY_CAP_GROUNDED)) {
-      res.status(429).json({ error: 'Daily AI limit reached — try again tomorrow, or add your own API key in Profile → AI Provider.' });
+      res.status(429).json({
+        code: 'user-limit',
+        error: 'Daily AI limit reached — try again tomorrow, or add your own API key in Profile → AI Provider.',
+      });
       return;
     }
   } catch (e) {

@@ -196,7 +196,11 @@ const callGeminiProxy = async (prompt, useWebSearch) => {
     body: JSON.stringify({ prompt, useWebSearch }),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data?.error || `AI proxy error ${res.status}`);
+  if (!res.ok) {
+    const err = new Error(data?.error || `AI proxy error ${res.status}`);
+    err.code = data?.code; // 'budget' (global breaker) | 'user-limit' (per-user cap)
+    throw err;
+  }
   return data.text || '';
 };
 
@@ -3045,9 +3049,15 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
         ).filter(Boolean);
       }
 
+      // Budget/limit trips degrade to pool-only mode: cached events still
+      // flow, and the message doubles as the BYO-key upsell.
+      if (aiError?.code === 'budget' || aiError?.code === 'user-limit') {
+        showGlobalMessage(aiError.message, 'error');
+      }
       if (!suggestions.length) {
         // Pool picks already landed → this run still succeeded quietly.
         if (poolPicks.length) return;
+        if (aiError?.code) throw new Error(aiError.message); // already user-friendly
         throw new Error(
           aiError ? `AI search failed — ${aiError.message}` : 'No new ideas right now — try again later or widen your interests.'
         );
@@ -4513,6 +4523,9 @@ Return ONLY a JSON array (no prose, no fences) of objects with keys: title, desc
             return (extractJsonArray(text) || []).map((e) => ({ ...e, source: e.source || 'ai', type: normalizeType(e.type || e.category) }));
           } catch (err) {
             console.warn('Explore AI search failed:', err);
+            // Budget trips still show cached pool results; tell the user why
+            // nothing fresh appeared (and point at the BYO-key valve).
+            if (err?.code) setExploreError(err.message);
             return [];
           }
         })();
