@@ -1590,17 +1590,6 @@ const ProfileSection = ({ onClose }) => {
   const [maxPricePerPerson, setMaxPricePerPerson] = useState(userProfile?.maxPricePerPerson || '');
   const [refineBucket, setRefineBucket] = useState(null); // taxonomy bucket to drill into after a broad add
   const [currentPreference, setCurrentPreference] = useState('');
-  const [availableDates, setAvailableDates] = useState(userProfile?.availability || []);
-  // Per-date slot picker. Map of "YYYY-MM-DD" -> ["morning"|"afternoon"|"evening"].
-  // Migration: if a date is in availability but missing from slots, treat as all-day.
-  const [availabilitySlots, setAvailabilitySlots] = useState(() => {
-    const existing = userProfile?.availabilitySlots || {};
-    const migrated = { ...existing };
-    (userProfile?.availability || []).forEach((d) => {
-      if (!migrated[d]) migrated[d] = ['morning', 'afternoon', 'evening'];
-    });
-    return migrated;
-  });
   // weeklyAvailability is the canonical recurring-availability field:
   // { Mon: ['morning','evening'], Sat: ['afternoon','evening'], ... }
   // Migration from the old separate pickers: cross-product the old
@@ -1617,6 +1606,7 @@ const ProfileSection = ({ onClose }) => {
     return Object.fromEntries(days.map((d) => [d, slots]));
   });
   const [freeSlots, setFreeSlots] = useState(userProfile?.freeSlots || []);
+  const [showFreeBlocks, setShowFreeBlocks] = useState(false); // expander for the synced-blocks list
   const [isSaving, setIsSaving] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [analyzingCalendar, setAnalyzingCalendar] = useState(false);
@@ -1750,8 +1740,8 @@ const ProfileSection = ({ onClose }) => {
         // Store the cap as a number (or null when cleared) so the feed prompt
         // and any filtering can use it numerically.
         maxPricePerPerson: maxPricePerPerson === '' ? null : Number(maxPricePerPerson) || null,
-        availability: availableDates,
-        availabilitySlots,
+        // NOTE: legacy per-date fields (availability / availabilitySlots) are
+        // no longer written — the weekly grid + calendar sync replaced them.
         weeklyAvailability,
         timeOfDayPrefs: derivedTimeOfDay,
         dayOfWeekPrefs: derivedDayOfWeek,
@@ -1831,10 +1821,8 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with shape:
       const slots = extractJsonArray(text);
       if (!slots) throw new Error('Could not parse calendar analysis JSON.');
       setFreeSlots(slots);
-      // Keep the day-level checked state in sync so the calendar reflects which days have any availability
-      const days = [...new Set(slots.map((s) => s.date))].sort();
-      setAvailableDates((prev) => [...new Set([...prev, ...days])].sort());
-      showGlobalMessage(`Synced! Found ${slots.length} free time blocks across ${days.length} days.`);
+      const days = [...new Set(slots.map((s) => s.date))].length;
+      showGlobalMessage(`Synced! Found ${slots.length} free time blocks across ${days} days.`);
     } catch (error) {
       console.error(error);
       showGlobalMessage('Could not sync calendar.', 'error');
@@ -1884,29 +1872,21 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with shape:
       return { ...prev, [bucket.key]: [...existing, opt] };
     });
   };
-  const handleDateToggle = (d) => {
-    setAvailableDates((prev) => (prev.includes(d) ? prev.filter((x) => x !== d) : [...prev, d].sort()));
-    setAvailabilitySlots((prev) => {
-      if (prev[d]) {
-        // Toggling off — drop the entry entirely
-        const { [d]: _drop, ...rest } = prev;
-        return rest;
-      }
-      // Toggling on — default to all-day available
-      return { ...prev, [d]: ['morning', 'afternoon', 'evening'] };
-    });
-  };
-  const handleSlotToggle = (date, slot) => {
-    setAvailabilitySlots((prev) => {
-      const current = prev[date] || ['morning', 'afternoon', 'evening'];
-      const next = current.includes(slot) ? current.filter((s) => s !== slot) : [...current, slot];
-      // If the user clears every slot, drop the date from availability too
-      if (next.length === 0) {
-        const { [date]: _drop, ...rest } = prev;
-        setAvailableDates((d) => d.filter((x) => x !== date));
-        return rest;
-      }
-      return { ...prev, [date]: next };
+  // One-tap presets for the weekly grid. Additive (union), so tapping both
+  // Weeknights and Weekends builds up rather than replacing.
+  const applyWeeklyPreset = (preset) => {
+    if (preset === 'clear') {
+      setWeeklyAvailability({});
+      return;
+    }
+    setWeeklyAvailability((prev) => {
+      const next = { ...prev };
+      const add = (day, slots) => {
+        next[day] = [...new Set([...(next[day] || []), ...slots])];
+      };
+      if (preset === 'weeknights') ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'].forEach((d) => add(d, ['evening']));
+      if (preset === 'weekends') ['Sat', 'Sun'].forEach((d) => add(d, ['afternoon', 'evening']));
+      return next;
     });
   };
 
@@ -1935,141 +1915,6 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with shape:
             <input type="text" value={address} onChange={(e) => setAddress(e.target.value)} placeholder="e.g. New York, NY" className="w-full p-3 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:bg-white transition" />
           </div>
         </div>
-      </div>
-
-      <div className="space-y-3 bg-gray-50 border border-gray-200 rounded-2xl p-4">
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            <h3 className="font-bold text-gray-800">Current location</h3>
-            <p className="text-xs text-gray-500">Use this when traveling so suggestions reflect where you actually are right now.</p>
-          </div>
-          <button
-            type="button"
-            onClick={refreshCurrentLocation}
-            disabled={locatingNow}
-            className="text-xs bg-indigo-50 text-indigo-700 px-3 py-1.5 rounded-lg font-bold flex items-center gap-1 hover:bg-indigo-100 transition disabled:opacity-50 whitespace-nowrap"
-          >
-            {locatingNow ? (
-              <div className="w-3 h-3 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />
-            ) : (
-              <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-4 h-4" />
-            )}
-            {currentLocation ? 'Update' : 'Get current location'}
-          </button>
-        </div>
-        {currentLocation && (
-          <p className="text-sm text-gray-700">
-            <span className="font-semibold">Last captured:</span> {currentLocation.label}
-            {currentLocation.capturedAt && (
-              <span className="text-gray-400 text-xs ml-2">({new Date(currentLocation.capturedAt).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })})</span>
-            )}
-          </p>
-        )}
-        {/* moved to AI provider section below */}
-        <div>
-          <label className="block text-xs font-semibold uppercase text-gray-500 mb-2">When suggesting events, use…</label>
-          <div className="flex flex-wrap gap-2">
-            {[
-              { id: 'home', label: 'Home only' },
-              { id: 'current', label: 'Current location only', disabled: !currentLocation },
-              { id: 'both', label: 'Both (mix)', disabled: !currentLocation },
-            ].map((opt) => {
-              const active = locationPreference === opt.id;
-              return (
-                <button
-                  key={opt.id}
-                  type="button"
-                  disabled={opt.disabled}
-                  onClick={() => setLocationPreference(opt.id)}
-                  className={`px-3 py-1.5 rounded-full text-sm font-medium border transition ${
-                    active ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-700 border-gray-200 hover:border-indigo-300'
-                  } ${opt.disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
-                  title={opt.disabled ? 'Get your current location first' : ''}
-                >
-                  {opt.label}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      </div>
-
-      <div className="space-y-3 bg-gray-50 border border-gray-200 rounded-2xl p-4">
-        {!showOwnAI ? (
-          <div className="flex items-center justify-between gap-3 flex-wrap">
-            <div>
-              <h3 className="font-bold text-gray-800">AI Provider</h3>
-              <p className="text-xs text-gray-500">Using the shared Gemini key (free, may hit a rate limit on heavy days).</p>
-            </div>
-            <button
-              type="button"
-              onClick={() => setShowOwnAI(true)}
-              className="text-xs bg-indigo-50 text-indigo-700 px-3 py-1.5 rounded-lg font-bold hover:bg-indigo-100 transition whitespace-nowrap"
-            >
-              Use my own AI →
-            </button>
-          </div>
-        ) : (
-          <>
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <h3 className="font-bold text-gray-800">Use my own AI</h3>
-                <p className="text-xs text-gray-500 leading-relaxed">
-                  Heads up: this needs a developer API key from one of the providers below — your ChatGPT/Claude/Gemini subscription does <span className="font-semibold">not</span> include API access (they're separate products). The key stays only on this device.
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={collapseToDefault}
-                className="text-xs text-gray-500 hover:text-gray-800 underline whitespace-nowrap"
-              >
-                Back to default
-              </button>
-            </div>
-            <div className="space-y-2">
-              {AI_PROVIDERS.filter((p) => p.id !== 'gemini').map((p) => {
-                const active = aiProvider === p.id;
-                return (
-                  <label
-                    key={p.id}
-                    className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition ${
-                      active ? 'border-indigo-500 bg-indigo-50' : 'border-gray-200 bg-white hover:border-indigo-300'
-                    }`}
-                  >
-                    <input
-                      type="radio"
-                      name="aiProvider"
-                      checked={active}
-                      onChange={() => setAiProvider(p.id)}
-                      className="mt-1"
-                    />
-                    <div className="flex-1">
-                      <p className="text-sm font-medium text-gray-800">{p.label.replace(' (use my own API key)', '').replace(' (use my own Anthropic key)', '').replace(' (use my own key)', '')}</p>
-                      {p.keyHint && active && (
-                        <p className="text-xs text-gray-500 mt-1">Get a key at <span className="font-mono">{p.keyHint}</span></p>
-                      )}
-                    </div>
-                  </label>
-                );
-              })}
-            </div>
-            {AI_PROVIDERS.find((p) => p.id === aiProvider)?.needsKey && (
-              <div>
-                <label className="block text-xs font-semibold uppercase text-gray-500 mb-1">Your API key</label>
-                <input
-                  type="password"
-                  value={aiKeyInput}
-                  onChange={(e) => handleAiKeyChange(e.target.value)}
-                  placeholder="Paste your key here"
-                  className="w-full p-3 bg-white border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500 text-sm font-mono"
-                />
-                <p className="text-xs text-gray-400 mt-1">
-                  {aiKeySaved ? '✓ Saved on this device. Never synced.' : 'Key is stored locally only.'}
-                </p>
-              </div>
-            )}
-          </>
-        )}
       </div>
 
       <div className="grid grid-cols-1 gap-8">
@@ -2241,19 +2086,41 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with shape:
       </div>
 
       <div className="space-y-3">
-        <h3 className="font-bold text-gray-800">When are you usually free?</h3>
-        <p className="text-xs text-gray-500">Tap the times you're typically open for each day. Each row is independent.</p>
+        <h3 className="font-bold text-ink flex items-center gap-2">
+          <CalendarIcon className="w-5 h-5 text-brand-600" /> When do you usually go out?
+        </h3>
+        <p className="text-xs text-ink-soft">Tap the times you're typically free — we'll aim suggestions at them.</p>
+        <div className="flex gap-2">
+          {[
+            { id: 'weeknights', label: 'Weeknights' },
+            { id: 'weekends', label: 'Weekends' },
+            { id: 'clear', label: 'Clear' },
+          ].map((p) => (
+            <button
+              key={p.id}
+              type="button"
+              onClick={() => applyWeeklyPreset(p.id)}
+              className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition ${
+                p.id === 'clear'
+                  ? 'bg-white text-ink-faint border-line hover:text-ink-soft'
+                  : 'bg-brand-50 text-brand-700 border-brand-100 hover:bg-brand-100'
+              }`}
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
         <div className="space-y-1.5">
           {['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map((day) => {
             const daySlots = weeklyAvailability[day] || [];
             return (
               <div key={day} className="flex items-center justify-between gap-2 bg-gray-50 rounded-xl p-2.5">
-                <span className="text-sm font-semibold text-gray-800 w-12 shrink-0">{day}</span>
+                <span className="text-sm font-semibold text-ink w-12 shrink-0">{day}</span>
                 <div className="flex gap-1 flex-1 justify-end">
                   {[
-                    { id: 'morning', short: 'AM' },
-                    { id: 'afternoon', short: 'PM' },
-                    { id: 'evening', short: 'Eve' },
+                    { id: 'morning', short: 'Morning' },
+                    { id: 'afternoon', short: 'Afternoon' },
+                    { id: 'evening', short: 'Evening' },
                   ].map(({ id, short }) => {
                     const on = daySlots.includes(id);
                     return (
@@ -2261,8 +2128,8 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with shape:
                         key={id}
                         type="button"
                         onClick={() => toggleWeeklySlot(day, id)}
-                        className={`px-3 py-1 rounded-md text-xs font-semibold border transition ${
-                          on ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-500 border-gray-200 hover:border-indigo-300'
+                        className={`px-2.5 py-1 rounded-md text-xs font-semibold border transition ${
+                          on ? 'bg-brand-600 text-white border-brand-600' : 'bg-white text-ink-faint border-line hover:border-brand-500'
                         }`}
                       >
                         {short}
@@ -2276,137 +2143,194 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with shape:
         </div>
       </div>
 
-      <div>
-        <div className="flex justify-between items-center mb-3">
-          <h3 className="font-bold text-gray-800">Availability Calendar</h3>
-          <button onClick={analyzeCalendarWithGemini} disabled={analyzingCalendar} className="text-xs bg-indigo-50 text-indigo-700 px-3 py-1.5 rounded-lg font-bold flex items-center gap-1 hover:bg-indigo-100 transition disabled:opacity-50">
-            {analyzingCalendar ? (
+      {/* Connect a real calendar: the precision upgrade over the weekly grid.
+          Google works today (incremental OAuth → Gemini finds free blocks).
+          Apple has no web API — it lands with the native iOS app. */}
+      <div className="space-y-3 bg-gray-50 border border-line rounded-2xl p-4">
+        <div>
+          <h3 className="font-bold text-ink">Connect your calendar</h3>
+          <p className="text-xs text-ink-soft mt-0.5">
+            Sync once and we'll aim suggestions at your actual free time. We only look for free blocks — your events are never stored.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={analyzeCalendarWithGemini}
+          disabled={analyzingCalendar}
+          className="w-full h-11 bg-white border border-line rounded-xl hover:bg-gray-100 font-semibold text-sm text-ink flex items-center justify-center gap-2.5 transition disabled:opacity-50"
+        >
+          {analyzingCalendar ? (
+            <div className="w-4 h-4 border-2 border-brand-600 border-t-transparent rounded-full animate-spin" />
+          ) : (
+            <GoogleIcon />
+          )}
+          {analyzingCalendar ? 'Reading your calendar…' : freeSlots.length ? 'Resync Google Calendar' : 'Sync Google Calendar'}
+        </button>
+        {freeSlots.length > 0 && (
+          <div className="text-xs text-ink-soft">
+            <button
+              type="button"
+              onClick={() => setShowFreeBlocks((v) => !v)}
+              className="font-semibold text-emerald-700 hover:text-emerald-800 transition"
+            >
+              ✓ Synced — {freeSlots.length} free block{freeSlots.length === 1 ? '' : 's'} over the next 30 days {showFreeBlocks ? '▾' : '▸'}
+            </button>
+            {showFreeBlocks && (
+              <div className="mt-2 max-h-40 overflow-y-auto space-y-1 bg-white border border-line rounded-xl p-3">
+                {freeSlots.map((s, i) => (
+                  <div key={i} className="flex justify-between gap-2 py-0.5">
+                    <span className="font-medium text-ink">{s.label || s.date}</span>
+                    <span className="font-mono text-[11px] text-ink-faint">{s.date} · {s.start}–{s.end}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+        <div className="flex items-center gap-2 text-xs text-ink-faint pt-1 border-t border-line">
+          <AppleIcon /> Apple Calendar — coming with the iOS app
+        </div>
+      </div>
+      <div className="space-y-3 bg-gray-50 border border-gray-200 rounded-2xl p-4">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h3 className="font-bold text-gray-800">Current location</h3>
+            <p className="text-xs text-gray-500">Use this when traveling so suggestions reflect where you actually are right now.</p>
+          </div>
+          <button
+            type="button"
+            onClick={refreshCurrentLocation}
+            disabled={locatingNow}
+            className="text-xs bg-indigo-50 text-indigo-700 px-3 py-1.5 rounded-lg font-bold flex items-center gap-1 hover:bg-indigo-100 transition disabled:opacity-50 whitespace-nowrap"
+          >
+            {locatingNow ? (
               <div className="w-3 h-3 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />
             ) : (
-              <SyncIcon className="w-4 h-4" />
+              <Icon path="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" className="w-4 h-4" />
             )}
-            Analyze with Gemini
+            {currentLocation ? 'Update' : 'Get current location'}
           </button>
         </div>
-        <CalendarPicker selectedDates={availableDates} onDateToggle={handleDateToggle} />
-
-        {availableDates.length > 0 && (
-          <div className="mt-4 space-y-2 max-h-72 overflow-y-auto pr-1">
-            <p className="text-xs font-semibold uppercase text-gray-500 px-1">Times of day for each date</p>
-            {availableDates.map((d) => {
-              const slots = availabilitySlots[d] || ['morning', 'afternoon', 'evening'];
-              const labelDate = new Date(d + 'T12:00');
-              const label = labelDate.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+        {currentLocation && (
+          <p className="text-sm text-gray-700">
+            <span className="font-semibold">Last captured:</span> {currentLocation.label}
+            {currentLocation.capturedAt && (
+              <span className="text-gray-400 text-xs ml-2">({new Date(currentLocation.capturedAt).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })})</span>
+            )}
+          </p>
+        )}
+        {/* moved to AI provider section below */}
+        <div>
+          <label className="block text-xs font-semibold uppercase text-gray-500 mb-2">When suggesting events, use…</label>
+          <div className="flex flex-wrap gap-2">
+            {[
+              { id: 'home', label: 'Home only' },
+              { id: 'current', label: 'Current location only', disabled: !currentLocation },
+              { id: 'both', label: 'Both (mix)', disabled: !currentLocation },
+            ].map((opt) => {
+              const active = locationPreference === opt.id;
               return (
-                <div key={d} className="flex items-center justify-between gap-2 bg-gray-50 rounded-xl p-2.5">
-                  <span className="text-sm font-medium text-gray-800 w-32 shrink-0">{label}</span>
-                  <div className="flex gap-1 flex-1 justify-end flex-wrap">
-                    {[
-                      { id: 'morning', short: 'AM' },
-                      { id: 'afternoon', short: 'PM' },
-                      { id: 'evening', short: 'Eve' },
-                    ].map(({ id, short }) => {
-                      const on = slots.includes(id);
-                      return (
-                        <button
-                          key={id}
-                          type="button"
-                          onClick={() => handleSlotToggle(d, id)}
-                          className={`px-2.5 py-1 rounded-md text-xs font-semibold border transition ${
-                            on ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-500 border-gray-200 hover:border-indigo-300'
-                          }`}
-                        >
-                          {short}
-                        </button>
-                      );
-                    })}
-                    <button
-                      type="button"
-                      onClick={() => handleDateToggle(d)}
-                      className="ml-1 p-1 text-gray-400 hover:text-red-500 transition"
-                      title="Remove date"
-                    >
-                      <CloseIcon className="w-3 h-3" />
-                    </button>
-                  </div>
-                </div>
+                <button
+                  key={opt.id}
+                  type="button"
+                  disabled={opt.disabled}
+                  onClick={() => setLocationPreference(opt.id)}
+                  className={`px-3 py-1.5 rounded-full text-sm font-medium border transition ${
+                    active ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-700 border-gray-200 hover:border-indigo-300'
+                  } ${opt.disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+                  title={opt.disabled ? 'Get your current location first' : ''}
+                >
+                  {opt.label}
+                </button>
               );
             })}
           </div>
-        )}
+        </div>
+      </div>
 
-        {freeSlots.length > 0 && (
-          <div className="mt-4 bg-indigo-50 border border-indigo-100 rounded-xl p-4">
-            <h4 className="text-sm font-bold text-indigo-900 mb-2">Free time blocks ({freeSlots.length})</h4>
-            <div className="max-h-48 overflow-y-auto space-y-1 text-sm text-indigo-800">
-              {freeSlots.map((s, i) => (
-                <div key={i} className="flex justify-between gap-2 py-1 border-b border-indigo-100 last:border-0">
-                  <span className="font-medium">{s.label || s.date}</span>
-                  <span className="font-mono text-xs">{s.date} · {s.start}–{s.end}</span>
-                </div>
-              ))}
+      <div className="space-y-3 bg-gray-50 border border-gray-200 rounded-2xl p-4">
+        {!showOwnAI ? (
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div>
+              <h3 className="font-bold text-gray-800">AI Provider</h3>
+              <p className="text-xs text-gray-500">Using the shared Gemini key (free, may hit a rate limit on heavy days).</p>
             </div>
+            <button
+              type="button"
+              onClick={() => setShowOwnAI(true)}
+              className="text-xs bg-indigo-50 text-indigo-700 px-3 py-1.5 rounded-lg font-bold hover:bg-indigo-100 transition whitespace-nowrap"
+            >
+              Use my own AI →
+            </button>
           </div>
+        ) : (
+          <>
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="font-bold text-gray-800">Use my own AI</h3>
+                <p className="text-xs text-gray-500 leading-relaxed">
+                  Heads up: this needs a developer API key from one of the providers below — your ChatGPT/Claude/Gemini subscription does <span className="font-semibold">not</span> include API access (they're separate products). The key stays only on this device.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={collapseToDefault}
+                className="text-xs text-gray-500 hover:text-gray-800 underline whitespace-nowrap"
+              >
+                Back to default
+              </button>
+            </div>
+            <div className="space-y-2">
+              {AI_PROVIDERS.filter((p) => p.id !== 'gemini').map((p) => {
+                const active = aiProvider === p.id;
+                return (
+                  <label
+                    key={p.id}
+                    className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition ${
+                      active ? 'border-indigo-500 bg-indigo-50' : 'border-gray-200 bg-white hover:border-indigo-300'
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="aiProvider"
+                      checked={active}
+                      onChange={() => setAiProvider(p.id)}
+                      className="mt-1"
+                    />
+                    <div className="flex-1">
+                      <p className="text-sm font-medium text-gray-800">{p.label.replace(' (use my own API key)', '').replace(' (use my own Anthropic key)', '').replace(' (use my own key)', '')}</p>
+                      {p.keyHint && active && (
+                        <p className="text-xs text-gray-500 mt-1">Get a key at <span className="font-mono">{p.keyHint}</span></p>
+                      )}
+                    </div>
+                  </label>
+                );
+              })}
+            </div>
+            {AI_PROVIDERS.find((p) => p.id === aiProvider)?.needsKey && (
+              <div>
+                <label className="block text-xs font-semibold uppercase text-gray-500 mb-1">Your API key</label>
+                <input
+                  type="password"
+                  value={aiKeyInput}
+                  onChange={(e) => handleAiKeyChange(e.target.value)}
+                  placeholder="Paste your key here"
+                  className="w-full p-3 bg-white border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500 text-sm font-mono"
+                />
+                <p className="text-xs text-gray-400 mt-1">
+                  {aiKeySaved ? '✓ Saved on this device. Never synced.' : 'Key is stored locally only.'}
+                </p>
+              </div>
+            )}
+          </>
         )}
       </div>
+
       <div className="flex justify-end pt-4 border-t">
         <button onClick={handleSaveProfile} disabled={isSaving} className="bg-indigo-600 text-white font-bold py-3 px-8 rounded-xl hover:bg-indigo-700 transition shadow-lg shadow-indigo-200">
           {isSaving ? 'Saving...' : 'Save Profile'}
         </button>
       </div>
-    </div>
-  );
-};
-
-const CalendarPicker = ({ selectedDates, onDateToggle }) => {
-  const [date, setDate] = useState(new Date());
-  const changeMonth = (offset) =>
-    setDate((prev) => {
-      const newDate = new Date(prev);
-      newDate.setMonth(newDate.getMonth() + offset);
-      return newDate;
-    });
-  const month = date.getMonth();
-  const year = date.getFullYear();
-  const daysInMonth = new Date(year, month + 1, 0).getDate();
-  const firstDay = new Date(year, month, 1).getDay();
-  const dayNames = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
-  const renderDays = () => {
-    const days = [];
-    for (let i = 0; i < firstDay; i++) days.push(<div key={`empty-${i}`} className="w-8 h-8"></div>);
-    for (let day = 1; day <= daysInMonth; day++) {
-      const dateString = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-      const isSelected = selectedDates.includes(dateString);
-      const isToday = new Date().toDateString() === new Date(year, month, day).toDateString();
-      days.push(
-        <div
-          key={dateString}
-          onClick={() => onDateToggle(dateString)}
-          className={`w-8 h-8 sm:w-10 sm:h-10 flex items-center justify-center rounded-full cursor-pointer transition-all ${
-            isSelected ? 'bg-indigo-600 text-white shadow-md' : 'hover:bg-gray-100 text-gray-700'
-          } ${isToday && !isSelected ? 'ring-2 ring-indigo-200 font-bold' : ''}`}
-        >
-          {day}
-        </div>
-      );
-    }
-    return days;
-  };
-  return (
-    <div className="bg-white border border-gray-200 p-4 rounded-xl">
-      <div className="flex justify-between items-center mb-4">
-        <button onClick={() => changeMonth(-1)} className="p-1 hover:bg-gray-100 rounded">&lt;</button>
-        <h4 className="font-bold text-gray-800">
-          {date.toLocaleString('default', { month: 'long' })} {year}
-        </h4>
-        <button onClick={() => changeMonth(1)} className="p-1 hover:bg-gray-100 rounded">&gt;</button>
-      </div>
-      <div className="grid grid-cols-7 gap-1 text-center text-xs font-bold text-gray-400 mb-2">
-        {dayNames.map((d, i) => (
-          <div key={`header-${i}`}>{d}</div>
-        ))}
-      </div>
-      <div className="grid grid-cols-7 gap-1 place-items-center text-sm">{renderDays()}</div>
     </div>
   );
 };
@@ -2895,12 +2819,6 @@ HARD RULE: of 5 returned events, at least 2 MUST be tagged locationSource="home"
             .map(([d, s]) => `${d}=${s.join('/')}`)
             .join(', ')
         : '(none specified)';
-      const slotsByDate = userProfile?.availabilitySlots || {};
-      const datesWithSlots = Object.entries(slotsByDate)
-        .filter(([, slots]) => Array.isArray(slots) && slots.length)
-        .slice(0, 30)
-        .map(([d, slots]) => `${d} (${slots.join('/')})`)
-        .join('; ');
       const today = new Date().toDateString();
       const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toDateString();
 
@@ -2944,8 +2862,7 @@ WHAT TO FIND (specific & niche beats generic):
 AVAILABILITY:
 - Recurring weekly availability (day=times-of-day): ${weeklyStr}
 - Preferred times of day: ${todsPrefs}; preferred days: ${dowPrefs}
-- Specific free dates (date → times-of-day): ${datesWithSlots || '(none — use the weekly availability)'}
-- If specific dates exist, every pick's date+time MUST fall on one of them and match a listed time-of-day (morning<12:00, afternoon 12:00–17:00, evening 17:00+).
+- Time-of-day guide: morning <12:00, afternoon 12:00–17:00, evening 17:00+. Strongly prefer picks whose date+time land in the recurring weekly availability above.
 
 DO NOT REPEAT — these were already shown; return NONE of them and no near-duplicates or other nights of the same series:
 ${seenList || '(none yet)'}
@@ -4358,17 +4275,6 @@ const SuggestionSection = () => {
           slots: p.freeSlots.slice(0, 14),
         }));
 
-      // Each member's hand-picked date + slot-of-day availability.
-      const pickedAvailability = memberProfiles
-        .filter((p) => p.availabilitySlots && Object.keys(p.availabilitySlots).length)
-        .map((p) => ({
-          name: p.name?.split(' ')[0] || 'Member',
-          entries: Object.entries(p.availabilitySlots)
-            .filter(([, s]) => Array.isArray(s) && s.length)
-            .slice(0, 30)
-            .map(([d, s]) => `${d} (${s.join('/')})`),
-        }));
-
       const today = new Date().toDateString();
 
       const prompt = `Today is ${today}. You're recommending events for a group of ${memberProfiles.length} friends called "${group.name}" who want to hang out together.
@@ -4394,15 +4300,8 @@ ${
     : '(No members have synced calendars.)'
 }
 
-MEMBER HAND-PICKED AVAILABILITY (dates members manually marked as free, with which times-of-day):
-${
-  pickedAvailability.length
-    ? pickedAvailability.map((m) => `- ${m.name}: ${m.entries.join('; ')}`).join('\n')
-    : '(No members have hand-picked dates.)'
-}
-
 If neither source above has data, fall back to Friday/Saturday evenings and weekend afternoons.
-When you do have hand-picked availability, weight it MORE than the auto-analyzed blocks — those are the times the user explicitly said they want to socialize. Suggest events that align with the largest overlap of members' hand-picked slots first, then their Gemini-analyzed free blocks.
+Weight synced-calendar free blocks (precise) over the recurring weekly schedule (general); prefer times where the most members overlap.
 
 YOUR TASK:
 Search the web for 6 ACTUAL, REAL-WORLD events happening near ${loc} in the next 30 days. PRIORITIZE events whose date/time overlaps with the most members' free blocks above. If no member availability is provided, prioritize Friday/Saturday evenings and weekend afternoons.

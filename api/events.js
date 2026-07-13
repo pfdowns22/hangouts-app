@@ -420,6 +420,18 @@ const tlScore = ({ overlap, dayDiff, miles }) => {
   if (miles != null) s += miles <= 75 ? 0.25 : miles >= 250 ? -0.4 : 0;
   return s;
 };
+// Final acceptance gate on the winning candidate. tlScore picks the BEST
+// candidate, but "best" isn't "good": a half-overlap title with a wildly
+// wrong date used to sail through (querying "Billy Joel" resolved to an
+// "Elton vs Billy" tribute band five months out). A wrong-event Buy Tickets
+// link is worse than no link — the client's web-search fallback is always
+// safe — so partial title matches must be corroborated by the date, and
+// way-off dates require a near-exact title.
+const tlConfident = ({ overlap, dayDiff }) => {
+  if (overlap >= 0.85) return dayDiff == null || dayDiff <= 45; // near-exact title; tolerate recurring-act date fuzz
+  if (overlap >= 0.65) return dayDiff == null || dayDiff <= 7;
+  return dayDiff != null && dayDiff <= 2; // weak title: only a same-window date saves it
+};
 
 const findTicketLink = async ({ title, lat, lng, date }) => {
   if (!title) return { url: null };
@@ -472,7 +484,9 @@ const findTicketLink = async ({ title, lat, lng, date }) => {
     const s = tlScore(c);
     if (s > bestScore) { best = c; bestScore = s; }
   }
-  return best ? { url: best.url, source: best.source } : { url: null };
+  // Only return the winner when it clears the confidence gate — otherwise
+  // fail open (null) and let the client keep its web-search fallback.
+  return best && tlConfident(best) ? { url: best.url, source: best.source } : { url: null };
 };
 
 export default async function handler(req, res) {
