@@ -1700,6 +1700,7 @@ const ProfileSection = ({ onClose }) => {
   const [uploading, setUploading] = useState(false);
   const [analyzingCalendar, setAnalyzingCalendar] = useState(false);
   const [showSurvey, setShowSurvey] = useState(false);
+  const [editInterests, setEditInterests] = useState(false); // interests picker collapsed to a summary by default
   const [currentLocation, setCurrentLocation] = useState(userProfile?.currentLocation || null);
   const [locationPreference, setLocationPreference] = useState(userProfile?.locationPreference || 'home');
   const [mobility, setMobility] = useState(userProfile?.mobility || 'auto'); // auto|dense|standard|spread
@@ -2011,18 +2012,36 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with shape:
       <div className="grid grid-cols-1 gap-8">
         <div>
           <div className="flex items-center justify-between mb-3">
-            <h3 className="font-bold text-gray-800 flex items-center gap-2">
-              <HeartIcon className="w-5 h-5 text-pink-500" /> Preferences
+            <h3 className="font-bold text-ink flex items-center gap-2">
+              <HeartIcon className="w-5 h-5 text-pink-500" /> Interests
             </h3>
             <button
               type="button"
-              onClick={() => setShowSurvey(true)}
-              className="text-xs bg-pink-50 text-pink-700 px-3 py-1.5 rounded-lg font-bold flex items-center gap-1 hover:bg-pink-100 transition"
-              title="Take a 1-minute AI-tailored interest survey"
+              onClick={() => setEditInterests((v) => !v)}
+              className={`text-xs px-3 py-1.5 rounded-lg font-bold transition ${
+                editInterests ? 'bg-brand-600 text-white hover:bg-brand-700' : 'bg-brand-50 text-brand-700 hover:bg-brand-100'
+              }`}
             >
-              <SparklesIcon className="w-4 h-4" /> Take Survey
+              {editInterests ? 'Done' : 'Edit'}
             </button>
           </div>
+          {!editInterests ? (
+            // Compact summary — the full picker lives behind Edit.
+            <div className="flex flex-wrap gap-1.5 items-center">
+              {preferences.slice(0, 6).map((p) => (
+                <span key={p} className="bg-brand-50 text-brand-700 px-2.5 py-1 rounded-full text-xs font-semibold border border-brand-100">
+                  {p}
+                </span>
+              ))}
+              {preferences.length > 6 && (
+                <span className="text-xs text-ink-faint font-semibold">+{preferences.length - 6} more</span>
+              )}
+              {preferences.length === 0 && (
+                <p className="text-xs text-ink-faint">No interests yet — tap Edit to pick some.</p>
+              )}
+            </div>
+          ) : (
+            <>
           <p className="text-xs text-gray-400 mb-2">Tap to add — or use the survey / type your own below.</p>
           <div className="flex flex-wrap gap-2 mb-3">
             {QUICK_INTEREST_CHIPS.map((chip) => {
@@ -2091,6 +2110,16 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with shape:
                 })}
               </div>
             </div>
+          )}
+          <button
+            type="button"
+            onClick={() => setShowSurvey(true)}
+            className="mt-3 text-xs bg-pink-50 text-pink-700 px-3 py-1.5 rounded-lg font-bold inline-flex items-center gap-1 hover:bg-pink-100 transition"
+            title="Take a 1-minute AI-tailored interest survey"
+          >
+            <SparklesIcon className="w-4 h-4" /> Take the 1-minute survey
+          </button>
+            </>
           )}
           {showSurvey && (
             <SurveyModal
