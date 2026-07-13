@@ -1702,6 +1702,7 @@ const ProfileSection = ({ onClose }) => {
   const [showSurvey, setShowSurvey] = useState(false);
   const [currentLocation, setCurrentLocation] = useState(userProfile?.currentLocation || null);
   const [locationPreference, setLocationPreference] = useState(userProfile?.locationPreference || 'home');
+  const [mobility, setMobility] = useState(userProfile?.mobility || 'auto'); // auto|dense|standard|spread
   const [locatingNow, setLocatingNow] = useState(false);
   // AI provider preference + user-supplied key. Provider syncs to profile;
   // the key lives only in localStorage so it never leaves the device.
@@ -1837,6 +1838,7 @@ const ProfileSection = ({ onClose }) => {
         freeSlots,
         currentLocation,
         locationPreference,
+        mobility,
         aiProvider,
         // Mark profile as completed (used by the onboarding banner).
         profileCompletedAt: serverTimestamp(),
@@ -2232,6 +2234,36 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with shape:
         </div>
       </div>
 
+      <div className="space-y-2">
+        <h3 className="font-bold text-ink">How far will you usually go?</h3>
+        <p className="text-xs text-ink-soft">
+          "Far" is different in Manhattan and in Louisville. Auto reads it from your home base
+          {mobility === 'auto' ? ` (currently: ${{ dense: 'walkable city', standard: 'my city', spread: 'whole region' }[deriveMobility(address)]})` : ''}.
+        </p>
+        <div className="flex flex-wrap gap-2">
+          {[
+            { id: 'auto', label: 'Auto' },
+            { id: 'dense', label: 'Walkable / transit' },
+            { id: 'standard', label: 'My city' },
+            { id: 'spread', label: 'Whole region' },
+          ].map((opt) => {
+            const on = mobility === opt.id;
+            return (
+              <button
+                key={opt.id}
+                type="button"
+                onClick={() => setMobility(opt.id)}
+                className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition ${
+                  on ? 'bg-brand-600 text-white border-brand-600' : 'bg-white text-ink-soft border-line hover:border-brand-500'
+                }`}
+              >
+                {opt.label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
       {/* Connect a real calendar: the precision upgrade over the weekly grid.
           Google works today (incremental OAuth → Gemini finds free blocks).
           Apple has no web API — it lands with the native iOS app. */}
@@ -2433,15 +2465,59 @@ const PATIENCE_MESSAGES = [
   'Almost there — polishing the results…',
 ];
 
-// Scope expansion as the user scrolls. Each "load more" jumps to the
-// next tier so we keep finding fresh content instead of repeating the
-// same local venues. Refresh resets the user to tier 0.
-const SCOPE_TIERS = [
-  { label: 'your immediate neighborhood (~3 miles)', radius: '3 miles', radiusMiles: 3 },
-  { label: 'adjacent neighborhoods (~10 miles)', radius: '10 miles', radiusMiles: 10 },
-  { label: 'your full city / borough (~25 miles)', radius: '25 miles', radiusMiles: 25 },
-  { label: 'the wider metro region (~60 miles)', radius: '60 miles', radiusMiles: 60 },
-];
+// --- Mobility model: what "far" means depends on where you live. ------------
+// In Manhattan, Midtown→Bronx is a trek; in Louisville a 30-minute drive is
+// routine. Distance tiers scale to a mobility class:
+//   dense    — walkable/transit metro core (NYC boroughs, SF, London, …)
+//   standard — typical city/suburb
+//   spread   — rural / spread-out region, driving culture
+// Default is inferred from the home base; users can override in Profile.
+const DENSE_METRO = /\b(manhattan|brooklyn|queens|bronx|staten island|nyc|new york,?\s*ny|san francisco|boston|philadelphia|washington,?\s*dc|chicago|london|paris|tokyo|hong kong|singapore|amsterdam|berlin|madrid|barcelona|mexico city|toronto|montreal|seattle|jersey city|hoboken|cambridge,?\s*ma)\b/i;
+const deriveMobility = (locLabel) => {
+  const s = (locLabel || '').toLowerCase();
+  if (!s.trim()) return 'standard';
+  if (nycBorough(s) || DENSE_METRO.test(s)) return 'dense';
+  return 'standard';
+};
+const effectiveMobility = (profile) => {
+  if (profile?.mobility && profile.mobility !== 'auto') return profile.mobility;
+  const locPref = profile?.locationPreference || 'home';
+  const label = locPref === 'current' && profile?.currentLocation?.label ? profile.currentLocation.label : profile?.address;
+  return deriveMobility(label);
+};
+
+// Scope expansion as the user scrolls. Each "load more" jumps to the next
+// tier so we keep finding fresh content instead of repeating the same local
+// venues. Refresh resets the user to tier 0. Tier radii scale to mobility.
+const scopeTiersFor = (mobility) => {
+  if (mobility === 'dense')
+    return [
+      { label: 'your immediate neighborhood (~1.5 miles — walking/short subway)', radius: '1.5 miles', radiusMiles: 1.5 },
+      { label: 'adjacent neighborhoods (~4 miles)', radius: '4 miles', radiusMiles: 4 },
+      { label: 'across your city/borough (~10 miles)', radius: '10 miles', radiusMiles: 10 },
+      { label: 'the wider metro (~25 miles)', radius: '25 miles', radiusMiles: 25 },
+    ];
+  if (mobility === 'spread')
+    return [
+      { label: 'your local area (~10 miles)', radius: '10 miles', radiusMiles: 10 },
+      { label: 'a short drive (~25 miles)', radius: '25 miles', radiusMiles: 25 },
+      { label: 'a normal drive out (~60 miles)', radius: '60 miles', radiusMiles: 60 },
+      { label: 'a day-trip radius (~120 miles)', radius: '120 miles', radiusMiles: 120 },
+    ];
+  return [
+    { label: 'your immediate neighborhood (~3 miles)', radius: '3 miles', radiusMiles: 3 },
+    { label: 'adjacent neighborhoods (~10 miles)', radius: '10 miles', radiusMiles: 10 },
+    { label: 'your full city (~25 miles)', radius: '25 miles', radiusMiles: 25 },
+    { label: 'the wider metro region (~60 miles)', radius: '60 miles', radiusMiles: 60 },
+  ];
+};
+// A one-line prompt cue so the model FEELS the local sense of distance.
+const mobilityPromptLine = (mobility) =>
+  mobility === 'dense'
+    ? 'This person lives in a dense transit city: a few miles IS far. Stay hyper-local; never suggest another borough/side of the city unless truly exceptional.'
+    : mobility === 'spread'
+      ? 'This person lives in a spread-out region where 30–60 minute drives are completely normal; cast a wide net.'
+      : 'Typical city/suburb mobility: nearby first, up to a reasonable drive.';
 
 // Map priceTier strings to a numeric sort weight; events without a tier
 // land at the bottom of price-sorted lists.
@@ -2813,10 +2889,13 @@ const MyFeedSection = () => {
     }
     // Refresh (button or context tick) resets scope to immediate area.
     // Scroll-triggered generation expands to the next scope tier so we
-    // surface fresh content instead of repeating local venues.
+    // surface fresh content instead of repeating local venues. Tier radii
+    // scale to the user's mobility (dense city vs. spread-out region).
+    const mobility = effectiveMobility(userProfile);
+    const tiers = scopeTiersFor(mobility);
     if (!fromScroll) scopeRef.current = 0;
-    else scopeRef.current = Math.min(scopeRef.current + 1, SCOPE_TIERS.length - 1);
-    const scope = SCOPE_TIERS[scopeRef.current];
+    else scopeRef.current = Math.min(scopeRef.current + 1, tiers.length - 1);
+    const scope = tiers[scopeRef.current];
 
     setIsGenerating(forToday ? 'today' : 'upcoming');
     try {
@@ -2943,6 +3022,7 @@ ${budgetLine ? `- Budget: ${budgetLine}. Respect this — set each pick's priceT
 
 LOCATION — HARD CONSTRAINT:
 ${locationBlock}
+- ${mobilityPromptLine(mobility)}
 - Suggest ONLY things in this neighborhood and immediately adjacent areas within ~${scope.radius}. NEVER suggest another state, a far-away borough, or a different city. If you can't find enough truly local options, return FEWER — do not reach far.
 
 WHAT TO FIND (specific & niche beats generic):
@@ -4365,6 +4445,10 @@ const SuggestionSection = () => {
             .map(([d, s]) => `${d}=${s.join('/')}`),
         }));
       const loc = userProfile?.address || memberProfiles.find((p) => p.address)?.address || 'New York';
+      // Distance sense anchored on the suggester's mobility (groups stretch
+      // one tier further than solo browsing).
+      const anchorMobility = effectiveMobility(userProfile);
+      const groupRadius = scopeTiersFor(anchorMobility)[2].radiusMiles;
 
       // Each member's free time blocks (from Gemini calendar analysis),
       // capped to 14 entries each so we don't blow the prompt budget.
@@ -4382,7 +4466,7 @@ const SuggestionSection = () => {
 GROUP CONTEXT:
 - Combined interests across all members: ${allPrefs.length ? allPrefs.join(', ') : 'general fun'}
 - Family situation: ${allKids.length ? `Group includes children ages ${allKids.map((k) => k.age).join(', ')} — prefer family-friendly options.` : 'No children — adult-friendly options are fine.'}
-- Anchor location: ${loc} (events must be within ~15 miles / 25 km of here)
+- Anchor location: ${loc} (events must be within ~${groupRadius} miles of here). ${mobilityPromptLine(anchorMobility)}
 - Preferred times of day (union across members): ${allTimeOfDay.length ? allTimeOfDay.join(', ') : 'any time'}
 - Preferred days of week (union across members): ${allDayOfWeek.length ? allDayOfWeek.join(', ') : 'any day'}
 
@@ -4456,7 +4540,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
           location: loc,
           startDate: ymdLocal(new Date()),
           endDate: ymdLocal(new Date(Date.now() + 30 * 864e5)),
-          radius: 25,
+          radius: groupRadius,
           keywords: allPrefs.slice(0, 4).join(' '),
           size: 12,
         });
@@ -4496,6 +4580,9 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
       const home = userProfile?.address || 'New York, NY';
       const locLabel = locPref === 'current' && current ? current : home;
       const geo = poolGeoBucket(locLabel);
+      // Browse radius scales with mobility: tier-1 of the user's scope set.
+      const mobility = effectiveMobility(userProfile);
+      const exploreRadius = scopeTiersFor(mobility)[1].radiusMiles;
       const typeOk = (e) => typeSel === 'all' || (e.type || 'Other') === typeSel;
       const whenOk = (e) => exploreDayMatches(whenSel, String(e.date || '').slice(0, 10));
 
@@ -4513,7 +4600,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
             : whenSel === 'weekend'
               ? 'happening on the upcoming Saturday or Sunday'
               : 'happening in the next 7 days';
-        const prompt = `Today is ${new Date().toDateString()}. Search the web for 6 REAL local events in ${catLine}, ${whenLine}, near ${locLabel} (within ~10 miles). Real and verifiable only — no invented events; prefer distinctive local picks over generic listings.
+        const prompt = `Today is ${new Date().toDateString()}. Search the web for 6 REAL local events in ${catLine}, ${whenLine}, near ${locLabel} (within ~${exploreRadius} miles). ${mobilityPromptLine(mobility)} Real and verifiable only — no invented events; prefer distinctive local picks over generic listings.
 Return ONLY a JSON array (no prose, no fences) of objects with keys: title, description, location, date (YYYY-MM-DD HH:MM), url (official page or null — never guess), imageUrl (real public image URL or null), imageKeywords (3-6 visual words), type (EXACTLY ONE of: ${EVENT_TYPES.join(', ')}), priceTier ("Free","$","$$","$$$","$$$$" or null), isTicketed (true/false), ticketsUrl (exact purchase page you saw, else null).`;
 
         const aiSearch = (async () => {
@@ -4533,7 +4620,7 @@ Return ONLY a JSON array (no prose, no fences) of objects with keys: title, desc
           location: locLabel,
           startDate: ymdLocal(new Date()),
           endDate: ymdLocal(new Date(Date.now() + (whenSel === 'today' ? 1 : 14) * 864e5)),
-          radius: 10,
+          radius: exploreRadius,
           keywords: typeSel === 'all' ? '' : typeSel,
           size: 12,
           borough: nycBorough(locLabel),
