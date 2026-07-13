@@ -546,6 +546,12 @@ const ticketAction = (event) => {
     const direct = validHttpUrl(event?.ticketsUrl) || validHttpUrl(event?.url);
     if (direct) return { href: affiliateUrl(direct), label: '🎟️ Buy Tickets' };
   }
+  // A previous session (any user, via the pool) already validated this
+  // event's ticket page — link straight to it.
+  if (event?.ticketsUrlVerified) {
+    const direct = validHttpUrl(event?.ticketsUrl);
+    if (direct) return { href: affiliateUrl(direct), label: '🎟️ Buy Tickets' };
+  }
   return { href: searchUrl(event, 'tickets'), label: '🎟️ Find Tickets' };
 };
 
@@ -569,6 +575,49 @@ const isRealTicketPage = (url) => {
     return valid;
   } catch {
     return null;
+  }
+};
+
+// Validate a candidate ticket URL end-to-end: shape check (real seller host,
+// real listing path) + a liveness probe through the meta proxy. Only a URL
+// that is BOTH plausibly a purchase page AND actually loads gets shown as a
+// one-click Buy Tickets link. Session-cached per URL. Returns url | null.
+const ticketUrlValidCache = new Map();
+const validateTicketUrl = async (url) => {
+  const real = isRealTicketPage(url);
+  if (!real) return null;
+  if (ticketUrlValidCache.has(real)) return ticketUrlValidCache.get(real);
+  const meta = await fetchUrlMeta(real);
+  // Strict: only accept a confirmed-alive page. (meta null = proxy
+  // unavailable, e.g. local dev — fall through to the next layer instead.)
+  const ok = meta?.alive === true ? real : null;
+  ticketUrlValidCache.set(real, ok);
+  return ok;
+};
+
+// Once ANY layer validates a direct ticket URL, remember it everywhere it
+// helps: the user's own feed doc (so this card is one-click next render) and
+// the shared event pool (so the next person in the area skips resolution
+// entirely). Fire-and-forget; failures never block the click.
+const cacheVerifiedTicketUrl = ({ event, url, userId, userProfile, feedId }) => {
+  try {
+    if (feedId && userId) {
+      updateDoc(doc(db, `artifacts/${appId}/users/${userId}/feed/${feedId}`), {
+        'data.ticketsUrl': url,
+        'data.ticketsUrlVerified': true,
+      }).catch(() => {});
+    }
+    const locPref = userProfile?.locationPreference || 'home';
+    const label =
+      locPref === 'current' && userProfile?.currentLocation?.label
+        ? userProfile.currentLocation.label
+        : userProfile?.address || '';
+    const geo = poolGeoBucket(label);
+    if (geo !== 'unknown' && event?.title) {
+      setDoc(doc(poolCollection(), poolDocId(event, geo)), { ticketsUrl: url, ticketsUrlVerified: true }, { merge: true }).catch(() => {});
+    }
+  } catch {
+    /* best-effort */
   }
 };
 
@@ -604,41 +653,59 @@ Rules: the URL must be the real listing page where a buyer completes purchase fo
 // ticketing APIs for the REAL purchase URL — upgrading to a one-click Buy
 // Tickets link when one is confidently found. Fail-open: any miss/error keeps
 // the search, so the button always works.
-const useTicketAction = (event) => {
+const useTicketAction = (event, feedId = null) => {
+  const { userId, userProfile } = useContext(AppContext);
   const base = ticketAction(event);
   const [resolved, setResolved] = useState(null);
   const [pending, setPending] = useState(false);
-  // Only worth resolving when ticketed and we don't already trust a direct link.
-  const needsResolve = !!event?.isTicketed && !TRUSTED_URL_SOURCES.has(event?.source);
+  // Only worth resolving when ticketed and we don't already have a direct link
+  // we trust (partner source or a previously validated ticketsUrl).
+  const needsResolve =
+    !!event?.isTicketed && !TRUSTED_URL_SOURCES.has(event?.source) && !(event?.ticketsUrlVerified && validHttpUrl(event?.ticketsUrl));
   const key = needsResolve ? `${(event.title || '').toLowerCase()}|${String(event.date || '').slice(0, 10)}` : '';
-  // Layer 1 (render): partner APIs are free, so resolve a direct Buy Tickets
-  // link up front. Layer 2 (the grounded agent) is metered, so it runs only on
-  // click — see onClick below.
+
+  const remember = (url) => cacheVerifiedTicketUrl({ event, url, userId, userProfile, feedId });
+
+  // Render-time resolution, free layers first:
+  //   Layer A — the AI's own ticketsUrl, liveness-validated. The grounded
+  //   search frequently returns the REAL Eventbrite/Posh/Dice page; we used
+  //   to throw it away for non-partner events, which is why the button so
+  //   often landed on a web search.
+  //   Layer B — TM/SeatGeek resolver (confidence-gated server-side).
+  // The metered grounded agent stays click-time only.
   useEffect(() => {
     if (!needsResolve) return;
     if (ticketLinkCache.has(key)) { setResolved(ticketLinkCache.get(key)); return; }
     let cancelled = false;
-    resolveTicketLink({ title: event.title, location: event.location, date: event.date }).then((r) => {
+    (async () => {
+      let r = null;
+      const aiUrl = await validateTicketUrl(event.ticketsUrl);
+      if (aiUrl) {
+        r = { url: aiUrl, source: 'ai-verified' };
+      } else {
+        r = await resolveTicketLink({ title: event.title, location: event.location, date: event.date });
+        // Partner-resolved URLs are real by construction; still remember them.
+      }
       ticketLinkCache.set(key, r);
+      if (r?.url) remember(r.url);
       if (!cancelled) setResolved(r);
-    });
+    })();
     return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [needsResolve, key]);
   if (!base) return null;
 
-  // Confident direct link (partner-resolved or trusted source) → plain anchor.
+  // Confident direct link (trusted / validated / partner-resolved) → plain anchor.
   if (resolved?.url) return { href: affiliateUrl(resolved.url), label: '🎟️ Buy Tickets' };
-
-  // No direct link yet. The button still navigates to the search fallback
-  // (base.href) for no-JS / failure, but on click we first let the agent try to
-  // find the real purchase page. A tab is opened synchronously (so the browser
-  // doesn't treat the post-await navigation as a blocked popup) and pointed at
-  // the agent's result, or the search fallback if the agent comes up empty.
   if (!needsResolve) return base;
+
+  // No direct link yet: on click, the grounded agent hunts for the exact
+  // purchase page (result liveness-validated too). A tab opens synchronously
+  // so the post-await navigation isn't popup-blocked; it lands on the agent's
+  // page or, failing everything, the targeted web search.
   const onClick = (e) => {
     trackAffiliateClick('tickets', base.href);
     if (pending) { e.preventDefault(); return; }
-    // Agent already run this session → use whatever it found (cached).
     if (ticketLinkCache.has(`agent:${key}`)) {
       const hit = ticketLinkCache.get(`agent:${key}`);
       if (hit?.url) { e.preventDefault(); window.open(affiliateUrl(hit.url), '_blank', 'noopener'); }
@@ -647,13 +714,20 @@ const useTicketAction = (event) => {
     e.preventDefault();
     const tab = window.open('about:blank', '_blank');
     setPending(true);
-    agentFindTicketUrl({ title: event.title, location: event.location, date: event.date })
-      .then((r) => {
-        ticketLinkCache.set(`agent:${key}`, r);
-        const dest = r?.url ? affiliateUrl(r.url) : base.href;
-        if (r?.url) setResolved(r); // upgrade the button to Buy Tickets for next time
-        if (tab) tab.location = dest; else window.open(dest, '_blank', 'noopener');
-      })
+    (async () => {
+      let r = await agentFindTicketUrl({ title: event.title, location: event.location, date: event.date });
+      if (r?.url) {
+        const live = await validateTicketUrl(r.url);
+        r = live ? { ...r, url: live } : null; // dead/fake page → treat as a miss
+      }
+      ticketLinkCache.set(`agent:${key}`, r);
+      const dest = r?.url ? affiliateUrl(r.url) : base.href;
+      if (r?.url) {
+        setResolved(r);
+        remember(r.url);
+      }
+      if (tab) tab.location = dest; else window.open(dest, '_blank', 'noopener');
+    })()
       .catch(() => { if (tab) tab.location = base.href; })
       .finally(() => setPending(false));
   };
@@ -3336,7 +3410,7 @@ const FeedCard = ({ item, onDelete, saved = false, onToggleSave }) => {
   const { data, type } = item;
   const isInvite = type === 'groupProposal';
   const imageSrc = useEventImage(data);
-  const ticket = useTicketAction(data);
+  const ticket = useTicketAction(data, item.id);
   const [showSend, setShowSend] = useState(false);
   const [sendAnchorRect, setSendAnchorRect] = useState(null);
   const sendBtnRef = useRef(null);
