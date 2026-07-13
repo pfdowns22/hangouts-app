@@ -43,7 +43,7 @@ import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 
 import { createPortal } from 'react-dom';
 
-import { auth, db, storage, appId, geminiApiKey } from './firebase.js';
+import { auth, db, storage, appId, geminiApiKey, firebaseConfig } from './firebase.js';
 import { fetchRealEvents, verifyVenue, resolveTicketLink, fetchUrlMeta } from './events.js';
 
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -1252,12 +1252,13 @@ const sendProposalEmails = async (group, eventTitle, proposerName, selfId) => {
         })
       )
     ).filter((e) => /\S+@\S+\.\S+/.test(e));
-    if (!emails.length) return;
+    // Push works even when no one has an email on file, so don't bail early.
     await fetch('/api/notify-proposal', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         emails,
+        memberIds: ids,
         proposerName,
         eventTitle,
         groupName: group.name,
@@ -1625,6 +1626,47 @@ const SettingsSection = ({ onClose }) => {
   const [isSaving, setIsSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
+  // --- Push notifications (web push via FCM) -----------------------------
+  // Requires VITE_FCM_VAPID_KEY (Firebase console → Cloud Messaging → Web
+  // Push certificates) — without it the card explains push isn't set up yet.
+  // iOS Safari only supports web push for installed PWAs; the native app
+  // gets real push via APNs later (see APPSTORE.md).
+  const [pushBusy, setPushBusy] = useState(false);
+  const pushSupported = typeof window !== 'undefined' && 'Notification' in window && 'serviceWorker' in navigator;
+  const pushEnabled = pushSupported && Notification.permission === 'granted' && (userProfile?.fcmTokens || []).length > 0;
+  const vapidKey = import.meta.env.VITE_FCM_VAPID_KEY || '';
+
+  const enablePush = async () => {
+    if (!pushSupported) return;
+    if (!vapidKey) {
+      showGlobalMessage('Push isn’t configured yet (missing VAPID key).', 'error');
+      return;
+    }
+    setPushBusy(true);
+    try {
+      const perm = await Notification.requestPermission();
+      if (perm !== 'granted') {
+        showGlobalMessage('Notifications stay off until you allow them in the browser prompt.', 'error');
+        return;
+      }
+      const cfgQs = new URLSearchParams(
+        Object.entries(firebaseConfig).filter(([, v]) => v)
+      ).toString();
+      const reg = await navigator.serviceWorker.register(`/firebase-messaging-sw.js?${cfgQs}`);
+      const { getMessaging, getToken } = await import('firebase/messaging');
+      const token = await getToken(getMessaging(), { vapidKey, serviceWorkerRegistration: reg });
+      if (!token) throw new Error('No token returned');
+      await updateDoc(doc(db, `artifacts/${appId}/users/${userId}/profiles`, 'myProfile'), { fcmTokens: arrayUnion(token) });
+      setUserProfile((prev) => ({ ...prev, fcmTokens: [...new Set([...(prev?.fcmTokens || []), token])] }));
+      showGlobalMessage('Notifications on! You’ll hear when your groups make plans.');
+    } catch (e) {
+      console.error('Enable push failed:', e);
+      showGlobalMessage('Could not enable notifications on this device.', 'error');
+    } finally {
+      setPushBusy(false);
+    }
+  };
+
   // Full account deletion — an Apple App Store review requirement, and the
   // right thing regardless. Removes the user's own data (profile, feed,
   // saved, plans) then the Auth user itself. Group content they posted is
@@ -1699,6 +1741,30 @@ const SettingsSection = ({ onClose }) => {
         <button onClick={handleSave} disabled={isSaving} className="bg-indigo-600 text-white font-medium py-2 px-6 rounded-xl hover:bg-indigo-700 transition">
           {isSaving ? 'Saving...' : 'Save Changes'}
         </button>
+      </div>
+
+      <div className="p-4 bg-gray-50 rounded-xl">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h4 className="text-sm font-bold text-ink">Notifications</h4>
+            <p className="text-xs text-ink-soft mt-0.5">
+              {pushEnabled
+                ? '✓ On for this device — you’ll hear when your groups propose plans.'
+                : pushSupported
+                  ? 'Get a ping when your groups propose events or RSVP.'
+                  : 'Not supported in this browser. On iPhone, add Hangouts to your Home Screen first (Share → Add to Home Screen).'}
+            </p>
+          </div>
+          {pushSupported && !pushEnabled && (
+            <button
+              onClick={enablePush}
+              disabled={pushBusy}
+              className="shrink-0 text-sm font-semibold bg-brand-600 text-white px-4 py-2 rounded-xl hover:bg-brand-700 transition disabled:opacity-50"
+            >
+              {pushBusy ? 'Enabling…' : 'Enable'}
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="border border-red-200 bg-red-50 rounded-xl p-4">

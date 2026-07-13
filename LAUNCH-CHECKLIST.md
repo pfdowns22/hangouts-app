@@ -1,5 +1,16 @@
 # Launch checklist — sign-in & mobile release
 
+## Push notifications (added with the web-push foundation)
+- [ ] Firebase Console → Project settings → **Cloud Messaging** → Web Push
+      certificates → **Generate key pair** → copy the public key.
+- [ ] Vercel → env var **`VITE_FCM_VAPID_KEY`** = that public key → redeploy.
+      Until set, the Settings "Enable notifications" button explains push
+      isn't configured (nothing breaks).
+- [ ] Optional env **`AI_GLOBAL_DAILY_CAP`** / **`AI_GLOBAL_GROUNDED_CAP`**
+      to tune the global AI budget breaker (defaults 1500 / 300 per day).
+- Note: iOS Safari delivers web push only for Home-Screen-installed PWAs;
+      full iOS push arrives with the native app (see APPSTORE.md).
+
 ## 0. Engine upgrades (added with the discovery-engine build)
 - [ ] **Publish the updated `firestore.rules`** (Firebase Console → Firestore →
       Rules → paste + Publish). Adds the `eventPool` block — until published,
