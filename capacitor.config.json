@@ -1,0 +1,11 @@
+{
+  "appId": "com.hangouts.app",
+  "appName": "Hangouts",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https"
+  },
+  "ios": {
+    "contentInset": "automatic"
+  }
+}

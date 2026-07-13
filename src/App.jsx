@@ -1623,6 +1623,45 @@ const SettingsSection = ({ onClose }) => {
   const { userId, userProfile, setUserProfile, showGlobalMessage } = useContext(AppContext);
   const [allowLocation, setAllowLocation] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+
+  // Full account deletion — an Apple App Store review requirement, and the
+  // right thing regardless. Removes the user's own data (profile, feed,
+  // saved, plans) then the Auth user itself. Group content they posted is
+  // left in place (it belongs to the group's shared history).
+  const handleDeleteAccount = async () => {
+    if (!window.confirm('Delete your account? This permanently removes your profile, feed, and saved events. This cannot be undone.')) return;
+    if (!window.confirm('Really delete everything? Last chance.')) return;
+    setDeleting(true);
+    try {
+      for (const coll of ['feed', 'saved', 'plans', 'profiles']) {
+        try {
+          const snap = await getDocs(collection(db, `artifacts/${appId}/users/${userId}/${coll}`));
+          const docs = snap.docs;
+          for (let i = 0; i < docs.length; i += 400) {
+            const batch = writeBatch(db);
+            docs.slice(i, i + 400).forEach((d) => batch.delete(d.ref));
+            await batch.commit();
+          }
+        } catch (e) {
+          console.warn(`Cleanup of ${coll} failed (continuing):`, e);
+        }
+      }
+      const { deleteUser } = await import('firebase/auth');
+      await deleteUser(auth.currentUser);
+      // onAuthStateChanged drops the app back to the sign-in screen.
+    } catch (e) {
+      console.error('Account deletion failed:', e);
+      showGlobalMessage(
+        e?.code === 'auth/requires-recent-login'
+          ? 'For security, please sign out, sign back in, and delete your account right away.'
+          : 'Could not delete your account. Please try again.',
+        'error'
+      );
+    } finally {
+      setDeleting(false);
+    }
+  };
 
   useEffect(() => {
     if (userProfile) setAllowLocation(userProfile.allowLocationTracking || false);
@@ -1659,6 +1698,20 @@ const SettingsSection = ({ onClose }) => {
       <div className="flex justify-end">
         <button onClick={handleSave} disabled={isSaving} className="bg-indigo-600 text-white font-medium py-2 px-6 rounded-xl hover:bg-indigo-700 transition">
           {isSaving ? 'Saving...' : 'Save Changes'}
+        </button>
+      </div>
+
+      <div className="border border-red-200 bg-red-50 rounded-xl p-4">
+        <h4 className="text-sm font-bold text-red-800">Danger zone</h4>
+        <p className="text-xs text-red-700 mt-1 leading-relaxed">
+          Permanently delete your account, profile, feed, and saved events. This cannot be undone.
+        </p>
+        <button
+          onClick={handleDeleteAccount}
+          disabled={deleting}
+          className="mt-3 text-sm font-semibold text-red-700 bg-white border border-red-300 px-4 py-2 rounded-xl hover:bg-red-100 transition disabled:opacity-50"
+        >
+          {deleting ? 'Deleting…' : 'Delete my account'}
         </button>
       </div>
     </div>
