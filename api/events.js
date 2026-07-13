@@ -20,6 +20,16 @@ const tierFromPrice = (min) => {
   return '$$$$';
 };
 
+// Junk-title guard: civic feeds and scrapes sometimes emit status strings
+// ("Closed", "Cancelled") or placeholder rows as event titles. One of these
+// reached production feeds as a card literally titled "closed" — and the
+// client's shared event pool then caches junk for everyone nearby.
+const JUNK_TITLE = /^(closed|open|cancell?ed|postponed|private( event)?|tbd|tba|n\/?a|none|test|untitled)$/i;
+const isJunkTitle = (t) => {
+  const s = (t || '').trim();
+  return s.length < 4 || JUNK_TITLE.test(s);
+};
+
 // Normalize any provider's raw category text into one filterable type from a
 // fixed set, so the client's "filter by type" control is consistent across
 // sources. Keep this list in sync with EVENT_TYPES on the client.
@@ -655,7 +665,7 @@ export default async function handler(req, res) {
   settled.forEach((r, i) => {
     const id = enabled[i].id;
     if (r.status === 'fulfilled') {
-      const list = (r.value || []).filter((e) => e.title && e.date);
+      const list = (r.value || []).filter((e) => e.title && e.date && !isJunkTitle(e.title));
       sources[id] = list.length;
       all = all.concat(list);
     } else {

@@ -930,12 +930,22 @@ const normalizeTitle = (title) =>
     .replace(/\s+/g, ' ')
     .trim();
 
+// Junk-title guard (mirrors the API-side check): status strings and
+// placeholders from civic feeds/scrapes must never render as event cards —
+// and because pool docs can't be deleted by clients, the READ path has to
+// filter out anything junk that was cached before the API-side guard landed.
+const JUNK_EVENT_TITLE = /^(closed|open|cancell?ed|postponed|private( event)?|tbd|tba|n\/?a|none|test|untitled)$/i;
+const isJunkEventTitle = (t) => {
+  const s = (t || '').trim();
+  return s.length < 4 || JUNK_EVENT_TITLE.test(s);
+};
+
 // Merge several event lists, collapsing duplicates by normalized title (ignoring
 // date) so the same event/series surfaces once, even across providers and dates.
 const mergeEvents = (...lists) => {
   const seen = new Map();
   for (const ev of [].concat(...lists)) {
-    if (!ev?.title) continue;
+    if (!ev?.title || isJunkEventTitle(ev.title)) continue;
     const key = normalizeTitle(ev.title) || (ev.title || '').toLowerCase();
     if (!seen.has(key)) seen.set(key, ev);
   }
@@ -1020,6 +1030,7 @@ const fetchPoolEvents = async ({ geo, forToday, excludeTitleKeys = new Set(), ma
       const day = e.poolDay || String(e.date || '').slice(0, 10);
       const inFrame = forToday ? day === today : day > today && day <= horizon;
       if (!inFrame) continue;
+      if (isJunkEventTitle(e.title)) continue; // pool may hold pre-guard junk; clients can't delete it
       if (excludeTitleKeys.has(normalizeTitle(e.title))) continue;
       const { poolGeo: _g, poolDay: _d, pooledAt: _t, ...event } = e;
       picks.push(event);
@@ -1051,7 +1062,7 @@ const rankAndPersonalizeEvents = async ({ events, contextText, provider, max = 6
   }));
   const prompt = `${contextText}
 
-Below is a JSON array of REAL events (already verified via partner APIs). Choose the ${max} best matches, ordered best first, and for each write a warm, specific 1-2 sentence description of why it fits. Do NOT invent events and do NOT change any field other than the description.
+Below is a JSON array of REAL events (already verified via partner APIs). Choose the ${max} best matches, ordered best first, and for each write a warm, specific 1-2 sentence description of why it fits. Weigh BOTH interest fit and time fit — when availability is given above, an event during the person's free times beats an equally interesting one when they're busy. Do NOT invent events and do NOT change any field other than the description.
 
 Return ONLY a JSON array of objects: {"i": <original index>, "description": "<personalized blurb>"}. Include only the events you selected.
 
@@ -2483,7 +2494,10 @@ const MyFeedSection = () => {
       }
     };
     const matchesType = (item) => typeFilter === 'all' || (item.data?.type || 'Other') === typeFilter;
-    const arr = feedItems.filter((it) => inTab(it) && matchesFilter(it) && matchesType(it));
+    // Hide junk-titled event docs already persisted before the guards landed.
+    const notJunk = (item) =>
+      !(item.type === 'personalSuggestion' || item.type === 'groupProposal') || !isJunkEventTitle(item.data?.title);
+    const arr = feedItems.filter((it) => inTab(it) && notJunk(it) && matchesFilter(it) && matchesType(it));
     if (sortMode === 'feed') return arr;
     const sorted = [...arr];
     const dateOf = (it) => new Date(it.data?.date || 0).getTime() || 0;
@@ -2915,7 +2929,9 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
           borough: nycBorough(home) || nycBorough(current),
         });
         if (!raw.length) return [];
-        const ctx = `Recommend events for someone interested in: ${prefs}. Home area: ${home}. ${kidsText}.`;
+        // Give the ranker the person's time availability too — otherwise
+        // partner events get ordered with no idea when they're actually free.
+        const ctx = `Recommend events for someone interested in: ${prefs}. Home area: ${home}. ${kidsText}. Usually free (day=times): ${weeklyStr}. Prefer events whose date/time falls in those free times${savedTitles.length ? `; they recently saved: ${savedTitles.slice(-4).join(' | ')}` : ''}.`;
         return rankAndPersonalizeEvents({ events: raw, contextText: ctx, provider, max: 6 });
       })();
 
@@ -4361,7 +4377,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
           size: 12,
         });
         if (!raw.length) return [];
-        const ctx = `Recommend events for a group of ${memberProfiles.length} friends ("${group.name}") interested in: ${allPrefs.length ? allPrefs.join(', ') : 'general fun'}. Anchor location: ${loc}.`;
+        const ctx = `Recommend events for a group of ${memberProfiles.length} friends ("${group.name}") interested in: ${allPrefs.length ? allPrefs.join(', ') : 'general fun'}. Anchor location: ${loc}.${memberWeekly.length ? ` Members usually free: ${memberWeekly.map((m) => `${m.name} ${m.entries.join(',')}`).join(' | ')}. Prefer events at overlapping free times.` : ''}`;
         return rankAndPersonalizeEvents({ events: raw, contextText: ctx, provider, max: 6 });
       })();
 
