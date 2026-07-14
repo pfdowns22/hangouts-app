@@ -703,20 +703,16 @@ const useTicketAction = (event, feedId = null) => {
   if (resolved?.url) return { href: affiliateUrl(resolved.url), label: '🎟️ Buy Tickets' };
   if (!needsResolve) return base;
 
-  // No direct link yet: on click, the grounded agent hunts for the exact
-  // purchase page (result liveness-validated too). A tab opens synchronously
-  // so the post-await navigation isn't popup-blocked; it lands on the agent's
-  // page or, failing everything, the targeted web search.
-  const onClick = (e) => {
+  // No direct link yet: the click NAVIGATES IMMEDIATELY to the targeted
+  // ticket search (never a blank tab — the old flow parked users on
+  // about:blank for the 20s the grounded agent needed, which read as
+  // "tickets are broken"). The agent runs in the background and, when it
+  // finds a validated purchase page, upgrades this card to one-click Buy
+  // Tickets for every future render (and caches it for other users).
+  const onClick = () => {
     trackAffiliateClick('tickets', base.href);
-    if (pending) { e.preventDefault(); return; }
-    if (ticketLinkCache.has(`agent:${key}`)) {
-      const hit = ticketLinkCache.get(`agent:${key}`);
-      if (hit?.url) { e.preventDefault(); window.open(affiliateUrl(hit.url), '_blank', 'noopener'); }
-      return; // null hit → let the anchor open the search fallback
-    }
-    e.preventDefault();
-    const tab = window.open('about:blank', '_blank');
+    // Let the anchor navigate naturally; kick off the background upgrade once.
+    if (pending || ticketLinkCache.has(`agent:${key}`)) return;
     setPending(true);
     (async () => {
       let r = await agentFindTicketUrl({ title: event.title, location: event.location, date: event.date });
@@ -725,17 +721,47 @@ const useTicketAction = (event, feedId = null) => {
         r = live ? { ...r, url: live } : null; // dead/fake page → treat as a miss
       }
       ticketLinkCache.set(`agent:${key}`, r);
-      const dest = r?.url ? affiliateUrl(r.url) : base.href;
       if (r?.url) {
-        setResolved(r);
-        remember(r.url);
+        setResolved(r); // button flips to Buy Tickets
+        remember(r.url); // feed doc + pool: one-click for everyone next time
       }
-      if (tab) tab.location = dest; else window.open(dest, '_blank', 'noopener');
     })()
-      .catch(() => { if (tab) tab.location = base.href; })
+      .catch(() => {})
       .finally(() => setPending(false));
   };
-  return { href: base.href, label: pending ? '🎟️ Finding…' : '🎟️ Find Tickets', onClick };
+  return { href: base.href, label: '🎟️ Find Tickets', onClick };
+};
+
+// "More info" with live upgrade: starts at the safe moreInfoUrl (trusted
+// direct link or targeted search), then — when the event carries an
+// unverified URL — probes it through the meta proxy and upgrades the button
+// to the REAL page once it's confirmed alive. Login-walled social hosts are
+// skipped (a search result beats a Facebook login wall).
+const moreInfoLiveCache = new Map(); // url -> validated url | null
+const useMoreInfoHref = (event) => {
+  const [upgraded, setUpgraded] = useState(null);
+  const candidate = (() => {
+    if (TRUSTED_URL_SOURCES.has(event?.source)) return null; // already direct
+    const u = validHttpUrl(event?.url);
+    if (!u) return null;
+    try {
+      if (NON_SELLER_HOSTS.test(new URL(u).hostname.replace(/^www\./, ''))) return null;
+    } catch { return null; }
+    return u;
+  })();
+  useEffect(() => {
+    setUpgraded(null);
+    if (!candidate) return;
+    if (moreInfoLiveCache.has(candidate)) { setUpgraded(moreInfoLiveCache.get(candidate)); return; }
+    let cancelled = false;
+    fetchUrlMeta(candidate).then((m) => {
+      const ok = m?.alive === true ? candidate : null;
+      moreInfoLiveCache.set(candidate, ok);
+      if (!cancelled) setUpgraded(ok);
+    });
+    return () => { cancelled = true; };
+  }, [candidate]);
+  return upgraded ? affiliateUrl(upgraded) : moreInfoUrl(event);
 };
 
 // A best-effort destination string for maps/ride deep-links. Events only persist
@@ -1446,18 +1472,18 @@ const UserProfileDropdown = () => {
 
   return (
     <div className="relative" ref={dropdownRef}>
-      <button onClick={() => setIsOpen(!isOpen)} aria-label="Account menu" className="flex items-center p-0.5 rounded-full hover:bg-gray-100 active:scale-95 transition-all">
-        <Avatar src={userProfile?.photoURL} alt={userProfile?.name} size="sm" />
+      {/* The bottom nav already owns "Profile" — this is the app MENU
+          (settings/about/sign-out), so it reads as a menu, not a second
+          profile button. */}
+      <button onClick={() => setIsOpen(!isOpen)} aria-label="Menu" className="p-2 rounded-full text-ink-soft hover:text-ink hover:bg-gray-100 active:scale-95 transition-all">
+        <MenuIcon />
       </button>
       {isOpen && (
         <div className="absolute right-0 mt-2 w-64 bg-white rounded-xl shadow-xl py-2 z-40 border border-line overflow-hidden">
           <div className="px-4 py-3 border-b border-gray-100 bg-gray-50/50">
             <p className="text-sm font-bold text-gray-900">{userProfile?.name || 'User'}</p>
-            <p className="text-xs text-gray-500 truncate">{userId}</p>
+            <p className="text-xs text-gray-500 truncate">{userProfile?.email || ''}</p>
           </div>
-          <button onClick={() => { setShowProfileModal(true); setIsOpen(false); }} className="flex w-full items-center gap-3 px-4 py-3 text-sm text-gray-700 hover:bg-indigo-50 transition-colors">
-            <UserIcon /> My Profile
-          </button>
           <button onClick={() => { setShowSettingsModal(true); setIsOpen(false); }} className="flex w-full items-center gap-3 px-4 py-3 text-sm text-gray-700 hover:bg-indigo-50 transition-colors">
             <SettingsIcon /> Settings
           </button>
@@ -1822,7 +1848,6 @@ const ProfileSection = ({ onClose }) => {
   const [editInterests, setEditInterests] = useState(false); // interests picker collapsed to a summary by default
   const [currentLocation, setCurrentLocation] = useState(userProfile?.currentLocation || null);
   const [locationPreference, setLocationPreference] = useState(userProfile?.locationPreference || 'home');
-  const [mobility, setMobility] = useState(userProfile?.mobility || 'auto'); // auto|dense|standard|spread
   const [locatingNow, setLocatingNow] = useState(false);
   // AI provider preference + user-supplied key. Provider syncs to profile;
   // the key lives only in localStorage so it never leaves the device.
@@ -1958,7 +1983,6 @@ const ProfileSection = ({ onClose }) => {
         freeSlots,
         currentLocation,
         locationPreference,
-        mobility,
         aiProvider,
         // Mark profile as completed (used by the onboarding banner).
         profileCompletedAt: serverTimestamp(),
@@ -2382,36 +2406,6 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with shape:
         </div>
       </div>
 
-      <div className="space-y-2">
-        <h3 className="font-bold text-ink">How far will you usually go?</h3>
-        <p className="text-xs text-ink-soft">
-          "Far" is different in Manhattan and in Louisville. Auto reads it from your home base
-          {mobility === 'auto' ? ` (currently: ${{ dense: 'walkable city', standard: 'my city', spread: 'whole region' }[deriveMobility(address)]})` : ''}.
-        </p>
-        <div className="flex flex-wrap gap-2">
-          {[
-            { id: 'auto', label: 'Auto' },
-            { id: 'dense', label: 'Walkable / transit' },
-            { id: 'standard', label: 'My city' },
-            { id: 'spread', label: 'Whole region' },
-          ].map((opt) => {
-            const on = mobility === opt.id;
-            return (
-              <button
-                key={opt.id}
-                type="button"
-                onClick={() => setMobility(opt.id)}
-                className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition ${
-                  on ? 'bg-brand-600 text-white border-brand-600' : 'bg-white text-ink-soft border-line hover:border-brand-500'
-                }`}
-              >
-                {opt.label}
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
       {/* Connect a real calendar: the precision upgrade over the weekly grid.
           Google works today (incremental OAuth → Gemini finds free blocks).
           Apple has no web API — it lands with the native iOS app. */}
@@ -2700,9 +2694,23 @@ const eventDateBucket = (item) => {
 };
 
 const MyFeedSection = () => {
-  const { userId, userProfile, showGlobalMessage, setShowProfileModal, feedRefreshTick } = useContext(AppContext);
+  const { userId, userProfile, setUserProfile, showGlobalMessage, setShowProfileModal, feedRefreshTick } = useContext(AppContext);
   const [feedItems, setFeedItems] = useState([]);
   const [feedLoaded, setFeedLoaded] = useState(false); // first snapshot landed
+
+  // Distance preference lives in the filter panel (it shapes what the feed
+  // finds); persisted on the profile so every surface (feed, Explore,
+  // groups) shares it. 'auto' derives from the home base.
+  const saveMobility = async (m) => {
+    try {
+      await updateDoc(doc(db, `artifacts/${appId}/users/${userId}/profiles`, 'myProfile'), { mobility: m });
+      setUserProfile((prev) => ({ ...prev, mobility: m }));
+      showGlobalMessage('Distance preference saved — new searches use it.');
+    } catch (e) {
+      console.error(e);
+      showGlobalMessage('Could not save distance preference.', 'error');
+    }
+  };
   const [isGenerating, setIsGenerating] = useState(false);
   const [patienceIdx, setPatienceIdx] = useState(0);
   const autoRunRef = useRef(false); // one auto-populate/stale-refresh per session
@@ -2752,7 +2760,11 @@ const MyFeedSection = () => {
     let right = vw - filterAnchorRect.right;
     right = Math.min(right, vw - width - 16);
     right = Math.max(16, right);
-    return { top: `${top}px`, right: `${right}px`, width: `${width}px`, maxHeight: `${vh - 32}px` };
+    // maxHeight must account for where the panel actually STARTS — a panel
+    // opened low on a desktop window otherwise extends past the viewport
+    // bottom with its own scroll area unreachable (the fixed backdrop blocks
+    // page scroll), which read as "the filter is stuck".
+    return { top: `${top}px`, right: `${right}px`, width: `${width}px`, maxHeight: `${Math.max(240, vh - top - 16)}px` };
   }, [filterAnchorRect]);
   const sentinelRef = useRef(null);
   const generatingRef = useRef(false);
@@ -3519,7 +3531,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
           )}
         </div>
       )}
-      {showFilterPanel && (
+      {showFilterPanel && createPortal(
         <div className="fixed inset-0 z-50" onClick={() => setShowFilterPanel(false)}>
           <div
             className="absolute bg-white rounded-2xl shadow-2xl border border-gray-200 overflow-y-auto"
@@ -3533,6 +3545,31 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
               </button>
             </header>
             <div className="p-4 space-y-6">
+              <section>
+                <h4 className="text-xs font-bold uppercase text-gray-500 mb-2">Distance</h4>
+                <p className="text-[11px] text-ink-faint mb-2 -mt-1">How far you'll go. Auto reads it from your home base{(userProfile?.mobility || 'auto') === 'auto' ? ` (now: ${{ dense: 'walkable city', standard: 'my city', spread: 'whole region' }[effectiveMobility(userProfile)]})` : ''}.</p>
+                <div className="flex flex-wrap gap-2">
+                  {[
+                    { id: 'auto', label: 'Auto' },
+                    { id: 'dense', label: 'Walkable' },
+                    { id: 'standard', label: 'My city' },
+                    { id: 'spread', label: 'Whole region' },
+                  ].map((opt) => {
+                    const on = (userProfile?.mobility || 'auto') === opt.id;
+                    return (
+                      <button
+                        key={opt.id}
+                        onClick={() => saveMobility(opt.id)}
+                        className={`px-3.5 py-1.5 rounded-full text-sm font-semibold border transition ${
+                          on ? 'bg-brand-600 text-white border-brand-600' : 'bg-white text-gray-600 border-gray-200 hover:border-brand-500'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </section>
               <section>
                 <h4 className="text-xs font-bold uppercase text-gray-500 mb-2">Filter by</h4>
                 <div className="flex flex-wrap gap-2">
@@ -3638,7 +3675,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
             </div>
           </div>
         </div>
-      )}
+      , document.body)}
     </div>
   );
 };
@@ -3649,6 +3686,7 @@ const FeedCard = ({ item, onDelete, saved = false, onToggleSave }) => {
   const isInvite = type === 'groupProposal';
   const imageSrc = useEventImage(data);
   const ticket = useTicketAction(data, item.id);
+  const moreInfoHref = useMoreInfoHref(data);
   const [showSend, setShowSend] = useState(false);
   const [sendAnchorRect, setSendAnchorRect] = useState(null);
   const sendBtnRef = useRef(null);
@@ -3787,7 +3825,7 @@ const FeedCard = ({ item, onDelete, saved = false, onToggleSave }) => {
             </a>
           ) : (
             <a
-              href={moreInfoUrl(data)}
+              href={moreInfoHref}
               target="_blank"
               rel="noopener noreferrer"
               className="flex-1 text-center text-sm font-semibold text-ink bg-gray-100 hover:bg-gray-200 py-2.5 rounded-xl transition flex items-center justify-center gap-1.5"
@@ -3821,7 +3859,7 @@ const FeedCard = ({ item, onDelete, saved = false, onToggleSave }) => {
           })()}
           {ticket && (
             <a
-              href={moreInfoUrl(data)}
+              href={moreInfoHref}
               target="_blank"
               rel="noopener noreferrer"
               className="w-11 flex items-center justify-center text-ink-soft bg-gray-100 hover:bg-gray-200 rounded-xl transition"
@@ -4198,6 +4236,7 @@ const GroupProposals = ({ groupId }) => {
 
 const ProposalCard = ({ proposal, groupId }) => {
   const { userId, showGlobalMessage } = useContext(AppContext);
+  const moreInfoHref = useMoreInfoHref(proposal);
   const [updating, setUpdating] = useState(false);
   const rsvps = proposal.rsvps || {};
   const myRsvp = rsvps[userId];
@@ -4275,7 +4314,7 @@ const ProposalCard = ({ proposal, groupId }) => {
             </button>
           </div>
           <a
-            href={moreInfoUrl(proposal)}
+            href={moreInfoHref}
             target="_blank"
             rel="noopener noreferrer"
             className="text-center text-xs font-bold text-blue-600 bg-blue-50 hover:bg-blue-100 py-2 rounded-lg transition"
@@ -4985,6 +5024,7 @@ const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage,
   const { setGoogleAccessToken } = useContext(AppContext);
   const imageSrc = useEventImage(idea);
   const ticket = useTicketAction(idea);
+  const moreInfoHref = useMoreInfoHref(idea);
   return (
     <div className="bg-white rounded-2xl border border-line overflow-hidden flex flex-col">
       {/* Full-bleed hero with scrim-overlaid title, matching FeedCard. */}
@@ -5051,7 +5091,7 @@ const SuggestionCard = ({ idea, onPropose, googleAccessToken, showGlobalMessage,
             </a>
           )}
           <a
-            href={moreInfoUrl(idea)}
+            href={moreInfoHref}
             target="_blank"
             rel="noopener noreferrer"
             className="w-11 flex items-center justify-center text-ink-soft bg-gray-100 hover:bg-gray-200 rounded-xl transition"
