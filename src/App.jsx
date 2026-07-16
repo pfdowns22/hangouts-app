@@ -1848,6 +1848,8 @@ const ProfileSection = ({ onClose }) => {
   const [editInterests, setEditInterests] = useState(false); // interests picker collapsed to a summary by default
   const [currentLocation, setCurrentLocation] = useState(userProfile?.currentLocation || null);
   const [locationPreference, setLocationPreference] = useState(userProfile?.locationPreference || 'home');
+  const [travelMode, setTravelMode] = useState(userProfile?.travelMode || 'auto'); // auto|walk|transit|drive
+  const [travelMinutes, setTravelMinutes] = useState(userProfile?.travelMinutes || 30); // 15|30|45
   const [locatingNow, setLocatingNow] = useState(false);
   // AI provider preference + user-supplied key. Provider syncs to profile;
   // the key lives only in localStorage so it never leaves the device.
@@ -1955,6 +1957,20 @@ const ProfileSection = ({ onClose }) => {
   const handleSaveProfile = async () => {
     setIsSaving(true);
     try {
+      // Geocode the home base (keyless Nominatim) so the distance filter and
+      // per-card travel hints have an origin even without a captured current
+      // location. Best-effort: failures just leave homeLat/homeLng as-is.
+      let homeGeo = {};
+      const addressChanged = address.trim() && address.trim() !== (userProfile?.address || '').trim();
+      if (address.trim() && (addressChanged || !Number.isFinite(userProfile?.homeLat))) {
+        try {
+          const res = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address.trim())}&format=json&limit=1`);
+          const hit = (await res.json())?.[0];
+          if (hit) homeGeo = { homeLat: parseFloat(hit.lat), homeLng: parseFloat(hit.lon) };
+        } catch {
+          /* keep previous coords */
+        }
+      }
       // Derive legacy timeOfDayPrefs / dayOfWeekPrefs from the new
       // weeklyAvailability matrix so any older code paths (and the
       // group-suggestion fallback prompt) keep working.
@@ -1983,6 +1999,9 @@ const ProfileSection = ({ onClose }) => {
         freeSlots,
         currentLocation,
         locationPreference,
+        travelMode,
+        travelMinutes,
+        ...homeGeo,
         aiProvider,
         // Mark profile as completed (used by the onboarding banner).
         profileCompletedAt: serverTimestamp(),
@@ -2406,6 +2425,52 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with shape:
         </div>
       </div>
 
+      <div className="space-y-2">
+        <h3 className="font-bold text-ink">How far will you travel?</h3>
+        <p className="text-xs text-ink-soft">
+          Time, not miles — 15 minutes on foot in Manhattan and 15 minutes driving in Kentucky are both "close".
+        </p>
+        <div className="flex flex-wrap gap-2">
+          {[
+            { id: 'auto', label: 'Auto' },
+            { id: 'walk', label: '🚶 Walking' },
+            { id: 'transit', label: '🚇 Transit' },
+            { id: 'drive', label: '🚗 Driving' },
+          ].map((opt) => {
+            const on = travelMode === opt.id;
+            return (
+              <button
+                key={opt.id}
+                type="button"
+                onClick={() => setTravelMode(opt.id)}
+                className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition ${
+                  on ? 'bg-brand-600 text-white border-brand-600' : 'bg-white text-ink-soft border-line hover:border-brand-500'
+                }`}
+              >
+                {opt.label}
+              </button>
+            );
+          })}
+        </div>
+        <div className="flex gap-2">
+          {[15, 30, 45].map((m) => {
+            const on = travelMinutes === m;
+            return (
+              <button
+                key={m}
+                type="button"
+                onClick={() => setTravelMinutes(m)}
+                className={`px-4 py-1.5 rounded-full text-xs font-semibold border transition ${
+                  on ? 'bg-ink text-white border-ink' : 'bg-white text-ink-soft border-line hover:border-ink'
+                }`}
+              >
+                {m} min
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
       {/* Connect a real calendar: the precision upgrade over the weekly grid.
           Google works today (incremental OAuth → Gemini finds free blocks).
           Apple has no web API — it lands with the native iOS app. */}
@@ -2661,6 +2726,65 @@ const mobilityPromptLine = (mobility) =>
       ? 'This person lives in a spread-out region where 30–60 minute drives are completely normal; cast a wide net.'
       : 'Typical city/suburb mobility: nearby first, up to a reasonable drive.';
 
+// --- Travel model: distance measured in MINUTES, not miles. -----------------
+// "15 minutes" means one thing on foot in Manhattan and another behind the
+// wheel in Louisville — so willingness-to-travel is time × mode, converted
+// to an effective radius with mode speeds (transit speed includes waiting).
+const TRAVEL_SPEED_MPH = { walk: 3, transit: 9, drive: 24 };
+const TRAVEL_MODE_LABEL = { walk: 'walking', transit: 'transit', drive: 'driving' };
+const effectiveTravel = (profile) => {
+  const minutes = [15, 30, 45].includes(profile?.travelMinutes) ? profile.travelMinutes : 30;
+  let mode = profile?.travelMode && profile.travelMode !== 'auto' ? profile.travelMode : null;
+  if (!mode) mode = effectiveMobility(profile) === 'dense' ? 'transit' : 'drive';
+  const radiusMiles = Math.round(Math.max(0.75, (TRAVEL_SPEED_MPH[mode] * minutes) / 60) * 10) / 10;
+  return { mode, minutes, radiusMiles };
+};
+// Scroll tiers grow from the comfort radius: comfort → 2x → 4x → 8x (capped).
+const travelScopeTiers = ({ mode, minutes, radiusMiles }) => {
+  const m = TRAVEL_MODE_LABEL[mode];
+  return [
+    { label: `within about ${minutes} minutes ${m} (~${radiusMiles} miles) — their stated comfort range`, radius: `${radiusMiles} miles`, radiusMiles },
+    { label: `a bit beyond their usual range (~${Math.min(120, radiusMiles * 2)} miles)`, radius: `${Math.min(120, radiusMiles * 2)} miles`, radiusMiles: Math.min(120, radiusMiles * 2) },
+    { label: `a stretch trip (~${Math.min(120, radiusMiles * 4)} miles)`, radius: `${Math.min(120, radiusMiles * 4)} miles`, radiusMiles: Math.min(120, radiusMiles * 4) },
+    { label: `special-occasion distance (~${Math.min(120, radiusMiles * 8)} miles)`, radius: `${Math.min(120, radiusMiles * 8)} miles`, radiusMiles: Math.min(120, radiusMiles * 8) },
+  ];
+};
+const travelPromptLine = ({ mode, minutes, radiusMiles }) =>
+  `This person's comfort range is about ${minutes} minutes by ${TRAVEL_MODE_LABEL[mode]} (~${radiusMiles} miles). ${
+    mode === 'walk' || mode === 'transit'
+      ? 'They live a walk/transit life — a few miles IS far; stay hyper-local unless something is truly exceptional.'
+      : 'Driving is normal for them; anything inside that drive time is fair game.'
+  }`;
+// Haversine miles (client-side twin of the server helper) for the distance
+// filter and per-card travel hints. Null-safe → null.
+const milesBetween = (aLat, aLng, bLat, bLng) => {
+  const nums = [aLat, aLng, bLat, bLng].map(Number);
+  if (nums.some((n) => !Number.isFinite(n))) return null;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const [la1, lo1, la2, lo2] = nums;
+  const dLat = toRad(la2 - la1), dLng = toRad(lo2 - lo1);
+  const s = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(la1)) * Math.cos(toRad(la2)) * Math.sin(dLng / 2) ** 2;
+  return 3959 * 2 * Math.asin(Math.min(1, Math.sqrt(s)));
+};
+// The user's own coordinates: captured current location, else the home base
+// geocoded at profile-save time (homeLat/homeLng).
+const userOrigin = (profile) => {
+  const cur = profile?.currentLocation;
+  if ((profile?.locationPreference || 'home') !== 'home' && Number.isFinite(cur?.lat)) return { lat: cur.lat, lng: cur.lng };
+  if (Number.isFinite(profile?.homeLat)) return { lat: profile.homeLat, lng: profile.homeLng };
+  if (Number.isFinite(cur?.lat)) return { lat: cur.lat, lng: cur.lng };
+  return null;
+};
+// Estimated one-way travel minutes to an event, or null when either side
+// lacks coordinates (AI events usually do — they pass filters untouched).
+const travelMinutesTo = (event, profile) => {
+  const o = userOrigin(profile);
+  const mi = o ? milesBetween(o.lat, o.lng, event?.lat, event?.lng) : null;
+  if (mi == null) return null;
+  const { mode } = effectiveTravel(profile);
+  return Math.round((mi / TRAVEL_SPEED_MPH[mode]) * 60);
+};
+
 // Map priceTier strings to a numeric sort weight; events without a tier
 // land at the bottom of price-sorted lists.
 const PRICE_WEIGHT = { Free: 0, '$': 1, '$$': 2, '$$$': 3, '$$$$': 4 };
@@ -2698,19 +2822,6 @@ const MyFeedSection = () => {
   const [feedItems, setFeedItems] = useState([]);
   const [feedLoaded, setFeedLoaded] = useState(false); // first snapshot landed
 
-  // Distance preference lives in the filter panel (it shapes what the feed
-  // finds); persisted on the profile so every surface (feed, Explore,
-  // groups) shares it. 'auto' derives from the home base.
-  const saveMobility = async (m) => {
-    try {
-      await updateDoc(doc(db, `artifacts/${appId}/users/${userId}/profiles`, 'myProfile'), { mobility: m });
-      setUserProfile((prev) => ({ ...prev, mobility: m }));
-      showGlobalMessage('Distance preference saved — new searches use it.');
-    } catch (e) {
-      console.error(e);
-      showGlobalMessage('Could not save distance preference.', 'error');
-    }
-  };
   const [isGenerating, setIsGenerating] = useState(false);
   const [patienceIdx, setPatienceIdx] = useState(0);
   const autoRunRef = useRef(false); // one auto-populate/stale-refresh per session
@@ -2721,13 +2832,14 @@ const MyFeedSection = () => {
   const [feedTab, setFeedTab] = useState('today'); // today | upcoming
   const [filterMode, setFilterMode] = useState('all'); // all | free | cheap | expensive | ticketed
   const [typeFilter, setTypeFilter] = useState('all'); // all | one of EVENT_TYPES
+  const [distFilter, setDistFilter] = useState('any'); // any | '15' | '30' | '45' (max travel minutes)
   const [activePlacements, setActivePlacements] = useState([]); // active-by-date sponsored docs
   const sponsoredSeenRef = useRef(null); // guards one impression count per placement
   const [sortMode, setSortMode] = useState('feed'); // feed | dateAsc | dateDesc | priceAsc | priceDesc
   const [showFilterPanel, setShowFilterPanel] = useState(false);
   const [filterAnchorRect, setFilterAnchorRect] = useState(null);
   const filterBtnRef = useRef(null);
-  const filterActive = filterMode !== 'all' || sortMode !== 'feed' || typeFilter !== 'all';
+  const filterActive = filterMode !== 'all' || sortMode !== 'feed' || typeFilter !== 'all' || distFilter !== 'any';
 
   const openFilterPanel = () => {
     if (filterBtnRef.current) {
@@ -2808,10 +2920,17 @@ const MyFeedSection = () => {
       }
     };
     const matchesType = (item) => typeFilter === 'all' || (item.data?.type || 'Other') === typeFilter;
+    // Travel-time filter: hides events measurably beyond the chosen minutes;
+    // events without coordinates (most AI finds) can't be judged and stay.
+    const matchesDist = (item) => {
+      if (distFilter === 'any') return true;
+      const mins = travelMinutesTo(item.data, userProfile);
+      return mins == null || mins <= Number(distFilter);
+    };
     // Hide junk-titled event docs already persisted before the guards landed.
     const notJunk = (item) =>
       !(item.type === 'personalSuggestion' || item.type === 'groupProposal') || !isJunkEventTitle(item.data?.title);
-    const arr = feedItems.filter((it) => inTab(it) && notJunk(it) && matchesFilter(it) && matchesType(it));
+    const arr = feedItems.filter((it) => inTab(it) && notJunk(it) && matchesFilter(it) && matchesType(it) && matchesDist(it));
     if (sortMode === 'feed') return arr;
     const sorted = [...arr];
     const dateOf = (it) => new Date(it.data?.date || 0).getTime() || 0;
@@ -2820,7 +2939,7 @@ const MyFeedSection = () => {
     if (sortMode === 'priceAsc') sorted.sort((a, b) => priceWeight(a.data?.priceTier) - priceWeight(b.data?.priceTier));
     if (sortMode === 'priceDesc') sorted.sort((a, b) => priceWeight(b.data?.priceTier) - priceWeight(a.data?.priceTier));
     return sorted;
-  }, [feedItems, filterMode, sortMode, typeFilter, feedTab]);
+  }, [feedItems, filterMode, sortMode, typeFilter, distFilter, userProfile, feedTab]);
 
   // Distinct event types present in the active tab — drives the type filter
   // chips so we only offer types that actually have results.
@@ -3051,8 +3170,8 @@ const MyFeedSection = () => {
     // Scroll-triggered generation expands to the next scope tier so we
     // surface fresh content instead of repeating local venues. Tier radii
     // scale to the user's mobility (dense city vs. spread-out region).
-    const mobility = effectiveMobility(userProfile);
-    const tiers = scopeTiersFor(mobility);
+    const travel = effectiveTravel(userProfile);
+    const tiers = travelScopeTiers(travel);
     if (!fromScroll) scopeRef.current = 0;
     else scopeRef.current = Math.min(scopeRef.current + 1, tiers.length - 1);
     const scope = tiers[scopeRef.current];
@@ -3182,7 +3301,7 @@ ${budgetLine ? `- Budget: ${budgetLine}. Respect this — set each pick's priceT
 
 LOCATION — HARD CONSTRAINT:
 ${locationBlock}
-- ${mobilityPromptLine(mobility)}
+- ${travelPromptLine(travel)}
 - Suggest ONLY things in this neighborhood and immediately adjacent areas within ~${scope.radius}. NEVER suggest another state, a far-away borough, or a different city. If you can't find enough truly local options, return FEWER — do not reach far.
 
 WHAT TO FIND (specific & niche beats generic):
@@ -3547,19 +3666,21 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
             <div className="p-4 space-y-6">
               <section>
                 <h4 className="text-xs font-bold uppercase text-gray-500 mb-2">Distance</h4>
-                <p className="text-[11px] text-ink-faint mb-2 -mt-1">How far you'll go. Auto reads it from your home base{(userProfile?.mobility || 'auto') === 'auto' ? ` (now: ${{ dense: 'walkable city', standard: 'my city', spread: 'whole region' }[effectiveMobility(userProfile)]})` : ''}.</p>
+                <p className="text-[11px] text-ink-faint mb-2 -mt-1">
+                  Hide events farther than this (by {TRAVEL_MODE_LABEL[effectiveTravel(userProfile).mode]} time). Events we can't locate stay visible.
+                </p>
                 <div className="flex flex-wrap gap-2">
                   {[
-                    { id: 'auto', label: 'Auto' },
-                    { id: 'dense', label: 'Walkable' },
-                    { id: 'standard', label: 'My city' },
-                    { id: 'spread', label: 'Whole region' },
+                    { id: 'any', label: 'Any distance' },
+                    { id: '15', label: '≤ 15 min' },
+                    { id: '30', label: '≤ 30 min' },
+                    { id: '45', label: '≤ 45 min' },
                   ].map((opt) => {
-                    const on = (userProfile?.mobility || 'auto') === opt.id;
+                    const on = distFilter === opt.id;
                     return (
                       <button
                         key={opt.id}
-                        onClick={() => saveMobility(opt.id)}
+                        onClick={() => setDistFilter(opt.id)}
                         className={`px-3.5 py-1.5 rounded-full text-sm font-semibold border transition ${
                           on ? 'bg-brand-600 text-white border-brand-600' : 'bg-white text-gray-600 border-gray-200 hover:border-brand-500'
                         }`}
@@ -3791,6 +3912,17 @@ const FeedCard = ({ item, onDelete, saved = false, onToggleSave }) => {
         <p className="text-ink-soft text-sm leading-relaxed">{data.description}</p>
         {(data.priceTier || data.isTicketed || SOURCE_LABELS[data.source] || (data.type && data.type !== 'Other')) && (
           <div className="flex items-center gap-2 flex-wrap mt-3">
+            {(() => {
+              // "~12 min 🚇" chip when both sides have coordinates.
+              const mins = travelMinutesTo(data, userProfile);
+              if (mins == null) return null;
+              const icon = { walk: '🚶', transit: '🚇', drive: '🚗' }[effectiveTravel(userProfile).mode];
+              return (
+                <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-700 text-xs font-medium">
+                  {icon} ~{mins} min
+                </span>
+              );
+            })()}
             <TypeBadge type={data.type} />
             <PriceTierBadge tier={data.priceTier} />
             <TicketedBadge isTicketed={data.isTicketed} />
@@ -3800,6 +3932,35 @@ const FeedCard = ({ item, onDelete, saved = false, onToggleSave }) => {
         )}
 
         <div className="mt-4 flex gap-2 items-stretch">
+          {isEvent && (
+            <button
+              onClick={async () => {
+                // Share a deep link that opens THIS event for the recipient
+                // (served from the shared pool — seed it first so the link
+                // resolves even for AI-found events).
+                try {
+                  const locPref = userProfile?.locationPreference || 'home';
+                  const label = locPref === 'current' && userProfile?.currentLocation?.label ? userProfile.currentLocation.label : userProfile?.address || '';
+                  const geo = poolGeoBucket(label);
+                  if (geo !== 'unknown') writeEventsToPool([data], geo);
+                  const url = `${window.location.origin}/?e=${encodeURIComponent(poolDocId(data, geo))}`;
+                  if (navigator.share) {
+                    await navigator.share({ title: data.title, text: `${data.title} — found this on Hangouts`, url });
+                  } else {
+                    await navigator.clipboard.writeText(url);
+                    showGlobalMessage('Event link copied — send it to a friend!');
+                  }
+                } catch {
+                  /* user cancelled share sheet */
+                }
+              }}
+              className="w-11 flex items-center justify-center rounded-xl text-ink-soft bg-gray-100 hover:bg-gray-200 transition"
+              title="Share this event"
+              aria-label="Share this event"
+            >
+              <ShareIcon className="w-5 h-5" />
+            </button>
+          )}
           {onToggleSave && (
             <button
               onClick={onToggleSave}
@@ -4634,8 +4795,8 @@ const SuggestionSection = () => {
       const loc = userProfile?.address || memberProfiles.find((p) => p.address)?.address || 'New York';
       // Distance sense anchored on the suggester's mobility (groups stretch
       // one tier further than solo browsing).
-      const anchorMobility = effectiveMobility(userProfile);
-      const groupRadius = scopeTiersFor(anchorMobility)[2].radiusMiles;
+      const anchorTravel = effectiveTravel(userProfile);
+      const groupRadius = travelScopeTiers(anchorTravel)[1].radiusMiles;
 
       // Each member's free time blocks (from Gemini calendar analysis),
       // capped to 14 entries each so we don't blow the prompt budget.
@@ -4653,7 +4814,7 @@ const SuggestionSection = () => {
 GROUP CONTEXT:
 - Combined interests across all members: ${allPrefs.length ? allPrefs.join(', ') : 'general fun'}
 - Family situation: ${allKids.length ? `Group includes children ages ${allKids.map((k) => k.age).join(', ')} — prefer family-friendly options.` : 'No children — adult-friendly options are fine.'}
-- Anchor location: ${loc} (events must be within ~${groupRadius} miles of here). ${mobilityPromptLine(anchorMobility)}
+- Anchor location: ${loc} (events must be within ~${groupRadius} miles of here). ${travelPromptLine(anchorTravel)}
 - Preferred times of day (union across members): ${allTimeOfDay.length ? allTimeOfDay.join(', ') : 'any time'}
 - Preferred days of week (union across members): ${allDayOfWeek.length ? allDayOfWeek.join(', ') : 'any day'}
 
@@ -4768,8 +4929,8 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
       const locLabel = locPref === 'current' && current ? current : home;
       const geo = poolGeoBucket(locLabel);
       // Browse radius scales with mobility: tier-1 of the user's scope set.
-      const mobility = effectiveMobility(userProfile);
-      const exploreRadius = scopeTiersFor(mobility)[1].radiusMiles;
+      const travel = effectiveTravel(userProfile);
+      const exploreRadius = travelScopeTiers(travel)[1].radiusMiles;
       const typeOk = (e) => typeSel === 'all' || (e.type || 'Other') === typeSel;
       const whenOk = (e) => exploreDayMatches(whenSel, String(e.date || '').slice(0, 10));
 
@@ -4787,7 +4948,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
             : whenSel === 'weekend'
               ? 'happening on the upcoming Saturday or Sunday'
               : 'happening in the next 7 days';
-        const prompt = `Today is ${new Date().toDateString()}. Search the web for 6 REAL local events in ${catLine}, ${whenLine}, near ${locLabel} (within ~${exploreRadius} miles). ${mobilityPromptLine(mobility)} Real and verifiable only — no invented events; prefer distinctive local picks over generic listings.
+        const prompt = `Today is ${new Date().toDateString()}. Search the web for 6 REAL local events in ${catLine}, ${whenLine}, near ${locLabel} (within ~${exploreRadius} miles). ${travelPromptLine(travel)} Real and verifiable only — no invented events; prefer distinctive local picks over generic listings.
 Return ONLY a JSON array (no prose, no fences) of objects with keys: title, description, location, date (YYYY-MM-DD HH:MM), url (official page or null — never guess), imageUrl (real public image URL or null), imageKeywords (3-6 visual words), type (EXACTLY ONE of: ${EVENT_TYPES.join(', ')}), priceTier ("Free","$","$$","$$$","$$$$" or null), isTicketed (true/false), ticketsUrl (exact purchase page you saw, else null).`;
 
         const aiSearch = (async () => {
@@ -7261,6 +7422,7 @@ export default function App() {
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [showAboutModal, setShowAboutModal] = useState(false);
   const [pendingJoinGroupId, setPendingJoinGroupId] = useState(null);
+  const [sharedEvent, setSharedEvent] = useState(null); // event opened from a shared ?e= link
   const [unreadFeedCount, setUnreadFeedCount] = useState(0);
   const [nameSkipped, setNameSkipped] = useState(false);
   const [feedRefreshTick, setFeedRefreshTick] = useState(0);
@@ -7352,6 +7514,14 @@ export default function App() {
     if (typeof window === 'undefined') return;
     const params = new URLSearchParams(window.location.search);
     const join = params.get('join');
+    const sharedId = params.get('e');
+    if (sharedId) {
+      // Shared-event deep link: resolve from the public pool once signed in.
+      window.__pendingSharedEventId = sharedId;
+      params.delete('e');
+      const q2 = params.toString();
+      window.history.replaceState({}, '', window.location.pathname + (q2 ? `?${q2}` : '') + window.location.hash);
+    }
     if (join) {
       setPendingJoinGroupId(join);
       params.delete('join');
@@ -7360,6 +7530,28 @@ export default function App() {
       window.history.replaceState({}, '', newUrl);
     }
   }, []);
+
+  // Load a shared event (?e=<poolDocId>) from the community pool once the
+  // user is signed in; shown in a modal with one-tap "Add to my feed".
+  useEffect(() => {
+    const id = typeof window !== 'undefined' ? window.__pendingSharedEventId : null;
+    if (!userId || !id) return;
+    (async () => {
+      try {
+        const snap = await getDoc(doc(db, `artifacts/${appId}/public/data/eventPool`, id));
+        if (snap.exists()) {
+          const { poolGeo: _g, poolDay: _d, pooledAt: _t, ...event } = snap.data();
+          setSharedEvent(event);
+        } else {
+          showGlobalMessage('That shared event has expired or moved on.', 'error');
+        }
+      } catch (e) {
+        console.warn('Shared event load failed:', e);
+      } finally {
+        window.__pendingSharedEventId = null;
+      }
+    })();
+  }, [userId, showGlobalMessage]);
 
   // Complete a redirect-based Google sign-in (the popup-blocked fallback).
   // onAuthStateChanged picks up the session either way; this call drains the
@@ -7507,6 +7699,30 @@ export default function App() {
           {showProfileModal && <ProfileModal onClose={() => setShowProfileModal(false)} />}
           {showSettingsModal && <SettingsModal onClose={() => setShowSettingsModal(false)} />}
           {showAboutModal && <AboutModal onClose={() => setShowAboutModal(false)} />}
+          {sharedEvent && (
+            <Modal onClose={() => setSharedEvent(null)} title="A friend sent you this">
+              <SuggestionCard
+                idea={sharedEvent}
+                onPropose={async (idea) => {
+                  try {
+                    await addDoc(collection(db, `artifacts/${appId}/users/${userId}/feed`), {
+                      type: 'personalSuggestion',
+                      data: idea,
+                      timestamp: serverTimestamp(),
+                    });
+                    showGlobalMessage('Added to your feed!');
+                    setSharedEvent(null);
+                  } catch (e) {
+                    console.error(e);
+                    showGlobalMessage('Could not add to feed.', 'error');
+                  }
+                }}
+                proposeLabel="Add to my feed"
+                googleAccessToken={googleAccessToken}
+                showGlobalMessage={showGlobalMessage}
+              />
+            </Modal>
+          )}
           {pendingJoinGroupId && (
             <JoinGroupModal groupId={pendingJoinGroupId} onClose={() => setPendingJoinGroupId(null)} />
           )}
