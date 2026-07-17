@@ -2785,6 +2785,109 @@ const travelMinutesTo = (event, profile) => {
   return Math.round((mi / TRAVEL_SPEED_MPH[mode]) * 60);
 };
 
+// --- Unified event scoring (the recommendation engine core) ------------------
+// One deterministic function scores an event against a profile across every
+// signal we collect, and returns human-readable reasons. It is the single
+// source of truth for BOTH generation-time ranking AND the render-time
+// "why this fits you" chip — so the order you see and the reason shown always
+// agree. Free (no AI), so it runs over pooled candidates too.
+const DOW_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const slotOfHour = (h) => (h < 12 ? 'morning' : h < 17 ? 'afternoon' : 'evening');
+const eventDayInfo = (dateStr) => {
+  if (!dateStr) return null;
+  const d = new Date(String(dateStr).replace(' ', 'T'));
+  if (Number.isNaN(d.getTime())) return null;
+  const hh = parseInt(String(dateStr).slice(11, 13), 10);
+  return { dow: DOW_NAMES[d.getDay()], slot: slotOfHour(Number.isFinite(hh) ? hh : 19), date: String(dateStr).slice(0, 10) };
+};
+const PRICE_RANK = { Free: 0, $: 1, $$: 2, $$$: 3, $$$$: 4 };
+
+const eventSignals = (event, profile) => {
+  const reasons = [];
+  let score = 0;
+  if (!event) return { score: 0, reasons };
+  const hay = `${event.title || ''} ${event.description || ''} ${event.type || ''}`.toLowerCase();
+
+  // 1. Interest fit — specific tastes (jazz, italian) beat broad ones.
+  const details = Object.values(profile?.preferenceDetails || {}).flat().map((x) => String(x).toLowerCase());
+  const prefs = (profile?.preferences || []).map((p) => String(p).toLowerCase());
+  const hitDetail = details.find((t) => t.length > 2 && hay.includes(t));
+  const hitPref = prefs.find((t) => t.length > 2 && hay.includes(t));
+  const prefTypes = new Set(prefs.map((p) => normalizeType(p)));
+  if (hitDetail) { score += 40; reasons.push(cap(hitDetail)); }
+  else if (hitPref) { score += 30; reasons.push(cap(hitPref)); }
+  else if (event.type && prefTypes.has(event.type)) { score += 18; reasons.push(event.type); }
+
+  // 2. Availability fit — falls in a free window you told us about.
+  const info = eventDayInfo(event.date);
+  if (info) {
+    const weekly = profile?.weeklyAvailability || {};
+    const free = (weekly[info.dow] || []).includes(info.slot);
+    const calFree = (profile?.freeSlots || []).some((s) => s.date === info.date);
+    if (free || calFree) { score += 28; reasons.push(`You're free ${info.dow}`); }
+    // Soonness nudge so the top of the feed isn't three weeks out.
+    const days = Math.max(0, (new Date(info.date) - new Date()) / 864e5);
+    score += Math.max(0, 6 - days * 0.4);
+  }
+
+  // 3. Travel — inside comfort range is a plus; well beyond is a penalty.
+  const mins = travelMinutesTo(event, profile);
+  if (mins != null) {
+    const comfort = effectiveTravel(profile).minutes;
+    if (mins <= comfort) { score += 16; reasons.push(`${mins} min away`); }
+    else if (mins <= comfort * 2) score += 4;
+    else score -= Math.min(25, (mins - comfort) * 0.4);
+  }
+
+  // 4. Budget — honor free/cheap lean and the per-person cap.
+  const tier = event.priceTier;
+  if (profile?.budgetLean === 'free' && (tier === 'Free' || tier === '$')) { score += 8; if (tier === 'Free') reasons.push('Free'); }
+  const maxPP = Number(profile?.maxPricePerPerson) || 0;
+  if (maxPP > 0 && PRICE_RANK[tier] != null) {
+    const approxMin = [0, 20, 50, 100, 150][PRICE_RANK[tier]];
+    if (approxMin > maxPP) score -= 14;
+  }
+
+  // 5. Taste feedback loop — saved categories up, dismissed down.
+  const t = profile?.tasteSignals || {};
+  const tk = typeKey(event.type);
+  score += Math.min(15, (t.savedTypes?.[tk] || 0) * 5);
+  score -= Math.min(15, (t.dismissedTypes?.[tk] || 0) * 5);
+
+  // 6. Niche bonus — a specific interest match on a non-partner (indie) find
+  // is exactly the "unique" thing we want to surface.
+  if (hitDetail && !TRUSTED_URL_SOURCES.has(event.source)) score += 6;
+
+  return { score, reasons: [...new Set(reasons)].slice(0, 3) };
+};
+const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
+
+// Rank + select for QUALITY and VARIETY: highest score first, but cap one per
+// venue/series and avoid returning five of the same category, so the feed
+// feels curated rather than one-note.
+const rankAndDiversify = (events, profile, max = 6) => {
+  const scored = events
+    .map((e) => ({ e, ...eventSignals(e, profile) }))
+    .sort((a, b) => b.score - a.score);
+  const out = [];
+  const seenVenue = new Set();
+  const seenTitle = new Set();
+  const typeCount = {};
+  for (const { e, reasons } of scored) {
+    const venue = normalizeTitle(e.location || '');
+    const title = normalizeTitle(e.title || '');
+    if (title && seenTitle.has(title)) continue;
+    if (venue && seenVenue.has(venue)) continue;
+    if ((typeCount[e.type] || 0) >= 2 && out.length < max + 3) continue; // spread categories
+    out.push({ ...e, matchReasons: reasons });
+    if (title) seenTitle.add(title);
+    if (venue) seenVenue.add(venue);
+    typeCount[e.type] = (typeCount[e.type] || 0) + 1;
+    if (out.length >= max) break;
+  }
+  return out;
+};
+
 // Map priceTier strings to a numeric sort weight; events without a tier
 // land at the bottom of price-sorted lists.
 const PRICE_WEIGHT = { Free: 0, '$': 1, '$$': 2, '$$$': 3, '$$$$': 4 };
@@ -3213,20 +3316,22 @@ const MyFeedSection = () => {
       const geoLabel = locPref === 'current' && current ? current : home;
       const geo = poolGeoBucket(geoLabel);
       const seenKeys = new Set(feedItems.map((i) => normalizeTitle(i.data?.title)).filter(Boolean));
-      const prefTypes = new Set((userProfile?.preferences || []).map((p) => normalizeType(p)));
-      const poolPicks = (
-        await fetchPoolEvents({ geo, forToday, excludeTitleKeys: seenKeys, max: 6 })
-      ).sort((a, b) => (prefTypes.has(b.type) ? 1 : 0) - (prefTypes.has(a.type) ? 1 : 0));
-      if (poolPicks.length) {
-        await persistSuggestions(poolPicks);
-        poolPicks.forEach((p) => seenKeys.add(normalizeTitle(p.title)));
-      }
-      if (poolPicks.length >= 4) {
-        // Pool alone filled the request — done, no AI spend. A later press
-        // (or scroll) digs deeper since these are now excluded as seen.
+      // Pool is now a CANDIDATE SOURCE, not a bypass: pull a wide set, then
+      // score every one against THIS person (interest × availability × travel
+      // × budget × taste) and take the best, varied few. The metered AI search
+      // only runs when the cache can't field enough strong matches — so we keep
+      // the cost win but stop serving a generic, date-sorted feed.
+      const poolCandidates = await fetchPoolEvents({ geo, forToday, excludeTitleKeys: seenKeys, max: 40 });
+      const poolPicks = rankAndDiversify(poolCandidates, userProfile, 6);
+      const strongPool = poolPicks.filter((p) => p.score >= 25).length;
+      if (poolPicks.length >= 5 && strongPool >= 3) {
+        // Cache had plenty of well-matched events — serve them, no AI spend.
+        await persistSuggestions(poolPicks.slice(0, 5));
         setIsGenerating(false);
         return;
       }
+      // Otherwise the pool becomes part of the candidate pool for scoring below.
+      poolPicks.forEach((p) => seenKeys.add(normalizeTitle(p.title)));
       // Location context — incorporates the current scope tier so the
       // radius expands as the user scrolls for more.
       let locationBlock;
@@ -3372,12 +3477,13 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
         return rankAndPersonalizeEvents({ events: raw, contextText: ctx, provider, max: 6 });
       })();
 
-      // Run both sources in parallel and merge + de-dupe by normalized title.
+      // Merge all THREE candidate sources — fresh AI finds, ranked partner
+      // events, AND the pool candidates that weren't strong enough to serve
+      // alone — so the best event wins regardless of where it came from.
       const [aEvents, bEvents] = await Promise.all([aiSearch, partnerSearch]);
-      let suggestions = mergeEvents(aEvents, bEvents);
-      // Hard de-dupe against what's ALREADY in the feed (both tabs) plus the
-      // pool picks just written — never trust the AI to fully obey the
-      // "already shown" list. This is what stops the same event reappearing.
+      let suggestions = mergeEvents(aEvents, bEvents, poolCandidates);
+      // Hard de-dupe against what's ALREADY in the feed (both tabs) — never
+      // trust the AI to fully obey the "already shown" list.
       suggestions = suggestions.filter((s) => !seenKeys.has(normalizeTitle(s.title)));
 
       // Verify AI food/drink picks against Google Places (real & within radius):
@@ -3414,17 +3520,19 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
         showGlobalMessage(aiError.message, 'error');
       }
       if (!suggestions.length) {
-        // Pool picks already landed → this run still succeeded quietly.
-        if (poolPicks.length) return;
         if (aiError?.code) throw new Error(aiError.message); // already user-friendly
         throw new Error(
           aiError ? `AI search failed — ${aiError.message}` : 'No new ideas right now — try again later or widen your interests.'
         );
       }
-      await persistSuggestions(suggestions);
+      // Final quality gate: score the whole candidate set for THIS person and
+      // take the best, most varied few — this is what makes the ordering
+      // trustworthy (best match at the top, not just first-fetched).
+      const ranked = rankAndDiversify(suggestions, userProfile, fromScroll ? 5 : 6);
+      await persistSuggestions(ranked);
       // Contribute the fresh discoveries to the community pool so the next
       // person in this area gets them instantly (fire-and-forget).
-      writeEventsToPool(suggestions, geo);
+      writeEventsToPool(ranked, geo);
     } catch (e) {
       console.error(e);
       showGlobalMessage(e?.message || 'Could not fetch real events. Try again.', 'error');
@@ -3909,20 +4017,25 @@ const FeedCard = ({ item, onDelete, saved = false, onToggleSave }) => {
       </div>
 
       <div className="p-4">
+        {/* "Why this fits you" — computed live from the viewer's own signals
+            (interest match, their free time, travel distance), so it's honest
+            and always relevant, not a stored AI claim. */}
+        {(() => {
+          const reasons = eventSignals(data, userProfile).reasons;
+          if (!reasons.length) return null;
+          return (
+            <div className="flex flex-wrap gap-1.5 mb-2">
+              {reasons.map((r, i) => (
+                <span key={i} className="inline-flex items-center px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-700 text-xs font-semibold">
+                  {i === 0 ? '✨ ' : ''}{r}
+                </span>
+              ))}
+            </div>
+          );
+        })()}
         <p className="text-ink-soft text-sm leading-relaxed">{data.description}</p>
         {(data.priceTier || data.isTicketed || SOURCE_LABELS[data.source] || (data.type && data.type !== 'Other')) && (
           <div className="flex items-center gap-2 flex-wrap mt-3">
-            {(() => {
-              // "~12 min 🚇" chip when both sides have coordinates.
-              const mins = travelMinutesTo(data, userProfile);
-              if (mins == null) return null;
-              const icon = { walk: '🚶', transit: '🚇', drive: '🚗' }[effectiveTravel(userProfile).mode];
-              return (
-                <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-700 text-xs font-medium">
-                  {icon} ~{mins} min
-                </span>
-              );
-            })()}
             <TypeBadge type={data.type} />
             <PriceTierBadge tier={data.priceTier} />
             <TicketedBadge isTicketed={data.isTicketed} />
