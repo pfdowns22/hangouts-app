@@ -1230,6 +1230,83 @@ const gatherGroupInterests = async (profile) => {
   }
 };
 
+// The differentiator: find WHEN a group is collectively free and WHAT they
+// share, so we can proactively surface "your crew is free Saturday — here's
+// something you'd all love." Intersects members' weekly availability (windows
+// where 2+ are free) with their shared interests. Returns the single best
+// opportunity across the user's groups, or null. Bounded reads like
+// gatherGroupInterests. Excludes the current user from the "who's free" count
+// so it reads as "your friends", not "you".
+const SLOT_ORDER = { morning: 0, afternoon: 1, evening: 2 };
+const gatherCrewOpportunities = async (profile, uid) => {
+  const groupIds = (profile?.groupIds || []).slice(0, 5);
+  if (!groupIds.length) return null;
+  try {
+    const groups = (
+      await Promise.all(
+        groupIds.map(async (gid) => {
+          try {
+            const s = await getDoc(doc(db, `artifacts/${appId}/public/data/groups`, gid));
+            return s.exists() ? { id: gid, ...s.data() } : null;
+          } catch {
+            return null;
+          }
+        })
+      )
+    ).filter(Boolean);
+
+    let best = null;
+    for (const g of groups) {
+      const memberIds = (g.members || []).slice(0, 25);
+      const profiles = (
+        await Promise.all(
+          memberIds.map(async (mid) => {
+            try {
+              const s = await getDoc(doc(db, `artifacts/${appId}/users/${mid}/profiles`, 'myProfile'));
+              return s.exists() ? { uid: mid, ...s.data() } : null;
+            } catch {
+              return null;
+            }
+          })
+        )
+      ).filter(Boolean);
+      if (profiles.length < 2) continue;
+
+      // Overlapping free windows: count members (incl. you) free per day+slot.
+      const winCount = {}; // "Sat|afternoon" -> Set(uid)
+      const freeNamesByWin = {};
+      profiles.forEach((p) => {
+        Object.entries(p.weeklyAvailability || {}).forEach(([day, slots]) => {
+          (slots || []).forEach((slot) => {
+            const k = `${day}|${slot}`;
+            (winCount[k] ||= new Set()).add(p.uid);
+            if (p.uid !== uid) (freeNamesByWin[k] ||= []).push((p.name || 'A friend').split(' ')[0]);
+          });
+        });
+      });
+      const windows = Object.entries(winCount)
+        .filter(([, set]) => set.size >= 2)
+        .map(([k, set]) => ({ key: k, day: k.split('|')[0], slot: k.split('|')[1], count: set.size, friends: freeNamesByWin[k] || [] }))
+        .sort((a, b) => b.count - a.count || SLOT_ORDER[b.slot] - SLOT_ORDER[a.slot]);
+      if (!windows.length) continue;
+
+      // Shared interests (held by 2+ members).
+      const freq = {};
+      profiles.forEach((p) => (p.preferences || []).forEach((pref) => { if (pref) freq[pref] = (freq[pref] || 0) + 1; }));
+      const shared = Object.entries(freq).filter(([, n]) => n >= 2).sort((a, b) => b[1] - a[1]).map(([k]) => k).slice(0, 6);
+
+      const top = windows[0];
+      const opp = { groupId: g.id, groupName: g.name, memberCount: profiles.length, windows: windows.slice(0, 4), topWindow: top, sharedInterests: shared, friendsFree: [...new Set(top.friends)].slice(0, 4) };
+      const score = top.count * 2 + shared.length;
+      if (!best || score > best._score) best = { ...opp, _score: score };
+    }
+    return best;
+  } catch (e) {
+    console.warn('Crew opportunity scan failed:', e);
+    return null;
+  }
+};
+
 // Read a group's recent chat and ask the AI for 2-4 concrete things the group
 // seems to want to do together (activities/places/outings) — used to seed
 // chat-aware suggestions. Returns short phrases (e.g. ["golf","sushi dinner"]).
@@ -1262,6 +1339,28 @@ const extractChatTopics = async (groupId, provider = 'gemini') => {
 // Email the other group members when an event is proposed (via /api/notify-proposal
 // → Resend). Reads member emails from their profiles (readable per rules).
 // Fire-and-forget; never blocks or fails the proposal.
+// Propose an event to a group: canonical proposal doc + a feed ping to each
+// other member (fires their toast/badge) + emails. Shared by the Suggestions
+// tab and the crew feed. Returns true on success.
+const proposeEventToGroup = async ({ group, event, userId, userName }) => {
+  const proposalRef = await addDoc(
+    collection(db, `artifacts/${appId}/public/data/groups/${group.id}/proposals`),
+    { ...event, proposerId: userId, proposerName: userName, groupId: group.id, groupName: group.name, rsvps: { [userId]: 'yes' }, createdAt: serverTimestamp() }
+  );
+  const batch = writeBatch(db);
+  (group.members || []).forEach((memberId) => {
+    if (memberId === userId) return;
+    batch.set(doc(collection(db, `artifacts/${appId}/users/${memberId}/feed`)), {
+      type: 'groupProposal',
+      data: { ...event, proposerName: userName, groupId: group.id, groupName: group.name, proposalId: proposalRef.id },
+      timestamp: serverTimestamp(),
+    });
+  });
+  await batch.commit();
+  sendProposalEmails(group, event.title, userName, userId);
+  return true;
+};
+
 const sendProposalEmails = async (group, eventTitle, proposerName, selfId) => {
   try {
     const ids = (group?.members || []).filter((id) => id !== selfId).slice(0, 30);
@@ -2920,6 +3019,112 @@ const eventDateBucket = (item) => {
   return 'upcoming';
 };
 
+// The crew feed — the social differentiator. Proactively surfaces "your crew
+// is free Saturday afternoon — here's something you'd all love" by intersecting
+// group members' availability + shared interests, with one-tap propose. Renders
+// nothing unless the user has a group with an overlapping free window.
+const CrewFeed = () => {
+  const { userId, userProfile, showGlobalMessage } = useContext(AppContext);
+  const [opp, setOpp] = useState(null);
+  const [events, setEvents] = useState([]);
+  const [proposingId, setProposingId] = useState(null);
+  const ranRef = useRef(false);
+
+  // A synthetic "crew profile" so the scorer ranks for the group's shared
+  // interests and collective free windows rather than just the viewer.
+  const crewProfileFor = (o) => {
+    const weekly = {};
+    o.windows.forEach((w) => { (weekly[w.day] ||= []).push(w.slot); });
+    return { ...userProfile, preferences: o.sharedInterests.length ? o.sharedInterests : userProfile?.preferences, weeklyAvailability: weekly };
+  };
+
+  useEffect(() => {
+    if (!userProfile || ranRef.current) return;
+    ranRef.current = true;
+    (async () => {
+      const o = await gatherCrewOpportunities(userProfile, userId);
+      if (!o) return;
+      setOpp(o);
+      try {
+        const locPref = userProfile?.locationPreference || 'home';
+        const geoLabel = locPref === 'current' && userProfile?.currentLocation?.label ? userProfile.currentLocation.label : userProfile?.address || '';
+        const geo = poolGeoBucket(geoLabel);
+        const cands = await fetchPoolEvents({ geo, forToday: false, max: 40 });
+        // Prefer events that land in one of the crew's free windows.
+        const inWindow = cands.filter((e) => {
+          const info = eventDayInfo(e.date);
+          return info && o.windows.some((w) => w.day === info.dow && w.slot === info.slot);
+        });
+        setEvents(rankAndDiversify(inWindow.length ? inWindow : cands, crewProfileFor(o), 3));
+      } catch (e) {
+        console.warn('Crew events load failed:', e);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userProfile, userId]);
+
+  const propose = async (event) => {
+    setProposingId(event.title);
+    try {
+      const snap = await getDoc(doc(db, `artifacts/${appId}/public/data/groups`, opp.groupId));
+      if (!snap.exists()) throw new Error('group gone');
+      await proposeEventToGroup({ group: { id: opp.groupId, ...snap.data() }, event, userId, userName: userProfile?.name || 'A friend' });
+      showGlobalMessage(`Proposed to ${opp.groupName}! They'll get a ping.`);
+    } catch (e) {
+      console.error(e);
+      showGlobalMessage('Could not propose to the group.', 'error');
+    } finally {
+      setProposingId(null);
+    }
+  };
+
+  if (!opp) return null;
+  const w = opp.topWindow;
+  const who = opp.friendsFree.length
+    ? `${opp.friendsFree.slice(0, 3).join(', ')}${opp.friendsFree.length > 3 ? ' & more' : ''}`
+    : `${w.count} of you`;
+
+  return (
+    <div className="rounded-2xl border border-brand-100 bg-brand-50 overflow-hidden">
+      <div className="p-4">
+        <div className="flex items-center gap-2 mb-1">
+          <UsersIcon className="w-5 h-5 text-brand-600" />
+          <h3 className="font-bold text-ink text-[15px]">Your crew is free {w.day} {w.slot}</h3>
+        </div>
+        <p className="text-xs text-ink-soft">
+          <span className="font-semibold text-ink">{who}</span> free in <span className="font-semibold">{opp.groupName}</span>
+          {opp.sharedInterests.length ? ` · you all like ${opp.sharedInterests.slice(0, 3).join(', ')}` : ''}
+        </p>
+      </div>
+      {events.length > 0 ? (
+        <div className="px-3 pb-3 space-y-3">
+          {events.map((e, i) => (
+            <div key={i} className="bg-white rounded-xl border border-line p-3">
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <p className="font-bold text-ink text-sm truncate">{e.title}</p>
+                  <p className="text-xs text-ink-faint">{e.date ? new Date(String(e.date).replace(' ', 'T')).toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric' }) : ''}{e.location ? ` · ${e.location}` : ''}</p>
+                </div>
+                <button
+                  onClick={() => propose(e)}
+                  disabled={proposingId === e.title}
+                  className="shrink-0 text-xs font-bold bg-brand-600 text-white px-3 py-1.5 rounded-lg hover:bg-brand-700 disabled:opacity-50 transition"
+                >
+                  {proposingId === e.title ? '…' : `Propose`}
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="px-4 pb-4">
+          <p className="text-xs text-ink-soft">Open <span className="font-semibold">Groups → {opp.groupName}</span> to plan something for this window.</p>
+        </div>
+      )}
+    </div>
+  );
+};
+
 const MyFeedSection = () => {
   const { userId, userProfile, setUserProfile, showGlobalMessage, setShowProfileModal, feedRefreshTick } = useContext(AppContext);
   const [feedItems, setFeedItems] = useState([]);
@@ -3616,6 +3821,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
           </button>
         </div>
       )}
+      {!showSaved && <CrewFeed />}
       <div className="flex justify-between items-center gap-3">
         <div>
           <h2 className="text-lg font-bold text-ink tracking-tight">Your feed</h2>
