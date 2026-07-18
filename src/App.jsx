@@ -3028,7 +3028,17 @@ const CrewFeed = () => {
   const [opp, setOpp] = useState(null);
   const [events, setEvents] = useState([]);
   const [proposingId, setProposingId] = useState(null);
+  const [dismissed, setDismissed] = useState(false);
   const ranRef = useRef(false);
+
+  // Dismissal is per opportunity (group + free window) and remembered on
+  // this device, so an unwanted card stays gone — but a NEW window or group
+  // can still surface later.
+  const dismissKeyFor = (o) => `hangouts_crew_dismissed_${o.groupId}|${o.topWindow.key}`;
+  const dismissCard = () => {
+    try { window.localStorage.setItem(dismissKeyFor(opp), '1'); } catch { /* private mode */ }
+    setDismissed(true);
+  };
 
   // A synthetic "crew profile" so the scorer ranks for the group's shared
   // interests and collective free windows rather than just the viewer.
@@ -3044,6 +3054,9 @@ const CrewFeed = () => {
     (async () => {
       const o = await gatherCrewOpportunities(userProfile, userId);
       if (!o) return;
+      try {
+        if (window.localStorage.getItem(`hangouts_crew_dismissed_${o.groupId}|${o.topWindow.key}`)) return; // dismissed earlier
+      } catch { /* private mode — show it */ }
       setOpp(o);
       try {
         const locPref = userProfile?.locationPreference || 'home';
@@ -3078,15 +3091,23 @@ const CrewFeed = () => {
     }
   };
 
-  if (!opp) return null;
+  if (!opp || dismissed) return null;
   const w = opp.topWindow;
   const who = opp.friendsFree.length
     ? `${opp.friendsFree.slice(0, 3).join(', ')}${opp.friendsFree.length > 3 ? ' & more' : ''}`
     : `${w.count} of you`;
 
   return (
-    <div className="rounded-2xl border border-brand-100 bg-brand-50 overflow-hidden">
-      <div className="p-4">
+    <div className="rounded-2xl border border-brand-100 bg-brand-50 overflow-hidden relative">
+      <button
+        onClick={dismissCard}
+        className="absolute top-3 right-3 p-1.5 rounded-full text-ink-faint hover:text-ink hover:bg-white/70 transition"
+        title="Dismiss this suggestion"
+        aria-label="Dismiss crew suggestion"
+      >
+        <CloseIcon className="w-4 h-4" />
+      </button>
+      <div className="p-4 pr-10">
         <div className="flex items-center gap-2 mb-1">
           <UsersIcon className="w-5 h-5 text-brand-600" />
           <h3 className="font-bold text-ink text-[15px]">Your crew is free {w.day} {w.slot}</h3>
@@ -3105,13 +3126,23 @@ const CrewFeed = () => {
                   <p className="font-bold text-ink text-sm truncate">{e.title}</p>
                   <p className="text-xs text-ink-faint">{e.date ? new Date(String(e.date).replace(' ', 'T')).toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric' }) : ''}{e.location ? ` · ${e.location}` : ''}</p>
                 </div>
-                <button
-                  onClick={() => propose(e)}
-                  disabled={proposingId === e.title}
-                  className="shrink-0 text-xs font-bold bg-brand-600 text-white px-3 py-1.5 rounded-lg hover:bg-brand-700 disabled:opacity-50 transition"
-                >
-                  {proposingId === e.title ? '…' : `Propose`}
-                </button>
+                <div className="flex items-center gap-1 shrink-0">
+                  <button
+                    onClick={() => propose(e)}
+                    disabled={proposingId === e.title}
+                    className="text-xs font-bold bg-brand-600 text-white px-3 py-1.5 rounded-lg hover:bg-brand-700 disabled:opacity-50 transition"
+                  >
+                    {proposingId === e.title ? '…' : `Propose`}
+                  </button>
+                  <button
+                    onClick={() => setEvents((prev) => prev.filter((x) => x !== e))}
+                    className="p-1.5 rounded-full text-ink-faint hover:text-ink hover:bg-gray-100 transition"
+                    title="Not this one"
+                    aria-label={`Dismiss ${e.title}`}
+                  >
+                    <CloseIcon className="w-3.5 h-3.5" />
+                  </button>
+                </div>
               </div>
             </div>
           ))}
@@ -4682,7 +4713,13 @@ const GroupProposals = ({ groupId }) => {
       limit(50)
     );
     return onSnapshot(q, (snap) => {
-      setProposals(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+      // Proposals expire once the event date has passed — a "who's going"
+      // list for last Tuesday is clutter. (Undated proposals never expire.)
+      setProposals(
+        snap.docs
+          .map((d) => ({ id: d.id, ...d.data() }))
+          .filter((p) => eventDateBucket({ data: p }) !== 'past')
+      );
       setLoading(false);
     });
   }, [groupId]);
