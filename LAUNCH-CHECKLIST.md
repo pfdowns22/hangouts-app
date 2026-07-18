@@ -83,3 +83,17 @@ _APIs & Services → OAuth consent screen (project `hangouts-app-9101f`)_
 4. "Use a password instead" → new email creates an account; existing email +
    wrong password shows a friendly error.
 5. "Browse as guest" still enters the app.
+
+## AI failover (Moonshot / Kimi)
+- [ ] Create a Moonshot account + API key at **platform.moonshot.ai**
+      (international platform; prepaid credits, Kimi K2 pricing is cheap).
+- [ ] Vercel → Environment Variables → add **MOONSHOT_API_KEY** (Production)
+      → redeploy. That's it — /api/ai automatically fails over to Moonshot
+      when Gemini's daily lane is spent or Gemini errors, including grounded
+      searches (Kimi's built-in $web_search).
+- [ ] Optional ramp knobs (env): AI_MOONSHOT_DAILY_CAP (4000),
+      AI_USER_DAILY_CAP (80) — raise as usage grows.
+- Note: when the fallback engages, prompts (interests/home area text) are
+  processed by Moonshot AI (a China-based provider) under their API terms —
+  no account credentials are ever included, but be comfortable with that
+  data flow before enabling.

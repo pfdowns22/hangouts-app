@@ -231,6 +231,11 @@ const GROUNDING_DAILY_CAP = 1400; // margin under Google's 1,500/day free limit
 // (and records the use), false once the daily cap is hit. Fails OPEN on any
 // metering error so a Firestore hiccup never breaks event discovery.
 const reserveGroundedSearch = async () => {
+  // Proxy mode (no client-bundled key): the SERVER meters budgets and can
+  // fail over to the Moonshot lane when Gemini's is spent — a client-side
+  // veto here would block calls the server could still serve. Legacy
+  // client-key mode (local dev) keeps the shared-counter gate below.
+  if (!geminiApiKey) return true;
   try {
     const day = new Date().toISOString().slice(0, 10);
     const ref = doc(db, `artifacts/${appId}/public/data/meta`, `grounding-${day}`);
