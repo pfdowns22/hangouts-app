@@ -4,6 +4,10 @@ AI-powered social planning app. Originally generated in Google Gemini Canvas, th
 refactored into a standard Vite + React project. See [README.md](README.md) for
 end-user setup, deploy, and known-issues notes.
 
+**Execution plan:** [MASTER-PLAN.md](MASTER-PLAN.md) — the current, handoff-ready
+plan for monetization go-live and the mobile/App-Store launch, with task ordering
+and owner-vs-code split. **Start there for next-phase work.**
+
 **Build-out roadmap:** [ROADMAP.md](ROADMAP.md) — the full forward plan
 (monetization incl. booking/agent + subscription + venue marketplace, mobile-first
 UX overhaul, Apple/Google app-store release, WhatsApp/iMessage integrations),
