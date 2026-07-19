@@ -1067,10 +1067,15 @@ const mergeEvents = (...lists) => {
 // sharper the more it's used. Firestore field paths only tolerate simple
 // names, so event types are slugged (Food & Drink → food_drink).
 const typeKey = (t) => (t || 'Other').toLowerCase().replace(/[^a-z0-9]+/g, '_');
-const recordTasteSignal = (uid, kind /* 'saved' | 'dismissed' */, event) => {
+const recordTasteSignal = (uid, kind /* 'saved' | 'dismissed' | 'disliked' */, event) => {
   if (!uid || !event?.title) return;
-  const patch = { [`tasteSignals.${kind}Types.${typeKey(event.type)}`]: increment(1) };
+  // Thumbs-down is an EXPLICIT "not for me": weigh it double a passive
+  // dismissal and remember the title so it (and near-clones) never return.
+  const bucket = kind === 'disliked' ? 'dismissedTypes' : `${kind}Types`;
+  const weight = kind === 'disliked' ? 2 : 1;
+  const patch = { [`tasteSignals.${bucket}.${typeKey(event.type)}`]: increment(weight) };
   if (kind === 'saved') patch['tasteSignals.savedTitles'] = arrayUnion(String(event.title).slice(0, 80));
+  if (kind === 'disliked') patch['tasteSignals.dislikedTitles'] = arrayUnion(String(event.title).slice(0, 80));
   updateDoc(doc(db, `artifacts/${appId}/users/${uid}/profiles`, 'myProfile'), patch).catch(() => {});
 };
 // Top-N keys of a {slug: count} map, de-slugged for prompt text.
@@ -1420,6 +1425,7 @@ const SparklesIcon = ({ className = 'w-6 h-6' }) => <Icon path="M5 3v4M3 5h4M6 1
 const LightbulbIcon = ({ className = 'w-6 h-6' }) => <Icon path="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 017.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" className={className} />;
 const UsersIcon = ({ className = 'w-6 h-6' }) => <Icon path="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" className={className} />;
 const CalendarIcon = ({ className = 'w-6 h-6' }) => <Icon path="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" className={className} />;
+const ThumbsDownIcon = ({ className = 'w-6 h-6' }) => <Icon path="M10 14H5.236a2 2 0 01-1.789-2.894l3.5-7A2 2 0 018.736 3h4.018a2 2 0 01.485.06l3.76.94m-7 10v5a2 2 0 002 2h.096c.5 0 .905-.405.905-.904 0-.715.211-1.413.608-2.008L17 13V4m-7 10h2m5-10h2a2 2 0 012 2v6a2 2 0 01-2 2h-2.5" className={className} />;
 const HeartIcon = ({ className = 'w-6 h-6' }) => <Icon path="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z" className={className} />;
 const SendIcon = ({ className = 'w-6 h-6' }) => <Icon path="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" className={className} />;
 const LogoutIcon = () => <Icon path="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />;
@@ -1547,7 +1553,7 @@ const Avatar = ({ src, alt, size = 'md', className = '' }) => {
 // --- UI Components ---
 const Modal = ({ children, onClose, title }) => (
   <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex justify-center items-center p-4 transition-all" onClick={onClose}>
-    <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto flex flex-col" onClick={(e) => e.stopPropagation()}>
+    <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[85dvh] overflow-y-auto flex flex-col" onClick={(e) => e.stopPropagation()}>
       <header className="flex justify-between items-center p-5 border-b border-gray-100 bg-white sticky top-0 z-10">
         <h2 className="text-xl font-bold text-gray-800">{title}</h2>
         <button onClick={onClose} className="text-gray-400 hover:text-gray-700 p-2 rounded-full hover:bg-gray-100 transition">
@@ -2758,9 +2764,9 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with shape:
         )}
       </div>
 
-      <div className="flex justify-end pt-4 border-t">
-        <button onClick={handleSaveProfile} disabled={isSaving} className="bg-indigo-600 text-white font-bold py-3 px-8 rounded-xl hover:bg-indigo-700 transition shadow-lg shadow-indigo-200">
-          {isSaving ? 'Saving...' : 'Save Profile'}
+      <div className="sticky bottom-0 bg-white pt-3 pb-1 border-t border-line -mx-1 px-1">
+        <button onClick={handleSaveProfile} disabled={isSaving} className="w-full bg-brand-600 text-white font-bold py-3.5 rounded-xl hover:bg-brand-700 transition disabled:opacity-50">
+          {isSaving ? 'Saving…' : 'Save Profile'}
         </button>
       </div>
     </div>
@@ -2952,8 +2958,11 @@ const eventSignals = (event, profile) => {
     if (approxMin > maxPP) score -= 14;
   }
 
-  // 5. Taste feedback loop — saved categories up, dismissed down.
+  // 5. Taste feedback loop — saved categories up, dismissed down, and a
+  // hard penalty for anything resembling an explicit thumbs-down.
   const t = profile?.tasteSignals || {};
+  const dislikedKeys = (t.dislikedTitles || []).map((x) => normalizeTitle(x));
+  if (dislikedKeys.includes(normalizeTitle(event.title))) score -= 60;
   const tk = typeKey(event.type);
   score += Math.min(15, (t.savedTypes?.[tk] || 0) * 5);
   score -= Math.min(15, (t.dismissedTypes?.[tk] || 0) * 5);
@@ -3460,6 +3469,19 @@ const MyFeedSection = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [feedItems.length, userProfile, feedTab]);
 
+  // Explicit 👎: strong negative signal (double weight + title blacklist in
+  // scoring and prompts), then the card leaves the feed.
+  const thumbsDownItem = async (item) => {
+    try {
+      if (item.data) recordTasteSignal(userId, 'disliked', item.data);
+      await deleteDoc(doc(db, `artifacts/${appId}/users/${userId}/feed/${item.id}`));
+      showGlobalMessage('Got it — fewer like this from now on.');
+    } catch (e) {
+      console.error(e);
+      showGlobalMessage('Could not record that.', 'error');
+    }
+  };
+
   const deleteFeedItem = async (item) => {
     try {
       await deleteDoc(doc(db, `artifacts/${appId}/users/${userId}/feed/${item.id}`));
@@ -3658,6 +3680,7 @@ ${detailLines ? `- Specific tastes:\n${detailLines}` : ''}
 ${savedTitles.length ? `- They SAVED these recently (strong positive signal — find more in this spirit): ${savedTitles.join(' | ')}` : ''}
 ${savedTypes.length ? `- Categories they save most: ${savedTypes.join(', ')} — over-weight these.` : ''}
 ${dismissedTypes.length ? `- Categories they keep DISMISSING: ${dismissedTypes.join(', ')} — avoid unless a pick is a spectacular, specific fit.` : ''}
+${(taste.dislikedTitles || []).length ? `- They gave a THUMBS DOWN to: ${(taste.dislikedTitles || []).slice(-8).join(' | ')} — NEVER suggest these again, nor close variants or the same venues/series.` : ''}
 ${groupInterests.length ? `- Their friend groups enjoy together: ${groupInterests.join(', ')} — make 1 pick a great fit for these shared interests.` : ''}
 - Family: ${kidsText}
 ${budgetLine ? `- Budget: ${budgetLine}. Respect this — set each pick's priceTier accordingly and skip options that clearly exceed it.` : ''}
@@ -3992,6 +4015,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
                   onDelete={() => deleteFeedItem(item)}
                   saved={savedKeySet.has(normalizeTitle(item.data?.title))}
                   onToggleSave={() => toggleSave(item.data)}
+                  onThumbsDown={() => thumbsDownItem(item)}
                 />
               </React.Fragment>
             ))
@@ -4168,7 +4192,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
   );
 };
 
-const FeedCard = ({ item, onDelete, saved = false, onToggleSave }) => {
+const FeedCard = ({ item, onDelete, saved = false, onToggleSave, onThumbsDown }) => {
   const { googleAccessToken, setGoogleAccessToken, showGlobalMessage, userProfile } = useContext(AppContext);
   const { data, type } = item;
   const isInvite = type === 'groupProposal';
@@ -4343,6 +4367,16 @@ const FeedCard = ({ item, onDelete, saved = false, onToggleSave }) => {
               aria-label={saved ? 'Remove from saved' : 'Save'}
             >
               <HeartIcon className="w-5 h-5" />
+            </button>
+          )}
+          {onThumbsDown && (
+            <button
+              onClick={onThumbsDown}
+              className="w-11 flex items-center justify-center rounded-xl text-ink-soft bg-gray-100 hover:bg-gray-200 hover:text-ink transition"
+              title="Not for me — show fewer like this"
+              aria-label="Thumbs down"
+            >
+              <ThumbsDownIcon className="w-5 h-5" />
             </button>
           )}
           {ticket ? (
@@ -6980,7 +7014,7 @@ const LegalAcceptanceModal = () => {
 
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[60] flex justify-center items-center p-4">
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[92vh] flex flex-col">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[88dvh] flex flex-col">
         <header className="p-5 border-b border-gray-100">
           <h2 className="text-xl font-bold text-gray-800">Before you continue</h2>
           <p className="text-xs text-gray-500 mt-1">
@@ -7088,26 +7122,31 @@ const TOUR_STEPS = [
   },
   {
     icon: (c) => <HomeIcon className={c} />,
+    anchor: 'Feed',
     title: 'Your Feed',
     body: 'Today shows what’s on tonight; Upcoming looks two weeks out. Tap ♥ to save events you love (it learns your taste), ✕ to pass, and pull down anytime for fresh ideas.',
   },
   {
     icon: (c) => <SearchIcon className={c} />,
+    anchor: 'Explore',
     title: 'Explore what’s on',
     body: 'Browse by mood — Music, Food & Drink, Outdoors — and by day: tonight, this week, or the weekend. Anything you like, add straight to your feed.',
   },
   {
     icon: (c) => <PlusIcon className={c} />,
+    anchor: 'Plan',
     title: 'Plan anything',
     body: 'Tap the + button and just describe it: “Taking my kids to Prospect Park Saturday afternoon.” You’ll get real places and events, ready to book or share.',
   },
   {
     icon: (c) => <UsersIcon className={c} />,
+    anchor: 'Groups',
     title: 'Bring your people',
     body: 'Create a group, invite friends with a link, chat, propose events, and RSVP. When you’re all free at the same time, Hangouts spots it and suggests the plan.',
   },
   {
     icon: (c) => <HeartIcon className={c} />,
+    anchor: 'Profile',
     title: 'Make it yours',
     body: 'Tell us your interests, when you usually go out, and how far you’ll travel — the more it knows, the better every suggestion gets.',
     cta: 'Set up my profile',
@@ -7117,8 +7156,19 @@ const TOUR_STEPS = [
 const TourModal = () => {
   const { userId, setUserProfile, setShowProfileModal } = useContext(AppContext);
   const [step, setStep] = useState(0);
+  const [spot, setSpot] = useState(null); // rect of the nav button this step points at
   const s = TOUR_STEPS[step];
   const last = step === TOUR_STEPS.length - 1;
+
+  // Point at the REAL control: measure the bottom-nav button for this step
+  // and cut a spotlight hole over it, so the tour teaches actual locations.
+  useEffect(() => {
+    if (!s.anchor) { setSpot(null); return; }
+    const el = document.querySelector(`nav button[aria-label="${s.anchor}"]`);
+    if (!el) { setSpot(null); return; }
+    const r = el.getBoundingClientRect();
+    setSpot({ top: r.top - 6, left: r.left - 6, width: r.width + 12, height: r.height + 12 });
+  }, [step, s.anchor]);
 
   const finish = (openProfile = false) => {
     // Stamp first so the tour never re-renders, then optionally open profile.
@@ -7129,7 +7179,17 @@ const TourModal = () => {
   };
 
   return (
-    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[70] flex justify-center items-end sm:items-center p-0 sm:p-4">
+    <div className={`fixed inset-0 z-[70] flex justify-center ${spot ? 'items-end pb-24' : 'items-end sm:items-center'} p-0 sm:p-4`}>
+      {/* Dimmer: with an anchor, a transparent hole is cut over the real nav
+          button (box-shadow trick) so it glows through; otherwise full dim. */}
+      {spot ? (
+        <div
+          className="fixed rounded-2xl pointer-events-none animate-pulse"
+          style={{ top: spot.top, left: spot.left, width: spot.width, height: spot.height, boxShadow: '0 0 0 3px rgba(79,70,229,0.9), 0 0 0 9999px rgba(0,0,0,0.62)' }}
+        />
+      ) : (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm pointer-events-none" />
+      )}
       <div className="bg-white w-full max-w-md rounded-t-3xl sm:rounded-3xl shadow-2xl p-6 pb-8 relative">
         <button
           onClick={() => finish(false)}
