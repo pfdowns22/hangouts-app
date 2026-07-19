@@ -1137,7 +1137,7 @@ const fetchPoolEvents = async ({ geo, forToday, excludeTitleKeys = new Set(), ma
     for (const d of snap.docs) {
       const e = d.data();
       const day = e.poolDay || String(e.date || '').slice(0, 10);
-      const inFrame = forToday ? day === today : day > today && day <= horizon;
+      const inFrame = forToday ? day === today && !eventHasPassed(e.date) : day > today && day <= horizon;
       if (!inFrame) continue;
       if (isJunkEventTitle(e.title)) continue; // pool may hold pre-guard junk; clients can't delete it
       if (excludeTitleKeys.has(normalizeTitle(e.title))) continue;
@@ -3004,22 +3004,39 @@ const priceWeight = (tier) => (PRICE_WEIGHT[tier] !== undefined ? PRICE_WEIGHT[t
 // ones, all of them below any refreshed/proposed items.
 const SCROLL_TIMESTAMP_BASE = new Date('2005-01-01').getTime();
 
-// Classify a feed item by its event date relative to now, for the
+// TIME-based expiry: an event is over once its START TIME is more than
+// 30 minutes behind us (grace so a 7:00 show doesn't vanish at 7:01 while
+// you could still head over). Date-only strings (some legacy/pool data has
+// no time part) count as end-of-day so they don't disappear at 00:01.
+const EVENT_GRACE_MS = 30 * 60 * 1000;
+const eventStartMs = (raw) => {
+  if (!raw) return NaN;
+  const s = String(raw).trim();
+  const dateOnly = s.length <= 10; // "YYYY-MM-DD"
+  const t = new Date(dateOnly ? `${s}T23:59` : s.replace(' ', 'T')).getTime();
+  return t;
+};
+const eventHasPassed = (raw) => {
+  const t = eventStartMs(raw);
+  return Number.isFinite(t) && t + EVENT_GRACE_MS < Date.now();
+};
+
+// Classify a feed item by its event date/TIME relative to now, for the
 // Today / Upcoming tab split:
-//   'today'    — the event is happening today
-//   'upcoming' — the event is on a future day
-//   'past'     — the event already happened (hidden from both tabs)
+//   'today'    — happening today and not yet started (within grace)
+//   'upcoming' — on a future day
+//   'past'     — start time already passed (hidden from both tabs)
 //   'undated'  — no parseable date; surfaced under Upcoming so nothing
 //                silently disappears from the feed.
 const eventDateBucket = (item) => {
   const raw = item?.data?.date;
-  const t = raw ? new Date(raw).getTime() : NaN;
+  const t = eventStartMs(raw);
   if (!raw || Number.isNaN(t)) return 'undated';
+  if (eventHasPassed(raw)) return 'past';
   const start = new Date();
   start.setHours(0, 0, 0, 0);
   const tomorrow = new Date(start);
   tomorrow.setDate(tomorrow.getDate() + 1);
-  if (t < start.getTime()) return 'past';
   if (t < tomorrow.getTime()) return 'today';
   return 'upcoming';
 };
@@ -3619,7 +3636,7 @@ HARD RULE: of 5 returned events, at least 2 MUST be tagged locationSource="home"
       const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toDateString();
 
       const timeframePrompt = forToday
-        ? `happening strictly TODAY (${today}) or tonight.`
+        ? `happening strictly TODAY (${today}) or tonight, and ONLY events whose START TIME is still ahead of right now (${new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}) — never something that already started this morning/afternoon.`
         : `happening between tomorrow and ~14 days out. STRICTLY EXCLUDE today (${today}) and the past.`;
 
       // Unique titles already in the feed (any tab), so we can tell the AI what
@@ -5039,10 +5056,10 @@ const EXPLORE_WHEN = [
   { id: 'week', label: 'This week' },
   { id: 'weekend', label: 'Weekend' },
 ];
-const exploreDayMatches = (whenId, day) => {
+const exploreDayMatches = (whenId, day, fullDate) => {
   if (!day) return false;
   const today = new Date().toISOString().slice(0, 10);
-  if (whenId === 'today') return day === today;
+  if (whenId === 'today') return day === today && !eventHasPassed(fullDate || day);
   const horizon = new Date(Date.now() + 7 * 864e5).toISOString().slice(0, 10);
   if (whenId === 'week') return day >= today && day <= horizon;
   // weekend: next Sat/Sun within 14 days
@@ -5293,7 +5310,7 @@ Return ONLY a JSON array (no prose, no markdown fences) of objects with keys: ti
       const travel = effectiveTravel(userProfile);
       const exploreRadius = travelScopeTiers(travel)[1].radiusMiles;
       const typeOk = (e) => typeSel === 'all' || (e.type || 'Other') === typeSel;
-      const whenOk = (e) => exploreDayMatches(whenSel, String(e.date || '').slice(0, 10));
+      const whenOk = (e) => exploreDayMatches(whenSel, String(e.date || '').slice(0, 10), e.date);
 
       // 1) Pool.
       const pool = await fetchPoolEvents({ geo, forToday: whenSel === 'today', max: 40 });
@@ -6862,8 +6879,8 @@ By checking the box and clicking "I Accept" below, you acknowledge that you have
 
 const LegalAcceptanceModal = () => {
   const { userId, userProfile, setUserProfile, showGlobalMessage } = useContext(AppContext);
-  const [tosAgreed, setTosAgreed] = useState(false);
-  const [ndaAgreed, setNdaAgreed] = useState(false);
+  const [agreed, setAgreed] = useState(false); // one checkbox covers ToS + NDA
+  const [openDoc, setOpenDoc] = useState(null); // 'tos' | 'nda' | null (collapsed)
   const [saving, setSaving] = useState(false);
 
   // Anonymous users have no email from Firebase Auth, so we capture
@@ -6877,7 +6894,7 @@ const LegalAcceptanceModal = () => {
   const identityOk = !isAnon || (nameLooksValid && emailLooksValid);
 
   const accept = async () => {
-    if (!tosAgreed || !ndaAgreed || !identityOk) return;
+    if (!agreed || !identityOk) return;
     setSaving(true);
     try {
       const stamp = {
@@ -7001,33 +7018,37 @@ const LegalAcceptanceModal = () => {
               </div>
             </section>
           )}
-          <section>
-            <h3 className="font-bold text-gray-900 mb-2">Terms of Service</h3>
-            <pre className="whitespace-pre-wrap font-sans text-sm bg-gray-50 border border-gray-200 rounded-xl p-4 leading-relaxed">{TOS_TEXT}</pre>
-            <label className="flex items-start gap-2 mt-3 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={tosAgreed}
-                onChange={(e) => setTosAgreed(e.target.checked)}
-                className="mt-1 w-4 h-4 text-indigo-600 rounded focus:ring-indigo-500"
-              />
-              <span className="text-sm text-gray-700">I have read and agree to the <strong>Terms of Service</strong>.</span>
-            </label>
-          </section>
+          {/* Collapsed documents — tap to read; ONE checkbox at the end. */}
+          {[
+            { id: 'tos', title: 'Terms of Service', text: TOS_TEXT },
+            { id: 'nda', title: 'Non-Disclosure Agreement', text: NDA_TEXT },
+          ].map((docItem) => (
+            <section key={docItem.id} className="border border-line rounded-xl overflow-hidden">
+              <button
+                type="button"
+                onClick={() => setOpenDoc(openDoc === docItem.id ? null : docItem.id)}
+                className="w-full flex items-center justify-between px-4 py-3 bg-gray-50 hover:bg-gray-100 transition text-left"
+              >
+                <span className="font-bold text-ink text-sm">{docItem.title}</span>
+                <span className="text-xs text-brand-600 font-semibold">{openDoc === docItem.id ? 'Hide ▴' : 'Read ▾'}</span>
+              </button>
+              {openDoc === docItem.id && (
+                <pre className="whitespace-pre-wrap font-sans text-sm p-4 leading-relaxed max-h-64 overflow-y-auto border-t border-line">{docItem.text}</pre>
+              )}
+            </section>
+          ))}
 
-          <section>
-            <h3 className="font-bold text-gray-900 mb-2">Non-Disclosure Agreement</h3>
-            <pre className="whitespace-pre-wrap font-sans text-sm bg-gray-50 border border-gray-200 rounded-xl p-4 leading-relaxed">{NDA_TEXT}</pre>
-            <label className="flex items-start gap-2 mt-3 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={ndaAgreed}
-                onChange={(e) => setNdaAgreed(e.target.checked)}
-                className="mt-1 w-4 h-4 text-indigo-600 rounded focus:ring-indigo-500"
-              />
-              <span className="text-sm text-gray-700">I have read and agree to the <strong>Non-Disclosure Agreement</strong>, and understand that violating it could lead to legal action.</span>
-            </label>
-          </section>
+          <label className="flex items-start gap-3 cursor-pointer bg-brand-50 border border-brand-100 rounded-xl p-4">
+            <input
+              type="checkbox"
+              checked={agreed}
+              onChange={(e) => setAgreed(e.target.checked)}
+              className="mt-0.5 w-5 h-5 text-brand-600 rounded focus:ring-brand-500"
+            />
+            <span className="text-sm text-ink leading-relaxed">
+              I have read and agree to the <strong>Terms of Service</strong> and the <strong>Non-Disclosure Agreement</strong> above.
+            </span>
+          </label>
         </div>
         <footer className="p-5 border-t border-gray-100 flex gap-3">
           <button
@@ -7039,7 +7060,7 @@ const LegalAcceptanceModal = () => {
           </button>
           <button
             onClick={accept}
-            disabled={!tosAgreed || !ndaAgreed || !identityOk || saving}
+            disabled={!agreed || !identityOk || saving}
             className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white py-3 rounded-xl font-bold disabled:opacity-50 transition"
             title={!identityOk ? 'Enter your name and a valid email to continue' : ''}
           >
@@ -7056,6 +7077,114 @@ const LegalAcceptanceModal = () => {
 // profile defaults to "User". When that's the case (or the name is
 // missing/blank), prompt the user to pick a display name so group
 // members can tell them apart.
+// First-run tour: six quick cards that walk a brand-new user (any sign-in
+// method) through the whole app. Shown once — finishing or skipping stamps
+// tourCompletedAt on the profile.
+const TOUR_STEPS = [
+  {
+    icon: (c) => <SparklesIcon className={c} />,
+    title: 'Welcome to Hangouts',
+    body: 'Real things to do — concerts, pop-ups, trivia nights, park days — found for you by AI, matched to your taste, your schedule, and how far you’ll go.',
+  },
+  {
+    icon: (c) => <HomeIcon className={c} />,
+    title: 'Your Feed',
+    body: 'Today shows what’s on tonight; Upcoming looks two weeks out. Tap ♥ to save events you love (it learns your taste), ✕ to pass, and pull down anytime for fresh ideas.',
+  },
+  {
+    icon: (c) => <SearchIcon className={c} />,
+    title: 'Explore what’s on',
+    body: 'Browse by mood — Music, Food & Drink, Outdoors — and by day: tonight, this week, or the weekend. Anything you like, add straight to your feed.',
+  },
+  {
+    icon: (c) => <PlusIcon className={c} />,
+    title: 'Plan anything',
+    body: 'Tap the + button and just describe it: “Taking my kids to Prospect Park Saturday afternoon.” You’ll get real places and events, ready to book or share.',
+  },
+  {
+    icon: (c) => <UsersIcon className={c} />,
+    title: 'Bring your people',
+    body: 'Create a group, invite friends with a link, chat, propose events, and RSVP. When you’re all free at the same time, Hangouts spots it and suggests the plan.',
+  },
+  {
+    icon: (c) => <HeartIcon className={c} />,
+    title: 'Make it yours',
+    body: 'Tell us your interests, when you usually go out, and how far you’ll travel — the more it knows, the better every suggestion gets.',
+    cta: 'Set up my profile',
+  },
+];
+
+const TourModal = () => {
+  const { userId, setUserProfile, setShowProfileModal } = useContext(AppContext);
+  const [step, setStep] = useState(0);
+  const s = TOUR_STEPS[step];
+  const last = step === TOUR_STEPS.length - 1;
+
+  const finish = (openProfile = false) => {
+    // Stamp first so the tour never re-renders, then optionally open profile.
+    const stamp = { tourCompletedAt: serverTimestamp() };
+    updateDoc(doc(db, `artifacts/${appId}/users/${userId}/profiles`, 'myProfile'), stamp).catch(() => {});
+    setUserProfile((p) => ({ ...(p || {}), tourCompletedAt: new Date().toISOString() }));
+    if (openProfile) setShowProfileModal(true);
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[70] flex justify-center items-end sm:items-center p-0 sm:p-4">
+      <div className="bg-white w-full max-w-md rounded-t-3xl sm:rounded-3xl shadow-2xl p-6 pb-8 relative">
+        <button
+          onClick={() => finish(false)}
+          className="absolute top-4 right-4 text-xs font-semibold text-ink-faint hover:text-ink px-2 py-1 transition"
+        >
+          Skip
+        </button>
+        <div className="w-16 h-16 bg-brand-50 rounded-2xl flex items-center justify-center text-brand-600 mb-5 mt-2">
+          {s.icon('w-8 h-8')}
+        </div>
+        <h2 className="text-xl font-bold text-ink tracking-tight">{s.title}</h2>
+        <p className="text-sm text-ink-soft leading-relaxed mt-2 min-h-20">{s.body}</p>
+        <div className="flex items-center gap-1.5 my-5">
+          {TOUR_STEPS.map((_, i) => (
+            <span key={i} className={`h-1.5 rounded-full transition-all ${i === step ? 'w-6 bg-brand-600' : 'w-1.5 bg-gray-200'}`} />
+          ))}
+        </div>
+        <div className="flex gap-3">
+          {step > 0 && (
+            <button
+              onClick={() => setStep(step - 1)}
+              className="px-5 h-12 bg-gray-100 hover:bg-gray-200 text-ink rounded-xl font-semibold text-sm transition"
+            >
+              Back
+            </button>
+          )}
+          {last ? (
+            <>
+              <button
+                onClick={() => finish(true)}
+                className="flex-1 h-12 bg-brand-600 hover:bg-brand-700 text-white rounded-xl font-semibold text-sm transition"
+              >
+                {s.cta}
+              </button>
+              <button
+                onClick={() => finish(false)}
+                className="px-5 h-12 bg-gray-100 hover:bg-gray-200 text-ink rounded-xl font-semibold text-sm transition"
+              >
+                Done
+              </button>
+            </>
+          ) : (
+            <button
+              onClick={() => setStep(step + 1)}
+              className="flex-1 h-12 bg-brand-600 hover:bg-brand-700 text-white rounded-xl font-semibold text-sm transition"
+            >
+              Next
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const NameSettingModal = ({ onClose }) => {
   const { userId, userProfile, setUserProfile, showGlobalMessage } = useContext(AppContext);
   const [name, setName] = useState('');
@@ -8089,6 +8218,8 @@ export default function App() {
           )}
           {needsName && <NameSettingModal onClose={() => setNameSkipped(true)} />}
           {needsLegal && <LegalAcceptanceModal />}
+          {/* First-run tour: after legal + name gates clear, before anything else. */}
+          {!needsLegal && !needsName && !!userProfile && !userProfile.tourCompletedAt && <TourModal />}
           <FeedbackButton />
         </div>
         )}
